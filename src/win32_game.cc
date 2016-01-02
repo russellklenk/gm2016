@@ -24,6 +24,7 @@
 
 #include "win32_debug.cc"
 #include "win32_parse.cc"
+#include "win32_memarena.cc"
 
 /*//////////////////
 //   Data Types   //
