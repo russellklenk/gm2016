@@ -20,7 +20,7 @@
 #endif
 
 /// @summary Define the CDECL calling convention attribute.
-#ifndef RTA_CALL_C
+#ifndef CALL_C
     #if   defined(_MSC_VER)
         #define CALL_C                        __cdecl
         #define C_API                         CALL_C
@@ -168,12 +168,12 @@
 #endif
 
 /// @summary Define our own memory order values for use with compiler intrinsics.
-/// RTA_MEMORY_ORDER_RELAXED: No inter-thread ordering constraint. The load or store must be atomic.
-/// RTA_MEMORY_ORDER_CONSUME: Impose a happens-before constraint relative to a store-release to prevent load reordering from moving before the barrier.
-/// RTA_MEMORY_ORDER_ACQUIRE: Impose a happens-before constraint relative to a store-release to prevent load reordering from moving before the barrier.
-/// RTA_MEMORY_ORDER_RELEASE: Impose a happens-before constraint to a load operation to prevent store reordering from moving below the barrier.
-/// RTA_MEMORY_ORDER_ACQ_REL: Prevent subsequent load operations from moving before the barrier, and prior store operations from moving after the barrier.
-/// RTA_MEMORY_ORDER_SEQ_CST: Enforces a total ordering relative to all other SEQ_CST operations.
+/// MEMORY_ORDER_RELAXED: No inter-thread ordering constraint. The load or store must be atomic.
+/// MEMORY_ORDER_CONSUME: Impose a happens-before constraint relative to a store-release to prevent load reordering from moving before the barrier.
+/// MEMORY_ORDER_ACQUIRE: Impose a happens-before constraint relative to a store-release to prevent load reordering from moving before the barrier.
+/// MEMORY_ORDER_RELEASE: Impose a happens-before constraint to a load operation to prevent store reordering from moving below the barrier.
+/// MEMORY_ORDER_ACQ_REL: Prevent subsequent load operations from moving before the barrier, and prior store operations from moving after the barrier.
+/// MEMORY_ORDER_SEQ_CST: Enforces a total ordering relative to all other SEQ_CST operations.
 #if   TARGET_COMPILER == COMPILER_MSVC
             #define MEMORY_ORDER_RELAXED       0
             #define MEMORY_ORDER_CONSUME       1
@@ -258,7 +258,7 @@
 /// @param pow2 The power-of-two alignment.
 /// @return The input size, rounded up to the nearest even multiple of pow2.
 public_function inline size_t 
-align_up
+AlignUp
 (
     size_t size, 
     size_t pow2
@@ -272,7 +272,7 @@ align_up
 /// @param pow2 The power-of-two alignment.
 /// @return The input size, rounded up to the nearest even multiple of pow2.
 public_function inline int64_t 
-align_up
+AlignUp
 (
     int64_t size, 
     size_t  pow2
@@ -288,7 +288,7 @@ align_up
 /// @return The address aligned to access elements of type T, or nullptr if addr is nullptr.
 template <typename T>
 public_function inline void* 
-align_for
+AlignFor
 (
     void *addr
 )
@@ -304,7 +304,7 @@ align_for
 /// @param mem_order The memory order constraint to apply to the load operation.
 /// @return The value stored at the address ptr.
 public_function inline int32_t
-atomic_load_int32
+AtomicLoadInt32
 (
     int32_t      *ptr, 
     int      mem_order
@@ -323,7 +323,7 @@ atomic_load_int32
 /// @param val The value to write to the specified memory address.
 /// @param mem_order The memory ordering constraint to apply to the store operation.
 public_function inline void
-atomic_store_int32
+AtomicStoreInt32
 (
     int32_t       *ptr, 
     int32_t        val,
@@ -344,7 +344,7 @@ atomic_store_int32
 /// @param mem_order The memory ordering constraint to apply to the RWM operation.
 /// @return The result of the addition operation.
 public_function inline int32_t
-atomic_fetch_add_int32
+AtomicFetchAddInt32
 (
     int32_t      *ptr, 
     int32_t       val, 
@@ -372,7 +372,7 @@ atomic_fetch_add_int32
 /// @param mem_order The memory ordering constraint to apply to the RWM operation.
 /// @return The result of the bitwise-OR operation.
 public_function inline int32_t
-atomic_fetch_or_int32
+AtomicFetchOrInt32
 (
     int32_t      *ptr, 
     int32_t       val, 
@@ -403,7 +403,7 @@ atomic_fetch_or_int32
 /// @param failure The memory ordering constraint to apply if the CAS operation fails and the value stored at the memory address ptr is not updated.
 /// @return true if the value stored at the memory address ptr is updated.
 public_function inline bool
-atomic_compare_exchange_int32
+AtomicCompareExchangeInt32
 (
     int32_t      *ptr, 
     int32_t *expected, 
@@ -422,15 +422,15 @@ atomic_compare_exchange_int32
     UNUSED_ARG(failure);
 
     int32_t original;
-    int32_t      exp = atomic_load_int32(expected, MEMORY_ORDER_SEQ_CST);
+    int32_t      exp = AtomicLoadInt32(expected, MEMORY_ORDER_SEQ_CST);
     #if TARGET_ARCHITECTURE == ARCHITECTURE_X86_32
         original = _InterlockedCompareExchange((volatile LONG*) ptr, desired, exp);
     #else
         original =  InterlockedCompareExchange((volatile LONG*) ptr, desired, exp);
     #endif
 
-    atomic_store_int32(expected, original, MEMORY_ORDER_SEQ_CST);
-    return (original==exp);
+    AtomicStoreInt32(expected, original, MEMORY_ORDER_SEQ_CST);
+    return (original == exp);
 #else
     #error Unsupported atomics implementation - need atomic_compare_exchange_int32 in compiler_config.h
 #endif

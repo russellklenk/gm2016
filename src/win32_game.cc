@@ -26,11 +26,13 @@
 #include "win32_parse.cc"
 #include "win32_memarena.cc"
 
+#include "memarena.cc"
+
 /*//////////////////
 //   Data Types   //
 //////////////////*/
 /// @summary Defines the data associated with a parsed command line.
-struct command_line_t
+struct COMMAND_LINE
 {
     bool CreateConsole;
 };
@@ -44,7 +46,7 @@ struct command_line_t
 internal_function bool
 DefaultCommandLineArguments
 (
-    command_line_t *args
+    COMMAND_LINE *args
 )
 {
     if (args != NULL)
@@ -61,7 +63,7 @@ DefaultCommandLineArguments
 internal_function bool
 ParseCommandLine
 (
-    command_line_t *args
+    COMMAND_LINE *args
 )
 {
     //command_line_args_t cl = {};
@@ -166,7 +168,7 @@ CreateConsoleAndRedirectStdio
         // allocated that console, so perform the buffer setup and I/O redirection.
         // the default size is 120 characters wide and 30 lines tall.
         CONSOLE_SCREEN_BUFFER_INFO    buffer_info;
-        SHORT const                 lines_visible =  30;
+        SHORT const                 lines_visible = 9999;
         SHORT const                 chars_visible = 120;
         HANDLE                      console_stdin = GetStdHandle(STD_INPUT_HANDLE);
         HANDLE                     console_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -216,7 +218,7 @@ WinMain
     int        show_command
 )
 {
-    command_line_t argv;
+    COMMAND_LINE argv;
 
     UNUSED_ARG(this_instance);
     UNUSED_ARG(prev_instance);

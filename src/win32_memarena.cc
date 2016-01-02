@@ -7,7 +7,7 @@
 //   Data Types   //
 //////////////////*/
 /// @summary Define the data associated with an operating system arena allocator. General-purpose sub-arenas can be created from a single underlying arena.
-struct os_memory_arena_t
+struct OS_MEMORY_ARENA
 {
     size_t   NextOffset;         /// The offset, in bytes relative to BaseAddress, of the next available byte.
     size_t   BytesCommitted;     /// The number of bytes committed for the arena.
@@ -23,9 +23,9 @@ struct os_memory_arena_t
 /// @param arena_size The number of bytes of process address space to reserve.
 /// @return Zero if the arena is initialize, or -1 if an error occurred.
 public_function int
-create_os_memory_arena
+CreateMemoryArena
 (
-    os_memory_arena_t     *arena, 
+    OS_MEMORY_ARENA       *arena, 
     size_t            arena_size
 )
 {   // virtual memory allocations are rounded up to the next even multiple of the system 
@@ -33,7 +33,7 @@ create_os_memory_arena
     // allocation granularity (SYSTEM_INFO::dwAllocationGranularity).
     SYSTEM_INFO sys_info = {};
     GetNativeSystemInfo(&sys_info);
-    arena_size  = align_up(arena_size, size_t(sys_info.dwPageSize));
+    arena_size  = AlignUp(arena_size, size_t(sys_info.dwPageSize));
     void *base  = VirtualAlloc(NULL, arena_size, MEM_RESERVE, PAGE_READWRITE);
     if   (base == NULL)
     {   // unable to reserve the requested amount of address space; fail.
@@ -59,9 +59,9 @@ create_os_memory_arena
 /// @summary Release process address space reserved for a memory arena. All allocations are invalidated.
 /// @param arena The memory arena to delete.
 public_function void
-delete_os_memory_arena
+DeleteMemoryArena
 (
-    os_memory_arena_t *arena
+    OS_MEMORY_ARENA *arena
 )
 {
     if (arena->BaseAddress != NULL)
@@ -80,9 +80,9 @@ delete_os_memory_arena
 /// @param arena The memory arena to query.
 /// @return The marker representing the byte offset of the next allocation.
 public_function size_t
-os_memory_arena_marker
+MemoryArenaMarker
 (
-    os_memory_arena_t *arena
+    OS_MEMORY_ARENA *arena
 )
 {
     return arena->NextOffset;
@@ -92,9 +92,9 @@ os_memory_arena_marker
 /// @param arena The memory arena to query.
 /// @return The operating system page size, in bytes.
 public_function size_t
-os_memory_arena_page_size
+MemoryArenaPageSize
 (
-    os_memory_arena_t *arena
+    OS_MEMORY_ARENA *arena
 )
 {
     return size_t(arena->PageSize);
@@ -106,15 +106,15 @@ os_memory_arena_page_size
 /// @param alloc_alignment A power-of-two, greater than or equal to 1, specifying the alignment of the returned address.
 /// @return A pointer to the start of the allocated block, or NULL if the request could not be satisfied.
 public_function void*
-os_memory_arena_allocate
+MemoryArenaAllocate
 (
-    os_memory_arena_t          *arena, 
-    size_t                 alloc_size, 
-    size_t            alloc_alignment
+    OS_MEMORY_ARENA          *arena, 
+    size_t               alloc_size, 
+    size_t          alloc_alignment
 )
 {
     size_t base_address    = size_t(arena->BaseAddress) + arena->NextOffset;
-    size_t aligned_address = align_up(base_address, alloc_alignment);
+    size_t aligned_address = AlignUp(base_address, alloc_alignment);
     size_t bytes_total     = alloc_size + (aligned_address - base_address);
     if ((arena->NextOffset + bytes_total) > arena->BytesReserved)
     {   // there's not enough reserved address space to satisfy the request.
@@ -126,23 +126,23 @@ os_memory_arena_allocate
         {   // there's not enough committed address space to satisfy the request.
             return NULL;
         }
-        arena->BytesCommitted = align_up(arena->NextOffset + bytes_total, arena->PageSize);
+        arena->BytesCommitted = AlignUp(arena->NextOffset + bytes_total, arena->PageSize);
     }
     arena->NextOffset += bytes_total;
     return (void*) aligned_address;
 }
 
-/// @summary Reserve memory within an arena. Additional address space is committed up to the initial OS reservation size. Use os_memory_arena_commit to commit the number of bytes actually used.
+/// @summary Reserve memory within an arena. Additional address space is committed up to the initial OS reservation size. Use MemoryArenaCommit to commit the number of bytes actually used.
 /// @param arena The memory arena to allocate from.
 /// @param reserve_size The number of bytes to reserve for the active allocation.
 /// @param alloc_alignment A power-of-two, greater than or equal to 1, specifying the alignment of the returned address.
 /// @return A pointer to the start of the allocated block, or NULL if the request could not be satisfied.
 public_function void*
-os_memory_arena_reserve
+MemoryArenaReserve
 (
-    os_memory_arena_t          *arena, 
-    size_t               reserve_size, 
-    size_t            alloc_alignment
+    OS_MEMORY_ARENA          *arena, 
+    size_t             reserve_size, 
+    size_t          alloc_alignment
 )
 {
     if (arena->ReserveAlignBytes != 0 || arena->ReserveTotalBytes != 0)
@@ -150,7 +150,7 @@ os_memory_arena_reserve
         return NULL;
     }
     size_t base_address    = size_t(arena->BaseAddress) + arena->NextOffset;
-    size_t aligned_address = align_up(base_address, alloc_alignment);
+    size_t aligned_address = AlignUp(base_address, alloc_alignment);
     size_t bytes_total     = reserve_size + (aligned_address - base_address);
     if ((arena->NextOffset + bytes_total) > arena->BytesReserved)
     {   // there's not enough reserved address space to satisfy the request.
@@ -162,7 +162,7 @@ os_memory_arena_reserve
         {   // there's not enough committed address space to satisfy the request.
             return NULL;
         }
-        arena->BytesCommitted = align_up(arena->NextOffset + bytes_total, arena->PageSize);
+        arena->BytesCommitted = AlignUp(arena->NextOffset + bytes_total, arena->PageSize);
     }
     arena->ReserveAlignBytes = aligned_address - base_address;
     arena->ReserveTotalBytes = bytes_total;
@@ -174,10 +174,10 @@ os_memory_arena_reserve
 /// @param commit_size The number of bytes to commit, which must be less than or equal to the reservation size.
 /// @return Zero if the commit is successful, or -1 if the commit size is invalid.
 public_function int
-os_memory_arena_commit
+MemoryArenaCommit
 (
-    os_memory_arena_t      *arena, 
-    size_t            commit_size
+    OS_MEMORY_ARENA      *arena, 
+    size_t          commit_size
 )
 {
     if (commit_size == 0)
@@ -204,9 +204,9 @@ os_memory_arena_commit
 /// @summary Cancel the active memory arena reservation, indicating that the returned memory block will not be used.
 /// @param arena The memory arena maintaining the reservation to be cancelled.
 public_function void
-os_memory_arena_cancel
+MemoryArenaCancel
 (
-    os_memory_arena_t *arena
+    OS_MEMORY_ARENA *arena
 )
 {
     arena->ReserveAlignBytes = 0;
@@ -217,10 +217,10 @@ os_memory_arena_cancel
 /// @param arena The memory arena to reset.
 /// @param arena_marker The marker value returned by os_memory_arena_marker().
 public_function void
-os_memory_arena_reset_to_marker
+MemoryArenaResetToMarker
 (
-    os_memory_arena_t       *arena,
-    size_t            arena_marker
+    OS_MEMORY_ARENA       *arena,
+    size_t          arena_marker
 )
 {
     if (arena_marker <= arena->NextOffset)
@@ -230,9 +230,9 @@ os_memory_arena_reset_to_marker
 /// @summary Resets the state of the arena to empty, without decomitting any memory.
 /// @param arena The memory arena to reset.
 public_function void
-os_memory_arena_reset
+MemoryArenaReset
 (
-    os_memory_arena_t *arena
+    OS_MEMORY_ARENA *arena
 )
 {
     arena->NextOffset = 0;
@@ -242,10 +242,10 @@ os_memory_arena_reset
 /// @param arena The memory arena to decommit.
 /// @param arena_marker The marker value returned by os_memory_arena_marker().
 public_function void
-os_memory_arena_decommit_to_marker
+MemoryArenaDecommitToMarker
 (
-    os_memory_arena_t       *arena, 
-    size_t            arena_marker
+    OS_MEMORY_ARENA       *arena, 
+    size_t          arena_marker
 )
 {
     if (arena_marker < arena->NextOffset)
@@ -255,7 +255,7 @@ os_memory_arena_decommit_to_marker
         // this avoids decommitting a page that is still partially allocated.
         size_t last_page  = size_t(arena->BaseAddress) + arena->BytesCommitted;
         size_t mark_page  = size_t(arena->BaseAddress) + arena_marker;
-        size_t next_page  = align_up(mark_page, arena->PageSize);
+        size_t next_page  = AlignUp(mark_page, arena->PageSize);
         size_t free_size  = last_page - next_page;
         arena->NextOffset = arena_marker;
         if (free_size > 0)
@@ -269,9 +269,9 @@ os_memory_arena_decommit_to_marker
 /// @summary Decommit all of the pages within a memory arena, without releasing the address space reservation.
 /// @param arena The memory arena to decommit.
 public_function void
-os_memory_arena_decommit
+MemoryArenaDecommit
 (
-    os_memory_arena_t *arena
+    OS_MEMORY_ARENA *arena
 )
 {
     if (arena->BytesCommitted > 0)
