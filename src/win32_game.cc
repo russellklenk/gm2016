@@ -22,6 +22,8 @@
 #include "platform_config.h"
 #include "compiler_config.h"
 
+#include "win32_runtime.cc"
+#include "win32_timestamp.cc"
 #include "win32_debug.cc"
 #include "win32_parse.cc"
 #include "win32_memarena.cc"
@@ -109,53 +111,6 @@ ParseCommandLine
     return true;
 }
 
-/// @summary Enable or disable a process privilege.
-/// @param token The privilege token of the process to modify.
-/// @param privilege_name The name of the privilege to enable or disable.
-/// @param should_enable Specify TRUE to request the privilege, or FALSE to disable the privilege.
-internal_function bool
-EnableProcessPrivilege
-(
-    HANDLE           token, 
-    LPCTSTR privilege_name,
-    BOOL     should_enable
-)
-{
-    TOKEN_PRIVILEGES tp;
-    LUID           luid;
-
-    if (LookupPrivilegeValue(NULL, privilege_name, &luid))
-    {
-        tp.PrivilegeCount           = 1;
-        tp.Privileges[0].Luid       = luid;
-        tp.Privileges[0].Attributes = should_enable ? SE_PRIVILEGE_ENABLED : 0;
-        if (AdjustTokenPrivileges(token, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL))
-        {   // the requested privilege adjustment was made successfully.
-            return (GetLastError() != ERROR_NOT_ALL_ASSIGNED);
-        }
-    }
-    return false;
-}
-
-/// @summary Request any privilege elevations for the current process.
-/// @return true if the necessary privileges have been obtained.
-internal_function bool
-ElevateProcessPrivileges
-(
-    void
-)
-{
-    HANDLE token;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &token))
-    {
-        bool se_debug = EnableProcessPrivilege(token, SE_DEBUG_NAME, TRUE);
-        // ...
-        CloseHandle(token);
-        return (se_debug);
-    }
-    return false;
-}
-
 /// @summary Attaches a console window to the application. This is useful for viewing debug output.
 internal_function void
 CreateConsoleAndRedirectStdio
@@ -234,7 +189,7 @@ WinMain
     {   // create the console before doing anything else, so all debug output can be seen.
         CreateConsoleAndRedirectStdio();
     }
-    if (!ElevateProcessPrivileges())
+    if (!Win32InitializeRuntime())
     {   // if the necessary privileges could not be obtained, there's no point in proceeding.
         goto cleanup_and_shutdown;
     }
