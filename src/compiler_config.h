@@ -118,6 +118,11 @@
     #define cacheline_align                    field_alignment(CACHELINE_SIZE)
 #endif
 
+/// @summary Define the default alignment for memory allocations.
+#ifndef DEFAULT_ALIGNMENT
+    #define DEFAULT_ALIGNMENT                  sizeof(void*)
+#endif
+
 /// @summary Helper macro to begin a multi-line macro safely.
 #ifndef MULTI_LINE_MACRO_BEGIN
     #define MULTI_LINE_MACRO_BEGIN             do {
@@ -247,6 +252,52 @@
         #error Unsupported compiler (need COMPILER_BARRIER_* and HARDWARE_BARRIER_* intrinsics in compiler_config.h)
     #endif
 #endif
+
+/// @summary Rounds a size up to the nearest even multiple of a given power-of-two.
+/// @param size The size value to round up.
+/// @param pow2 The power-of-two alignment.
+/// @return The input size, rounded up to the nearest even multiple of pow2.
+public_function inline size_t 
+align_up
+(
+    size_t size, 
+    size_t pow2
+)
+{
+    return (size == 0) ? pow2 : ((size + (pow2-1)) & ~(pow2-1));
+}
+
+/// @summary Rounds a size up to the nearest even multiple of a given power-of-two.
+/// @param size The size value to round up.
+/// @param pow2 The power-of-two alignment.
+/// @return The input size, rounded up to the nearest even multiple of pow2.
+public_function inline int64_t 
+align_up
+(
+    int64_t size, 
+    size_t  pow2
+)
+{
+    uint64_t pow2_64   = uint64_t(pow2);
+    uint64_t pow2_64m  = pow2_64 - 1;
+    return (size == 0) ? int64_t(pow2_64) : int64_t((size + pow2_64m) & ~pow2_64m);
+}
+
+/// @summary For a given address, return the address aligned for the specified type. The type T must be aligned to a power-of-two.
+/// @param addr The unaligned address.
+/// @return The address aligned to access elements of type T, or nullptr if addr is nullptr.
+template <typename T>
+public_function inline void* 
+align_for
+(
+    void *addr
+)
+{
+    const size_t a = std::alignment_of<T>::value;
+    const size_t m = std::alignment_of<T>::value - 1;
+    uint8_t     *p =(uint8_t*) addr;
+    return (addr  != nullptr) ? (void*) ((uintptr_t(p) + m) & ~m) : nullptr;
+}
 
 /// @summary Perform an atomic load of the signed 32-bit integer value at the specified address.
 /// @param ptr The address to read.
