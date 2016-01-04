@@ -18,6 +18,6 @@ SET LNKFLAGS=%LIBRARIES%
 IF NOT EXIST %OUTPUTDIR% mkdir %OUTPUTDIR%
 
 PUSHD %OUTPUTDIR%
-cl %CPPFLAGS% ..\src\win32_game.cc %DEFINES% %LNKFLAGS% /Fegame.exe
+cl %CPPFLAGS% ..\src\win32_client.cc %DEFINES% %LNKFLAGS% /Fegclient.exe
 POPD
 

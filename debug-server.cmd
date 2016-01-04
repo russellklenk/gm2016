@@ -8,5 +8,5 @@ IF NOT DEFINED DevEnvDir (
     CALL "C:\Program Files (x86)\Microsoft Visual Studio %VSVERSION%\VC\vcvarsall.bat" x86_amd64
 )
 
-start devenv /debugexe build\game.exe
+start devenv /debugexe build\gserver.exe
 

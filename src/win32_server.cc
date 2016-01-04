@@ -1,5 +1,5 @@
 /*/////////////////////////////////////////////////////////////////////////////
-/// @summary Implement the entry point of the game client application.
+/// @summary Implement the entry point of the game server application.
 ///////////////////////////////////////////////////////////////////////////80*/
 
 /*////////////////
@@ -11,13 +11,13 @@
 #include <stdint.h>
 #include <stdarg.h>
 
-#include <conio.h>
-#include <fcntl.h>
-#include <io.h>
-
 #include <tchar.h>
 #include <Windows.h>
 #include <Shellapi.h>
+
+#include <conio.h>
+#include <fcntl.h>
+#include <io.h>
 
 #include "platform_config.h"
 #include "compiler_config.h"
@@ -36,7 +36,7 @@
 /// @summary Defines the data associated with a parsed command line.
 struct COMMAND_LINE
 {
-    bool CreateConsole;
+    int Port;
 };
 
 /*//////////////////////////
@@ -53,7 +53,7 @@ DefaultCommandLineArguments
 {
     if (args != NULL)
     {   // set the default command-line argument values.
-        args->CreateConsole = false;
+        args->Port = 0;
         return true;
     }
     return false;
@@ -91,9 +91,8 @@ ParseCommandLine
 
         if (ArgumentKeyAndValue(arg, &key, &val)) // may mutate arg
         {
-            if (KeyMatch(key, _T("c")) || KeyMatch(key, _T("console")))
+            if (KeyMatch(key, _T("p")) || KeyMatch(key, _T("port")))
             {   // create a console window to view debug output.
-                args->CreateConsole = true;
             }
             else
             {   // the key is not recognized. output a debug message, but otherwise ignore the error.
@@ -185,22 +184,7 @@ WinMain
         DebugPrintf(_T("ERROR: Unable to parse the command line.\n"));
         return 0;
     }
-    if (argv.CreateConsole)
-    {   // create the console before doing anything else, so all debug output can be seen.
-        CreateConsoleAndRedirectStdio();
-    }
-    if (!Win32InitializeRuntime())
-    {   // if the necessary privileges could not be obtained, there's no point in proceeding.
-        goto cleanup_and_shutdown;
-    }
-
-cleanup_and_shutdown:
-    if (argv.CreateConsole)
-    {
-        printf("\nApplication terminated. Press any key to exit.\n");
-        (void) _getch();
-    }
-    // TODO(rlk): perform additional cleanup here.
+    CreateConsoleAndRedirectStdio();
     return 0;
 }
 

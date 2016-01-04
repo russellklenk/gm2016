@@ -1,3 +1,4 @@
 @ECHO OFF
-CALL build-game.cmd
+CALL build-client.cmd
+CALL build-server.cmd
 
