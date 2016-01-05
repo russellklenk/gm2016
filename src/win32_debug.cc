@@ -11,13 +11,13 @@
 #endif
 
 /// @summary The current output indentation level.
-global_variable thread_local int  GlobalIndent = 0;
+global_variable __declspec(thread) int  GlobalIndent = 0;
 
 /// @summary The zero-based index specifying the current top-of-stack for saved indent levels.
-global_variable thread_local int  GlobalIndentTOS = 0;
+global_variable __declspec(thread) int  GlobalIndentTOS = 0;
 
 /// @summary A stack used to save and restore the global indentation level.
-global_variable thread_local int  GlobalIndentStack[MAX_SAVED_INDENT_LEVELS] = {};
+global_variable __declspec(thread) int  GlobalIndentStack[MAX_SAVED_INDENT_LEVELS] = {};
 
 /// @summary Helper macro to write a formatted string to stderr. The output will not be visible unless a console window is opened.
 #define ConsoleError(formatstr, ...) \
