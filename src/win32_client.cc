@@ -33,30 +33,39 @@
 /*//////////////////
 //   Data Types   //
 //////////////////*/
+/// @summary Define various flags specifying window states or attributes.
+enum   WINDOW_FLAGS : uint32_t
+{
+    WINDOW_FLAGS_NONE       = (0UL << 0UL),    /// No flags are set on the window.
+    WINDOW_FLAGS_WINDOWED   = (1UL << 0UL),    /// The window is currently presented in a windowed style.
+    WINDOW_FLAGS_FULLSCREEN = (1UL << 1UL),    /// The window is currently presented in a fullscreen style.
+};
+
 /// @summary Defines the data associated with a parsed command line.
 struct COMMAND_LINE
 {
-    bool            CreateConsole;    /// If true, attach a console for viewing debug output.
+    bool            CreateConsole;             /// If true, attach a console for viewing debug output.
 };
 
 /// @summary Stores the data associated with a display output attached to the system.
 struct WIN32_DISPLAY
 {
-    DWORD           Ordinal;          /// The unique display ordinal.
-    HMONITOR        Monitor;          /// The operating system monitor identifier.
-    int             DisplayX;         /// The x-coordinate of the upper-left corner of the display, in virtual screen space.
-    int             DisplayY;         /// The y-coordinate of the upper-left corner of the display, in virtual screen space.
-    int             DisplayWidth;     /// The width of the display, in pixels.
-    int             DisplayHeight;    /// The height of the display, in pixels.
-    DEVMODE         DisplayMode;      /// The active display settings.
-    DISPLAY_DEVICE  DisplayInfo;      /// Information uniquely identifying the display to the operating system.
+    DWORD           Ordinal;                   /// The unique display ordinal.
+    HMONITOR        Monitor;                   /// The operating system monitor identifier.
+    int             DisplayX;                  /// The x-coordinate of the upper-left corner of the display, in virtual screen space.
+    int             DisplayY;                  /// The y-coordinate of the upper-left corner of the display, in virtual screen space.
+    int             DisplayWidth;              /// The width of the display, in pixels.
+    int             DisplayHeight;             /// The height of the display, in pixels.
+    DEVMODE         DisplayMode;               /// The active display settings.
+    DISPLAY_DEVICE  DisplayInfo;               /// Information uniquely identifying the display to the operating system.
 };
 
 /// @summary Stores data associated with a window.
 struct WIN32_WINDOW
 {
-    HWND            Window;           /// The handle of the window.
-    WINDOWPLACEMENT Placement;        /// The placement of the window on the display.
+    HWND            Window;                    /// The handle of the window.
+    WINDOWPLACEMENT Placement;                 /// The placement of the window on the display.
+    uint32_t        Flags;                     /// Current state and attribute flags.
 };
 
 /*///////////////
@@ -65,20 +74,11 @@ struct WIN32_WINDOW
 /// @summary Define the maximum number of attached displays recognized by the application.
 global_variable size_t const  MAX_ATTACHED_DISPLAYS                    = 32;
 
-/// @summary Define the maximum number of top-level application windows.
-global_variable size_t const  MAX_TOP_LEVEL_WINDOWS                    = 32;
-
 /// @summary Define storage for a list of attributes of all attached displays.
 global_variable WIN32_DISPLAY GlobalDisplayList[MAX_ATTACHED_DISPLAYS] = {};
 
 /// @summary Define the number of valid records in the list of attached displays.
 global_variable size_t        GlobalDisplayCount                       =  0;
-
-/// @summary Define storage for a list of top-level windows.
-global_variable WIN32_WINDOW  GlobalWindowList[MAX_TOP_LEVEL_WINDOWS]  = {};
-
-/// @summary Define the number of valid records in the list of top-level windows.
-global_variable size_t        GlobalWindowCount                        =  0;
 
 /*//////////////////////////
 //   Internal Functions   //
@@ -256,6 +256,19 @@ EnumerateAttachedDisplays
     }
 }
 
+/// @summary Helper function to enumerate all displays attached to the system. Display information is stored in the global list.
+/// @return true if display resources are initialized and at least one display is attached to the system.
+internal_function bool
+EnumerateAttachedDisplays
+(
+    void
+)
+{
+    GlobalDisplayCount = 0;
+    EnumerateAttachedDisplays(GlobalDisplayList, MAX_ATTACHED_DISPLAYS, GlobalDisplayCount);
+    return (GlobalDisplayCount > 0);
+}
+
 /// @summary Locate the display containing a given window.
 /// @param display_list The list of attached displays to search.
 /// @param num_displays The number of records in the display_list.
@@ -309,6 +322,17 @@ FindPrimaryDisplay
     return primary_display;
 }
 
+/// @summary Locate the primary display attached to the system.
+/// @return A pointer to the record associated with the primary display, or NULL if no displays are attached.
+internal_function inline WIN32_DISPLAY*
+FindPrimaryDisplay
+(
+    void
+)
+{
+    return FindPrimaryDisplay(GlobalDisplayList, GlobalDisplayCount);
+}
+
 /// @summary Retrieve the current refresh rate, in Hz, for a given display or window.
 /// @param display The display record for the display containing the given window.
 /// @param window The window associated with the given display.
@@ -348,27 +372,6 @@ DisplayRefreshRate
     }
 }
 
-/// @summary Search a list of windows for a top-level window identified by HWND.
-/// @param window_list The list of windows to search.
-/// @param num_windows The number of valid records in the window_list.
-/// @param hwnd The Win32 handle of the window to locate.
-/// @return A pointer to the window record, or NULL.
-internal_function WIN32_WINDOW*
-FindTopLevelWindow
-(
-    WIN32_WINDOW *window_list,
-    size_t const  num_windows, 
-    HWND                 hwnd
-)
-{
-    for (size_t i = 0; i < num_windows; ++i)
-    {
-        if (window_list[i].Window == hwnd)
-            return &window_list[i];
-    }
-    return NULL;
-}
-
 /// @summary Implements the WndProc for the main game window.
 /// @param window The window receiving the message.
 /// @param message The message identifier.
@@ -406,8 +409,7 @@ MainWindowCallback
         case WM_DISPLAYCHANGE:
             {   // re-enumerate all attached displays. a display may have been added or removed, 
                 // and likely the geometry of all attached displays was affected in some way.
-                GlobalDisplayCount = 0;
-                EnumerateAttachedDisplays(GlobalDisplayList, MAX_ATTACHED_DISPLAYS, GlobalDisplayCount);
+                EnumerateAttachedDisplays();
             } break;
 
         default:
@@ -512,6 +514,11 @@ CreateWindowOnDisplay
     window->Window = hwnd;
     window->Placement.length = sizeof(WINDOWPLACEMENT);
     GetWindowPlacement(hwnd, &window->Placement);
+
+    window->Flags = WINDOW_FLAGS_NONE;
+    if (fullscreen) window->Flags |= WINDOW_FLAGS_FULLSCREEN;
+    else window->Flags |= WINDOW_FLAGS_WINDOWED;
+
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     return true;
 }
@@ -531,11 +538,13 @@ ToggleFullscreen
         MONITORINFO monitor_info = { sizeof(MONITORINFO) };
         WINDOWPLACEMENT win_info = { sizeof(WINDOWPLACEMENT) };
         if (GetWindowPlacement(hwnd, &win_info) && GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor_info))
-        {
+        {   // modify the window style, size and placement.
             RECT rc = monitor_info.rcMonitor;
             CopyMemory(&window->Placement, &win_info, (SIZE_T) win_info.length);
             SetWindowLongPtr(hwnd, GWL_STYLE, style &~ WS_OVERLAPPEDWINDOW);
             SetWindowPos(hwnd, HWND_TOP, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            window->Flags &= ~WINDOW_FLAGS_WINDOWED;
+            window->Flags |=  WINDOW_FLAGS_FULLSCREEN;
         }
     }
     else
@@ -543,21 +552,33 @@ ToggleFullscreen
         SetWindowLongPtr(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &window->Placement);
         SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED); 
+        window->Flags &= ~WINDOW_FLAGS_FULLSCREEN;
+        window->Flags |=  WINDOW_FLAGS_FULLSCREEN;
     }
 }
 
-/// @summary Helper function to initialize global display variables and enumerate the displays attached to the system.
-/// @return true if display resources are initialized and at least one display is attached to the system.
-internal_function bool
-InitializeDisplayResources
+/// @summary Determine if a window is currently being displayed with a fullscreen style.
+/// @param window The window to check.
+/// @return true if the window is displayed in a fullscreen style.
+internal_function inline bool
+IsFullscreen
 (
-    void
+    WIN32_WINDOW *window
 )
 {
-    GlobalWindowCount  = 0;
-    GlobalDisplayCount = 0;
-    EnumerateAttachedDisplays(GlobalDisplayList, MAX_ATTACHED_DISPLAYS, GlobalDisplayCount);
-    return (GlobalDisplayCount > 0);
+    return (window->Flags & WINDOW_FLAGS_FULLSCREEN) == WINDOW_FLAGS_FULLSCREEN;
+}
+
+/// @summary Determine if a window is currently being displayed with a windowed style.
+/// @param window The window to check.
+/// @return true if the window is displayed in a windowed style.
+internal_function inline bool
+IsWindowed
+(
+    WIN32_WINDOW *window
+)
+{
+    return (window->Flags & WINDOW_FLAGS_WINDOWED) == WINDOW_FLAGS_WINDOWED;
 }
 
 /*////////////////////////
@@ -579,7 +600,7 @@ WinMain
 )
 {
     COMMAND_LINE              argv;
-    WIN32_WINDOW      *main_window = NULL;
+    WIN32_WINDOW       main_window = {};
     WIN32_DISPLAY *primary_display = NULL;
     int                     result = 0;
 
@@ -601,19 +622,17 @@ WinMain
     {   // if the necessary privileges could not be obtained, there's no point in proceeding.
         goto cleanup_and_shutdown;
     }
-    if (!InitializeDisplayResources())
+    if (!EnumerateAttachedDisplays())
     {   // no displays are attached to the system; there's no point in proceeding.
         goto cleanup_and_shutdown;
     }
 
     // create the main application window on the primary display.
     primary_display = FindPrimaryDisplay(GlobalDisplayList, GlobalDisplayCount);
-    main_window     = &GlobalWindowList[0];
-    if (!CreateWindowOnDisplay(main_window, this_instance, primary_display, 800, 600, false))
+    if (!CreateWindowOnDisplay(&main_window, this_instance, primary_display, 800, 600, false))
     {   // unable to create the main application window; there's no point in proceeding.
         goto cleanup_and_shutdown;
     }
-    // TODO(rlk): Update GlobalWindowCount, yucky.
 
     // run the main thread loop.
     for ( ; ; )
