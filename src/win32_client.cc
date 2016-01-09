@@ -160,6 +160,29 @@ CreateConsoleAndRedirectStdio
     }
 }
 
+/// @summary Performs all setup and initialization for the input system. User input is handled on the main thread.
+/// @return true if the input system is initialized and ready for use.
+internal_function bool 
+SetupInputDevices
+(
+    void
+)
+{   // http://www.usb.org/developers/hidpage/Hut1_12v2.pdf
+    RAWINPUTDEVICE keyboard_and_mouse[2] = { 
+        { 1, 6, RIDEV_DEVNOTIFY, NULL }, // keyboard
+        { 1, 2, RIDEV_DEVNOTIFY, NULL }  // mouse
+    };
+
+    // this should also create a Windows message queue for the thread.
+    if (!RegisterRawInputDevices(keyboard_and_mouse, 2, sizeof(RAWINPUTDEVICE)))
+    {
+        ConsoleError("ERROR: Unable to register for keyboard and mouse input; reason = 0x%08X.\n", GetLastError());
+        return false;
+    }
+    // TODO(rlk): Load and initialize XInput for gamepad support.
+    return true;
+}
+
 /// @summary Spawn an explicitly-managed thread.
 /// @param thread_main The thread entry point.
 /// @param thread_args Data to pass to the thread being spawned.
@@ -218,6 +241,10 @@ WinMain
     {   // if the necessary privileges could not be obtained, there's no point in proceeding.
         goto cleanup_and_shutdown;
     }
+    if (!SetupInputDevices())
+    {   // no user input services are available.
+        goto cleanup_and_shutdown;
+    }
 
     // set up explicit threads for frame composition, network I/O and file I/O.
     thread_args.StartEvent     = ev_start;
@@ -235,10 +262,35 @@ WinMain
 
     // enter the main game loop:
     for ( ; ; )
-    {   // TODO(rlk): change the 8 to 0 - it's only 8 to simulate the main thread's "work".
-        if (WaitForSingleObject(ev_break, 8) == WAIT_OBJECT_0)
+    {   
+        MSG msg;
+
+        // poll for externally-signaled application termination.
+        if (WaitForSingleObject(ev_break, 0) == WAIT_OBJECT_0)
         {   // some other thread (probably the render thread) has signaled termination.
             break;
+        }
+
+        // poll the Windows message queue for the thread to receive WM_INPUT notifications.
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+        {
+            switch (msg.message)
+            {
+                case WM_INPUT:
+                    {   // TODO(rlk): It looks like we need to create an invisible window.
+                        // Should probably do that on a separate thread dedicated only to user input.
+                        ConsoleOutput("INFO: An input packet is available.\n");
+                    } break;
+
+                case WM_INPUT_DEVICE_CHANGE:
+                    {
+                        ConsoleOutput("INFO: An input device was attached or removed.\n");
+                    } break;
+
+                default:
+                    {   // some other message we don't care about.
+                    } break;
+            }
         }
     }
 
