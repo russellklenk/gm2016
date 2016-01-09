@@ -160,17 +160,98 @@ CreateConsoleAndRedirectStdio
     }
 }
 
+/// @summary WndProc for the hidden message-only window on the main thread.
+/// @param hwnd The handle of the window to which the message was sent.
+/// @param message The message identifier.
+/// @param wparam Additional message-specific data.
+/// @param lparam Additional message-specific data.
+/// @return A message-specific result code.
+internal_function LRESULT CALLBACK
+MessageWindowCallback
+(
+    HWND   hwnd, 
+    UINT   message, 
+    WPARAM wparam, 
+    LPARAM lparam
+)
+{
+    LRESULT result = 0;
+    switch (message)
+    {
+        case WM_DESTROY:
+            {   // termination was signaled from another thread. 
+                // post WM_QUIT to terminate the main game loop.
+                PostQuitMessage(0);
+            } break;
+
+        case WM_INPUT:
+            {
+                result = DefWindowProc(hwnd, message, wparam, lparam);
+            } break;
+
+        default:
+            {   // pass the message on to the default handler:
+                result = DefWindowProc(hwnd, message, wparam, lparam);
+            } break;
+    }
+    return result;
+}
+
+/// @summary Create a message-only window for the sole purpose of gathering user input and receiving messages from other threads.
+/// @param this_instance The HINSTANCE of the application passed to WinMain.
+/// @return The handle of the message-only window used to communicate with the main thread and gather user input.
+internal_function HWND 
+CreateMessageWindow
+(
+    HINSTANCE this_instance
+)
+{
+    TCHAR const *class_name = _T("GM2016_MessageWindow");
+    WNDCLASSEX     wndclass = {};
+
+    // register the window class, if necessary.
+    if (!GetClassInfoEx(this_instance, class_name, &wndclass))
+    {   // the window class hasn't been registered yet.
+        wndclass.cbSize         = sizeof(WNDCLASSEX);
+        wndclass.cbClsExtra     = 0;
+        wndclass.cbWndExtra     = 0;
+        wndclass.hInstance      = this_instance;
+        wndclass.lpszClassName  = class_name;
+        wndclass.lpszMenuName   = NULL;
+        wndclass.lpfnWndProc    = MessageWindowCallback;
+        wndclass.hIcon          = LoadIcon  (0, IDI_APPLICATION);
+        wndclass.hIconSm        = LoadIcon  (0, IDI_APPLICATION);
+        wndclass.hCursor        = LoadCursor(0, IDC_ARROW);
+        wndclass.style          = 0;
+        wndclass.hbrBackground  = NULL;
+        if (!RegisterClassEx(&wndclass))
+        {   // unable to register the window class; cannot proceed.
+            return NULL;
+        }
+    }
+
+    // the message window spans the entire virtual display space across all monitors.
+    int x      = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int y      = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int width  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+    // return the window handle. the window is not visible.
+    return CreateWindowEx(0, class_name, class_name, 0, x, y, width, height, HWND_MESSAGE, NULL, this_instance, NULL);
+}
+
 /// @summary Performs all setup and initialization for the input system. User input is handled on the main thread.
+/// @param message_window The handle of the main thread's message window.
 /// @return true if the input system is initialized and ready for use.
 internal_function bool 
 SetupInputDevices
 (
-    void
+    HWND message_window
 )
 {   // http://www.usb.org/developers/hidpage/Hut1_12v2.pdf
     RAWINPUTDEVICE keyboard_and_mouse[2] = { 
-        { 1, 6, RIDEV_DEVNOTIFY, NULL }, // keyboard
-        { 1, 2, RIDEV_DEVNOTIFY, NULL }  // mouse
+        { 1, 6, RIDEV_DEVNOTIFY, message_window }, // keyboard
+        { 1, 2, RIDEV_DEVNOTIFY, message_window }  // mouse
     };
 
     // this should also create a Windows message queue for the thread.
@@ -222,6 +303,8 @@ WinMain
     HANDLE             thread_draw = NULL; // frame composition thread and main UI thread
     HANDLE             thread_disk = NULL; // asynchronous disk I/O thread
     HANDLE             thread_net  = NULL; // network I/O thread
+    HWND            message_window = NULL; // for receiving input and notification from other threads
+    bool              keep_running = true;
 
     UNUSED_ARG(prev_instance);
     UNUSED_ARG(command_line);
@@ -241,7 +324,11 @@ WinMain
     {   // if the necessary privileges could not be obtained, there's no point in proceeding.
         goto cleanup_and_shutdown;
     }
-    if (!SetupInputDevices())
+    if ((message_window = CreateMessageWindow(this_instance)) == NULL)
+    {   // without the message window, no user input can be processed.
+        goto cleanup_and_shutdown;
+    }
+    if (!SetupInputDevices(message_window))
     {   // no user input services are available.
         goto cleanup_and_shutdown;
     }
@@ -250,6 +337,7 @@ WinMain
     thread_args.StartEvent     = ev_start;
     thread_args.TerminateEvent = ev_break;
     thread_args.ModuleBaseAddr = this_instance;
+    thread_args.MessageWindow  = message_window;
     thread_args.CommandLine    =&argv;
     if ((thread_draw = SpawnExplicitThread(RenderThread, &thread_args)) == NULL)
     {
@@ -261,14 +349,14 @@ WinMain
     SetEvent(ev_start);
 
     // enter the main game loop:
-    for ( ; ; )
+    while (keep_running)
     {   
         MSG msg;
 
         // poll for externally-signaled application termination.
         if (WaitForSingleObject(ev_break, 0) == WAIT_OBJECT_0)
         {   // some other thread (probably the render thread) has signaled termination.
-            break;
+            DestroyWindow(message_window);
         }
 
         // poll the Windows message queue for the thread to receive WM_INPUT notifications.
@@ -276,21 +364,21 @@ WinMain
         {
             switch (msg.message)
             {
-                case WM_INPUT:
-                    {   // TODO(rlk): It looks like we need to create an invisible window.
-                        // Should probably do that on a separate thread dedicated only to user input.
-                        ConsoleOutput("INFO: An input packet is available.\n");
-                    } break;
-
-                case WM_INPUT_DEVICE_CHANGE:
-                    {
-                        ConsoleOutput("INFO: An input device was attached or removed.\n");
+                case WM_QUIT:
+                    {   // the message window is destroyed. terminate the application.
+                        keep_running = false;
                     } break;
 
                 default:
-                    {   // some other message we don't care about.
+                    {   // forward the message on to MessageWindowCallback.
+                        TranslateMessage(&msg);
+                        DispatchMessage (&msg);
                     } break;
             }
+        }
+        if (!keep_running)
+        {   // time to break out of the main loop.
+            break;
         }
     }
 
