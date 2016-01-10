@@ -102,6 +102,13 @@
 /*//////////////////
 //   Data Types   //
 //////////////////*/
+/// @summary Define the supported runtime users. Certain functionality, like XInput, is not loaded on the server.
+enum WIN32_RUNTIME_TYPE : int
+{
+    WIN32_RUNTIME_TYPE_CLIENT = 1,    /// The Win32 runtime is being loaded on the client.
+    WIN32_RUNTIME_TYPE_SERVER = 2,    /// The Win32 runtime is being loaded on the server.
+};
+
 DECLARE_WIN32_RUNTIME_FUNCTION(void    , WINAPI, XInputEnable                      , BOOL);                                                   // XInput1_4.dll
 DECLARE_WIN32_RUNTIME_FUNCTION(DWORD   , WINAPI, XInputGetState                    , DWORD, XINPUT_STATE*);                                   // XInput1_4.dll
 DECLARE_WIN32_RUNTIME_FUNCTION(DWORD   , WINAPI, XInputSetState                    , DWORD, XINPUT_VIBRATION*);                               // XInput1_4.dll
@@ -507,16 +514,33 @@ missing_entry_point:
 //   Public Functions   //
 ////////////////////////*/
 /// @summary Initialize the runtime environment by loading all required APIs at runtime and requesting any elevated privileges.
+/// @param runtime_type One of WIN32_RUNTIME_TYPE specifying whether the runtime is being initialized on the client or the server.
 /// @return true if the runtime environment was successfully initialized.
 public_function bool 
 Win32InitializeRuntime
 (
-    void
+    int runtime_type
 )
 { 
     bool missing_entry_points = false;
-    if (!Win32LoadKernel(&missing_entry_points)) return false;
-    if (!Win32LoadXInput(&missing_entry_points)) return false;
+
+    // load routines required by both client and server.
+    if (!Win32LoadKernel(&missing_entry_points))
+    {   // without the kernel routines, there's no point in continuing.
+        return false;
+    }
+
+    if (runtime_type == WIN32_RUNTIME_TYPE_CLIENT)
+    {   // resolve client-only entry points.
+        if (!Win32LoadXInput(&missing_entry_points))
+        {   // without XInput, there is no support for gamepads.
+            return false;
+        }
+    }
+    if (runtime_type == WIN32_RUNTIME_TYPE_SERVER)
+    {   // resolve server-only entry points.
+    
+    }
     return ElevateProcessPrivileges();
 }
 

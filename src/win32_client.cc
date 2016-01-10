@@ -320,7 +320,7 @@ WinMain
     {   // create the console before doing anything else, so all debug output can be seen.
         CreateConsoleAndRedirectStdio();
     }
-    if (!Win32InitializeRuntime())
+    if (!Win32InitializeRuntime(WIN32_RUNTIME_TYPE_CLIENT))
     {   // if the necessary privileges could not be obtained, there's no point in proceeding.
         goto cleanup_and_shutdown;
     }
