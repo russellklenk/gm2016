@@ -1,8 +1,7 @@
 /*/////////////////////////////////////////////////////////////////////////////
 /// @summary Implement the entry point of the client application. Initializes 
-/// the runtime and sets up the rendering system, which is performed on the 
-/// main thread. User input and networking are handled on explicit background
-/// threads.
+/// the runtime and sets up the execution environment for the explicit 
+/// background threads. User input is handled on the main thread.
 ///////////////////////////////////////////////////////////////////////////80*/
 
 /*////////////////
@@ -22,14 +21,15 @@
 #include <tchar.h>
 #include <Windows.h>
 #include <Shellapi.h>
+#include <XInput.h>
 
 #include "platform_config.h"
 #include "compiler_config.h"
-
 #include "win32_platform.h"
+
+#include "win32_debug.cc"
 #include "win32_runtime.cc"
 #include "win32_timestamp.cc"
-#include "win32_debug.cc"
 #include "win32_parse.cc"
 #include "win32_memarena.cc"
 #include "win32_render.cc"

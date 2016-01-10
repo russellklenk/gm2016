@@ -17,6 +17,7 @@ struct WIN32_THREAD_ARGS
     HANDLE              StartEvent;      /// All threads wait on this manual-reset event before entering their main body.
     HANDLE              TerminateEvent;  /// All threads poll this manual-reset event. If signaled, they terminate.
     HINSTANCE           ModuleBaseAddr;  /// The module load address of the executable.
+    HWND                MessageWindow;   /// The background message window used to communicate with the main thread.
     WIN32_COMMAND_LINE *CommandLine;     /// Parsed command-line argument information.
 };
 

@@ -14,6 +14,7 @@
 #include <tchar.h>
 #include <Windows.h>
 #include <Shellapi.h>
+#include <XInput.h>
 
 #include <conio.h>
 #include <fcntl.h>
@@ -21,10 +22,11 @@
 
 #include "platform_config.h"
 #include "compiler_config.h"
+#include "win32_platform.h"
 
+#include "win32_debug.cc"
 #include "win32_runtime.cc"
 #include "win32_timestamp.cc"
-#include "win32_debug.cc"
 #include "win32_parse.cc"
 #include "win32_memarena.cc"
 
