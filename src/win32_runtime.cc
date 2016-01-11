@@ -424,7 +424,7 @@ ElevateProcessPrivileges
 /// @param missing_entry_points On return, set to true if any entry points are missing.
 /// @return true if Kernel32.dll was loaded into the process address space.
 internal_function bool
-Win32LoadKernel
+LoadKernel
 (
     bool *missing_entry_points
 )
@@ -468,7 +468,7 @@ missing_entry_point:
 /// @param missing_entry_points On return, set to true if any entry points are missing.
 /// @return true if the XInput DLL was loaded into the process address space.
 internal_function bool
-Win32LoadXInput
+LoadXInput
 (
     bool *missing_entry_points
 )
@@ -517,7 +517,7 @@ missing_entry_point:
 /// @param runtime_type One of WIN32_RUNTIME_TYPE specifying whether the runtime is being initialized on the client or the server.
 /// @return true if the runtime environment was successfully initialized.
 public_function bool 
-Win32InitializeRuntime
+InitializeRuntime
 (
     int runtime_type
 )
@@ -525,14 +525,14 @@ Win32InitializeRuntime
     bool missing_entry_points = false;
 
     // load routines required by both client and server.
-    if (!Win32LoadKernel(&missing_entry_points))
+    if (!LoadKernel(&missing_entry_points))
     {   // without the kernel routines, there's no point in continuing.
         return false;
     }
 
     if (runtime_type == WIN32_RUNTIME_TYPE_CLIENT)
     {   // resolve client-only entry points.
-        if (!Win32LoadXInput(&missing_entry_points))
+        if (!LoadXInput(&missing_entry_points))
         {   // without XInput, there is no support for gamepads.
             return false;
         }

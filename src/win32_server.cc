@@ -186,7 +186,7 @@ WinMain
         DebugPrintf(_T("ERROR: Unable to parse the command line.\n"));
         return 0;
     }
-    if (!Win32InitializeRuntime(WIN32_RUNTIME_TYPE_SERVER))
+    if (!InitializeRuntime(WIN32_RUNTIME_TYPE_SERVER))
     {   // 
         return 0;
     }
