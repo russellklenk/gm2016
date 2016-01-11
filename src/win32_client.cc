@@ -33,6 +33,7 @@
 #include "win32_parse.cc"
 #include "win32_memarena.cc"
 #include "win32_render.cc"
+#include "win32_input.cc"
 
 #include "memarena.cc"
 
@@ -185,8 +186,41 @@ MessageWindowCallback
             } break;
 
         case WM_INPUT:
-            {
-                result = DefWindowProc(hwnd, message, wparam, lparam);
+            {   // a fixed-size buffer on the stack should be sufficient for storing the packet.
+                UINT       packet_used = 0;
+                UINT const packet_size = 256;
+                uint8_t    packet[packet_size];
+
+                if (GetRawInputData((HRAWINPUT) lparam, RID_INPUT, packet, &packet_used, sizeof(RAWINPUTHEADER)) > 0)
+                {   // wparam is RIM_INPUT (foreground) or RIM_INPUTSINK (background).
+                    RAWINPUT *input = (RAWINPUT*)packet;
+
+                    switch (input->header.dwType)
+                    {
+                        case RIM_TYPEKEYBOARD:
+                            {
+                            } break;
+
+                        case RIM_TYPEMOUSE:
+                            {
+                            } break;
+
+                        default:
+                            {   // unknown device type; ignore.
+                            } break;
+                    }
+
+                    // pass the message on to the default handler "for cleanup".
+                    result = DefWindowProc(hwnd, message, wparam, lparam);
+                }
+                else
+                {   // there was an error retrieving data; pass the message on to the default handler.
+                    result = DefWindowProc(hwnd, message, wparam, lparam);
+                }
+            } break;
+
+        case WM_INPUT_DEVICE_CHANGE:
+            {   // a keyboard or mouse was attached or removed.
             } break;
 
         default:
@@ -260,7 +294,7 @@ SetupInputDevices
         ConsoleError("ERROR: Unable to register for keyboard and mouse input; reason = 0x%08X.\n", GetLastError());
         return false;
     }
-    // TODO(rlk): Load and initialize XInput for gamepad support.
+    // XInput is loaded by the InitializeRuntime function in win32_runtime.cc.
     return true;
 }
 
@@ -275,7 +309,7 @@ SpawnExplicitThread
     WIN32_THREAD_ARGS      *thread_args
 )
 {
-    return (HANDLE) _beginthreadex(NULL, 0, (_beginthreadex_proc_type) thread_main, thread_args, 0, NULL);
+    return (HANDLE) _beginthreadex(NULL, 0, thread_main, thread_args, 0, NULL);
 }
 
 /*////////////////////////

@@ -455,7 +455,7 @@ IsWindowed
 ////////////////////////*/
 /// @summary Implement the entry point for the main frame composition thread.
 /// @param args Pointer to a WIN32_THREAD_ARGS structure populated by the main thread.
-public_function void __stdcall
+public_function unsigned int __cdecl
 RenderThread
 (
     void *args
@@ -526,9 +526,10 @@ RenderThread
 
     ConsoleError("STATUS: The render thread is exiting.\n");
     SetEvent(thread_args->TerminateEvent);
+    return 0;
 
 terminate_thread:
     SetEvent(thread_args->TerminateEvent);
-    return;
+    return 1;
 }
 

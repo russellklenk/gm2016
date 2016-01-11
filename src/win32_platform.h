@@ -23,5 +23,5 @@ struct WIN32_THREAD_ARGS
 
 /// @summary Define the function signature for a thread entry point.
 /// @param argp A pointer to a WIN32_THREAD_ARGS strycture.
-typedef void (__stdcall *WIN32_THREAD_ENTRYPOINT)(void *argp);
+typedef unsigned int (__cdecl *WIN32_THREAD_ENTRYPOINT)(void *argp);
 
