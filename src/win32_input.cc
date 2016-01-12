@@ -299,8 +299,8 @@ ProcessKeyboardPacket
         case VK_MENU:     /* left/right ALT  */
             vkey =  e0 ? VK_RMENU : VK_LMENU;
             break;
-        case VK_RETURN:   /* numpad enter has e0 set */
-            vkey =  e0 ? VK_RETURN : VK_RETURN;
+        case VK_RETURN:
+            vkey =  e0 ? VK_SEPARATOR : VK_RETURN;
             break;
         case VK_INSERT:
             vkey = !e0 ? VK_NUMPAD0 : VK_INSERT;
