@@ -66,8 +66,8 @@ struct WIN32_GAMEPAD_STATE
 struct WIN32_POINTER_STATE
 {
     int32_t  Pointer[2];                    /// The absolute X and Y coordinates of the pointer, in virtual display space.
-    int32_t  Relative[3];                   /// The high definition relative X, Y and Z (wheel) values of the pointer.
-    int32_t  Buttons;                       /// A bitvector storing up to 32 button states (0 = left, 1 = right, 2 = middle) (1 = button down.)
+    int32_t  Relative[3];                   /// The high definition relative X, Y and Z (wheel) values of the pointer. X and Y are specified in mickeys.
+    uint32_t Buttons;                       /// A bitvector storing up to 32 button states (0 = left, 1 = right, 2 = middle) (1 = button down.)
 };
 
 // @summary Define a macro for easy static initialization of pointer state data.
@@ -387,16 +387,80 @@ CopyKeyDisplayName
     return (size_t)  GetKeyNameText(key_code, buffer, (int) buffer_size);
 }
 
-internal_function void
-ProcessMousePacket
+/// @summary Process a Raw Input mouse packet to extract the movement, position and flags data.
+/// @param input The Raw Input mouse packet to process.
+/// @param flags On return, stores the RI_MOUSE_* flags associated with the input.
+/// @return The zero-based index of the input device in the current input buffer, or WIN32_INPUT_DEVICE_TOO_MANY.
+internal_function size_t
+ProcessPointerPacket
 (
-    RAWINPUT const *input
+    RAWINPUT const *input,
+    uint32_t       &flags
 )
 {
     RAWINPUTHEADER const &header = input->header;
-    RAWMOUSE       const &mouse  = input->data.mouse;
-    UNUSED_LOCAL(header);
-    UNUSED_LOCAL(mouse);
+    RAWMOUSE       const  &mouse = input->data.mouse;
+    WIN32_POINTER_STATE   *state = NULL;
+    WIN32_POINTER_LIST  &devices = CurrentInputBuffer->Pointers;
+    size_t                 index = 0;
+
+    // locate the pointer in the current state buffer by device handle.
+    for (size_t i = 0, n = devices.DeviceCount; i < n; ++i)
+    {
+        if (devices.DeviceHandle[i] == header.hDevice)
+        {   // found the matching device.
+            index = i;
+            state =&devices.DeviceState[i];
+        }
+    }
+    if (state == NULL)
+    {   // this device was newly attached.
+        if (devices.DeviceCount == WIN32_POINTER_LIST::MAX_DEVICES)
+        {   // there are too many devices of the specified type attached.
+            return WIN32_INPUT_DEVICE_TOO_MANY;
+        }
+        index = devices.DeviceCount++;
+        state =&devices.DeviceState[index];
+    }
+
+    if (mouse.usFlags & MOUSE_MOVE_ABSOLUTE)
+    {   // the device is a pen, touchscreen, etc. and specifies absolute coordinates.
+        state->Pointer[0]  = mouse.lLastX;
+        state->Pointer[1]  = mouse.lLastY;
+        // relative coordinates have to be calculated externally.
+        state->Relative[0] = 0;
+        state->Relative[1] = 0;
+    }
+    else
+    {   // the device has specified relative coordinates in mickeys.
+        state->Relative[0] = mouse.lLastX;
+        state->Relative[1] = mouse.lLastY;
+        // grab the current mouse pointer position, in pixels.
+        POINT cursor; GetCursorPos(&cursor);
+        state->Pointer[0]  = cursor.x;
+        state->Pointer[1]  = cursor.y;
+    }
+    if (mouse.usButtonFlags & RI_MOUSE_WHEEL)
+    {   // mouse wheel data was supplied with the packet.
+        state->Relative[2] = (int16_t) mouse.usButtonData;
+    }
+    else
+    {   // no mouse wheel data was supplied with the packet.
+        state->Relative[2] = 0;
+    }
+
+    // rebuild the button state vector. Raw Input supports up to 5 buttons.
+    uint32_t  b[5] = {};
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_1_DOWN) b[0] = (1 << 0);
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_2_DOWN) b[1] = (1 << 1);
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_3_DOWN) b[2] = (1 << 2);
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN) b[3] = (1 << 3);
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN) b[4] = (1 << 4);
+    state->Buttons = (b[0] | b[1] | b[2] | b[3] | b[4]);
+
+    // return the button flags to the caller so they can track transitions.
+    flags = mouse.usButtonFlags;
+    return index;
 }
 
 internal_function void
