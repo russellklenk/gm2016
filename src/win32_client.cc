@@ -260,18 +260,19 @@ CreateMessageWindow
         wndclass.hbrBackground  = NULL;
         if (!RegisterClassEx(&wndclass))
         {   // unable to register the window class; cannot proceed.
+            DebugPrintf(_T("ERROR: Unable to register the message window class.\n"));
             return NULL;
         }
     }
 
     // the message window spans the entire virtual display space across all monitors.
-    int x      = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int y      = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int width  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
     // return the window handle. the window is not visible.
-    return CreateWindowEx(0, class_name, class_name, 0, x, y, width, height, HWND_MESSAGE, NULL, this_instance, NULL);
+    return CreateWindowEx(0, class_name, class_name, 0, x, y, w, h, HWND_MESSAGE, NULL, this_instance, NULL);
 }
 
 /// @summary Performs all setup and initialization for the input system. User input is handled on the main thread.
@@ -291,7 +292,7 @@ SetupInputDevices
     // this should also create a Windows message queue for the thread.
     if (!RegisterRawInputDevices(keyboard_and_mouse, 2, sizeof(RAWINPUTDEVICE)))
     {
-        ConsoleError("ERROR: Unable to register for keyboard and mouse input; reason = 0x%08X.\n", GetLastError());
+        DebugPrintf(_T("ERROR: Unable to register for keyboard and mouse input; reason = 0x%08X.\n"), GetLastError());
         return false;
     }
     // XInput is loaded by the InitializeRuntime function in win32_runtime.cc.
@@ -350,10 +351,6 @@ WinMain
         DebugPrintf(_T("ERROR: Unable to parse the command line.\n"));
         return 0;
     }
-    if (argv.CreateConsole)
-    {   // create the console before doing anything else, so all debug output can be seen.
-        CreateConsoleAndRedirectStdio();
-    }
     if (!InitializeRuntime(WIN32_RUNTIME_TYPE_CLIENT))
     {   // if the necessary privileges could not be obtained, there's no point in proceeding.
         goto cleanup_and_shutdown;
@@ -366,6 +363,12 @@ WinMain
     {   // no user input services are available.
         goto cleanup_and_shutdown;
     }
+    if (argv.CreateConsole)
+    {   // for some reason, this has to be done *after* the message window is created.
+        CreateConsoleAndRedirectStdio();
+    }
+    // ConsoleError and ConsoleOutput should be used past this point.
+    // 
 
     // set up explicit threads for frame composition, network I/O and file I/O.
     thread_args.StartEvent     = ev_start;
