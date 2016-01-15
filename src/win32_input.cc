@@ -17,6 +17,11 @@
 #define WIN32_PLAYER_INDEX_NONE           0xFFFFFFFFUL
 #endif
 
+/// @summary Define a bitvector used to poll all possible gamepad ports (all bits set.)
+#ifndef WIN32_ALL_GAMEPAD_PORTS
+#define WIN32_ALL_GAMEPAD_PORTS           0xFFFFFFFFUL
+#endif
+
 /// @summary Define the value indicating that an input packet was dropped because too many devices of the specified type are attached.
 #ifndef WIN32_INPUT_DEVICE_TOO_MANY
 #define WIN32_INPUT_DEVICE_TOO_MANY       ~size_t(0)
@@ -47,19 +52,19 @@ struct WIN32_GAMEPAD_STATE
 {
     uint32_t LTrigger;                      /// The left trigger value, in [0, 255].
     uint32_t RTrigger;                      /// The right trigger value, in [0, 255].
-    int32_t  LStick[2];                     /// The left analog stick X and Y values, after deadzone logic is applied.
-    int32_t  RStick[2];                     /// The right analog stick X and Y values, after deadzone logic is applied.
     uint32_t Buttons;                       /// A bitvector storing up to 32 button states (1 = button down.)
+    float    LStick[4];                     /// The left analog stick X, Y, magnitude and normalized magnitude values, after deadzone logic is applied.
+    float    RStick[4];                     /// The right analog stick X, Y, magnitude and normalized magnitude values, after deadzone logic is applied.
 };
 
 /// @summary Define a macro for easy static initialization of gamepad state data.
 #define WIN32_GAMEPAD_STATE_STATIC_INIT                                        \
     {                                                                          \
-        0,      /* LTrigger */                                                 \
-        0,      /* RTrigger */                                                 \
-      { 0, 0 }, /* LStick[X,Y] */                                              \
-      { 0, 0 }, /* RStick[X,Y] */                                              \
-        0       /* Buttons */                                                  \
+        0,            /* LTrigger */                                           \
+        0,            /* RTrigger */                                           \
+        0,            /* Buttons */                                            \
+      { 0, 0, 0, 0 }, /* LStick[X,Y,M,N] */                                    \
+      { 0, 0, 0, 0 }  /* RStick[X,Y,M,N] */                                    \
     }
 
 /// @summary Define the data associated with a pointing device (like a mouse.)
@@ -463,14 +468,127 @@ ProcessPointerPacket
     return index;
 }
 
+/// @summary Apply scaled radial deadzone logic to an analog stick input.
+/// @param stick_x The x-axis component of the analog input.
+/// @param stick_y The y-axis component of the analog input.
+/// @param deadzone The deadzone size as a percentage of the total input range.
+/// @param stick_xymn A four-element array that will store the normalized x- and y-components of the input direction, the magnitude, and the normalized magnitude.
 internal_function void
-ProcessGamepadPacket
+ScaledRadialDeadzone
 (
-    XINPUT_STATE const       *input, 
-    DWORD              player_index
+    int16_t    stick_x, 
+    int16_t    stick_y, 
+    float     deadzone, 
+    float  *stick_xymn
 )
 {
-    UNUSED_ARG(input);
-    UNUSED_ARG(player_index);
+    float  x = stick_x;
+    float  y = stick_y;
+    float  m = sqrtf(x * x + y * y);
+    float nx = x / m;
+    float ny = y / m;
+
+    if (m < deadzone)
+    {   // drop the input; it falls within the deadzone.
+        stick_xymn[0] = 0;
+        stick_xymn[1] = 0;
+        stick_xymn[2] = 0;
+        stick_xymn[3] = 0;
+    }
+    else
+    {   // rescale the input into the non-dead space.
+        float n = (m - deadzone) / (1.0f - deadzone);
+        stick_xymn[0] = nx * n;
+        stick_xymn[1] = ny * n;
+        stick_xymn[2] = m;
+        stick_xymn[3] = n;
+    }
+}
+
+/// @summary Process an XInput gamepad packet to apply deadzone logic and update button states.
+/// @param input The XInput gámepad packet to process.
+/// @param port_index The zero-based index of the port to which the gamepad is connected.
+/// @return The zero-based index of the input device in the current input buffer, or WIN32_INPUT_DEVICE_TOO_MANY.
+internal_function size_t
+ProcessGamepadPacket
+(
+    XINPUT_STATE const     *input, 
+    DWORD              port_index
+)
+{
+    WIN32_GAMEPAD_STATE   *state = NULL;
+    WIN32_GAMEPAD_LIST  &devices = CurrentInputBuffer->Gamepads;
+    size_t                 index = 0;
+
+    // locate the pointer in the current state buffer by port index.
+    for (size_t i = 0, n = devices.DeviceCount; i < n; ++i)
+    {
+        if (devices.PlayerIndex[i] == port_index)
+        {   // found the matching device.
+            index = i;
+            state =&devices.DeviceState[i];
+        }
+    }
+    if (state == NULL)
+    {   // this device was newly attached.
+        if (devices.DeviceCount == WIN32_GAMEPAD_LIST::MAX_DEVICES)
+        {   // there are too many devices of the specified type attached.
+            return WIN32_INPUT_DEVICE_TOO_MANY;
+        }
+        index = devices.DeviceCount++;
+        state =&devices.DeviceState[index];
+    }
+
+    // apply deadzone filtering to the trigger inputs.
+    state->LTrigger = input->Gamepad.bLeftTrigger  > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ? input->Gamepad.bLeftTrigger  : 0;
+    state->RTrigger = input->Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ? input->Gamepad.bRightTrigger : 0;
+    // copy over the button state bits as-is.
+    state->Buttons  = input->Gamepad.wButtons;
+    // apply deadzone filtering to the analog stick inputs.
+    float const l_deadzone = XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE  / 32767.0f;
+    float const r_deadzone = XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE / 32767.0f;
+    ScaledRadialDeadzone(input->Gamepad.sThumbLX, input->Gamepad.sThumbLY, l_deadzone, state->LStick);
+    ScaledRadialDeadzone(input->Gamepad.sThumbRX, input->Gamepad.sThumbRY, r_deadzone, state->RStick);
+    return index;
+}
+
+/// @summary Poll XInput gamepads attached to the system and update the input device state.
+/// @param ports_in A bitvector specifying the gamepad ports to poll. Specify WIN32_ALL_GAMEPAD_PORTS to poll all possible ports. MSDN recommends against polling unattached ports each frame.
+/// @param ports_out A bitvector specifying the attached gamepad ports. Bit x is set if port x has an attached gamepad.
+/// @return The number of gamepads attached to the system (the number of bits set in ports_out.)
+internal_function size_t
+PollGamepads
+(
+    uint32_t   ports_in,
+    uint32_t &ports_out
+)
+{
+    size_t   const max_gamepads = 4;
+    size_t         num_gamepads = 0;
+    uint32_t const port_bits[4] = {
+        (1UL << 0UL), 
+        (1UL << 1UL), 
+        (1UL << 2UL), 
+        (1UL << 3UL)
+    };
+    // clear all attached port bits in the output:
+    ports_out = 0;
+    // poll any ports whose corresponding bit is set in ports_in.
+    for (size_t i = 0; i < max_gamepads; ++i)
+    {
+        if (ports_in & port_bits[i])
+        {
+            XINPUT_STATE state = {};
+            DWORD       result = XInputGetState((DWORD) i, &state);
+            if (result == ERROR_SUCCESS)
+            {   // gamepad port i is attached and in use.
+                ports_out |= port_bits[i];
+                // update the corresponding input state.
+                ProcessGamepadPacket(&state, (DWORD) i);
+                num_gamepads++;
+            }
+        }
+    }
+    return num_gamepads;
 }
 
