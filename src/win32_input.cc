@@ -779,3 +779,34 @@ GenerateGamepadEvents
     }
 }
 
+/*////////////////////////
+//   Public Functions   //
+////////////////////////*/
+/// @summary Initializes the state of the low-level input system.
+/// @param system A pointer to the low-level input system to initialize.
+public_function void
+InitializeInputSystem
+(
+    WIN32_INPUT_SYSTEM *system
+)
+{
+    system->Buffers[0]   = WIN32_INPUT_DEVICES_STATIC_INIT;
+    system->Buffers[1]   = WIN32_INPUT_DEVICES_STATIC_INIT;
+    system->PrevState    =&system->Buffers[0];
+    system->CurrState    =&system->Buffers[1];
+    system->PrevPorts    = 0;
+    system->CurrPorts    = 0;
+    system->LastPollTime = 0;
+}
+
+public_function void
+PollInputDevices
+(
+    WIN32_INPUT_SYSTEM   *system,
+    uint64_t           tick_time
+)
+{
+    UNUSED_ARG(system);
+    UNUSED_ARG(tick_time);
+}
+
