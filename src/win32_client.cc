@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <assert.h>
 
 #include <process.h>
 #include <conio.h>
