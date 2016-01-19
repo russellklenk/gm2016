@@ -45,6 +45,8 @@
 /*///////////////
 //   Globals   //
 ///////////////*/
+/// @summary Define the data associated with the low-level input system as local to this module.
+global_variable WIN32_INPUT_SYSTEM InputSystem;
 
 /*//////////////////////////
 //   Internal Functions   //
@@ -191,27 +193,9 @@ MessageWindowCallback
                 UINT       packet_used = 0;
                 UINT const packet_size = 256;
                 uint8_t    packet[packet_size];
-
                 if (GetRawInputData((HRAWINPUT) lparam, RID_INPUT, packet, &packet_used, sizeof(RAWINPUTHEADER)) > 0)
                 {   // wparam is RIM_INPUT (foreground) or RIM_INPUTSINK (background).
-                    RAWINPUT *input = (RAWINPUT*)packet;
-
-                    switch (input->header.dwType)
-                    {
-                        case RIM_TYPEKEYBOARD:
-                            {
-                            } break;
-
-                        case RIM_TYPEMOUSE:
-                            {
-                            } break;
-
-                        default:
-                            {   // unknown device type; ignore.
-                            } break;
-                    }
-
-                    // pass the message on to the default handler "for cleanup".
+                    PushRawInput(&InputSystem, (RAWINPUT*)packet);
                     result = DefWindowProc(hwnd, message, wparam, lparam);
                 }
                 else
@@ -332,19 +316,24 @@ WinMain
     int        show_command
 )
 {
-    WIN32_COMMAND_LINE        argv;
-    WIN32_THREAD_ARGS  thread_args = {};
-    HANDLE                ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
-    HANDLE                ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
-    HANDLE             thread_draw = NULL; // frame composition thread and main UI thread
-    HANDLE             thread_disk = NULL; // asynchronous disk I/O thread
-    HANDLE             thread_net  = NULL; // network I/O thread
-    HWND            message_window = NULL; // for receiving input and notification from other threads
-    bool              keep_running = true;
+    WIN32_COMMAND_LINE          argv;
+    WIN32_THREAD_ARGS    thread_args = {};
+    WIN32_INPUT_EVENTS  input_events = {};
+    WIN32_INPUT_SYSTEM *input_system =&InputSystem; // global; module-local
+    HANDLE                  ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+    HANDLE                  ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+    HANDLE               thread_draw = NULL; // frame composition thread and main UI thread
+    HANDLE               thread_disk = NULL; // asynchronous disk I/O thread
+    HANDLE               thread_net  = NULL; // network I/O thread
+    HWND              message_window = NULL; // for receiving input and notification from other threads
+    bool                keep_running = true;
 
     UNUSED_ARG(prev_instance);
     UNUSED_ARG(command_line);
     UNUSED_ARG(show_command);
+
+    // initialize the state of the low-level user input system, needed by the message window's WndProc.
+    ResetInputSystem(input_system);
 
     // set up the runtime environment. if any of these steps fail, the game cannot run.
     if (!ParseCommandLine(&argv))
@@ -389,7 +378,8 @@ WinMain
     // enter the main game loop:
     while (keep_running)
     {   
-        MSG msg;
+        uint64_t tick_start = TimestampInTicks();
+        MSG      msg;
 
         // poll for externally-signaled application termination.
         if (WaitForSingleObject(ev_break, 0) == WAIT_OBJECT_0)
@@ -418,6 +408,9 @@ WinMain
         {   // time to break out of the main loop.
             break;
         }
+
+        // update the state of all user input devices.
+        ConsumeInputEvents(&input_events, input_system, tick_start);
     }
 
     ConsoleOutput("The main thread has exited.\n");
