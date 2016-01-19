@@ -1031,10 +1031,10 @@ GenerateGamepadEvents
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
-/// @summary Initializes the state of the low-level input system.
-/// @param system A pointer to the low-level input system to initialize.
+/// @summary Resets the state of the low-level input system.
+/// @param system A pointer to the low-level input system to reset.
 public_function void
-InitializeInputSystem
+ResetInputSystem
 (
     WIN32_INPUT_SYSTEM *system
 )
