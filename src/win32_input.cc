@@ -668,7 +668,7 @@ PollGamepads
         if (ports_in & port_bits[i])
         {
             XINPUT_STATE state = {};
-            DWORD       result = XInputGetState((DWORD) i, &state);
+            DWORD       result = XInputGetState_Func((DWORD) i, &state);
             if (result == ERROR_SUCCESS)
             {   // gamepad port i is attached and in use.
                 ports_out |= port_bits[i];
