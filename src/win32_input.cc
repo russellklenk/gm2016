@@ -7,24 +7,24 @@
 /*/////////////////
 //   Constants   //
 /////////////////*/
-/// @summary Define the value indicating an unused device handle. Gamepads don't specify a device handle, so they present as (HANDLE) dwPlayerIndex.
+/// @summary Define the value indicating an unused device handle.
 #ifndef WIN32_INPUT_DEVICE_HANDLE_NONE
-#define WIN32_INPUT_DEVICE_HANDLE_NONE       INVALID_HANDLE_VALUE
+#define WIN32_INPUT_DEVICE_HANDLE_NONE          INVALID_HANDLE_VALUE
 #endif
 
 /// @summary Define a bitvector used to poll all possible gamepad ports (all bits set.)
 #ifndef WIN32_ALL_GAMEPAD_PORTS
-#define WIN32_ALL_GAMEPAD_PORTS              0xFFFFFFFFUL
+#define WIN32_ALL_GAMEPAD_PORTS                 0xFFFFFFFFUL
 #endif
 
 /// @summary Define the value indicating that an input packet was dropped because too many devices of the specified type are attached.
 #ifndef WIN32_INPUT_DEVICE_TOO_MANY
-#define WIN32_INPUT_DEVICE_TOO_MANY          ~size_t(0)
+#define WIN32_INPUT_DEVICE_TOO_MANY             ~size_t(0)
 #endif
 
 /// @summary Define the value indicating that a device was not found in the specified device list.
 #ifndef WIN32_INPUT_DEVICE_NOT_FOUND
-#define WIN32_INPUT_DEVICE_NOT_FOUND         ~size_t(0)
+#define WIN32_INPUT_DEVICE_NOT_FOUND            ~size_t(0)
 #endif
 
 /*//////////////////
@@ -33,7 +33,7 @@
 /// @summary Define the data associated with keyboard state.
 struct WIN32_KEYBOARD_STATE
 {
-    uint32_t KeyState[8];                      /// A bitvector (256 bits) mapping scan code to key state (1 = key down.)
+    uint32_t             KeyState[8];           /// A bitvector (256 bits) mapping scan code to key state (1 = key down.)
 };
 
 /// @summary Define a macro for easy static initialization of keyboard state data.
@@ -45,11 +45,11 @@ struct WIN32_KEYBOARD_STATE
 /// @summary Define the data associated with gamepad state (Xbox controller.)
 struct WIN32_GAMEPAD_STATE
 {
-    uint32_t LTrigger;                         /// The left trigger value, in [0, 255].
-    uint32_t RTrigger;                         /// The right trigger value, in [0, 255].
-    uint32_t Buttons;                          /// A bitvector storing up to 32 button states (1 = button down.)
-    float    LStick[4];                        /// The left analog stick X, Y, magnitude and normalized magnitude values, after deadzone logic is applied.
-    float    RStick[4];                        /// The right analog stick X, Y, magnitude and normalized magnitude values, after deadzone logic is applied.
+    uint32_t             LTrigger;              /// The left trigger value, in [0, 255].
+    uint32_t             RTrigger;              /// The right trigger value, in [0, 255].
+    uint32_t             Buttons;               /// A bitvector storing up to 32 button states (1 = button down.)
+    float                LStick[4];             /// The left analog stick X, Y, magnitude and normalized magnitude values, after deadzone logic is applied.
+    float                RStick[4];             /// The right analog stick X, Y, magnitude and normalized magnitude values, after deadzone logic is applied.
 };
 
 /// @summary Define a macro for easy static initialization of gamepad state data.
@@ -65,17 +65,17 @@ struct WIN32_GAMEPAD_STATE
 /// @summary Define flags indicating how to interpret WIN32_POINTER_STATE::Relative.
 enum WIN32_POINTER_FLAGS : uint32_t
 {
-    WIN32_POINTER_FLAGS_NONE     = (0 << 0),   /// No special flags are specified with the pointer data.
-    WIN32_POINTER_FLAGS_ABSOLUTE = (1 << 0),   /// Only absolute position was specified.
+    WIN32_POINTER_FLAGS_NONE     = (0 << 0),    /// No special flags are specified with the pointer data.
+    WIN32_POINTER_FLAGS_ABSOLUTE = (1 << 0),    /// Only absolute position was specified.
 };
 
 /// @summary Define the data associated with a pointing device (like a mouse.)
 struct WIN32_POINTER_STATE
 {
-    int32_t  Pointer[2];                       /// The absolute X and Y coordinates of the pointer, in virtual display space.
-    int32_t  Relative[3];                      /// The high definition relative X, Y and Z (wheel) values of the pointer. X and Y are specified in mickeys.
-    uint32_t Buttons;                          /// A bitvector storing up to 32 button states (0 = left, 1 = right, 2 = middle) (1 = button down.)
-    uint32_t Flags;                            /// Bitflags indicating postprocessing that needs to be performed.
+    int32_t              Pointer[2];            /// The absolute X and Y coordinates of the pointer, in virtual display space.
+    int32_t              Relative[3];           /// The high definition relative X, Y and Z (wheel) values of the pointer. X and Y are specified in mickeys.
+    uint32_t             Buttons;               /// A bitvector storing up to 32 button states (0 = left, 1 = right, 2 = middle) (1 = button down.)
+    uint32_t             Flags;                 /// Bitflags indicating postprocessing that needs to be performed.
 };
 
 // @summary Define a macro for easy static initialization of pointer state data.
@@ -89,16 +89,17 @@ struct WIN32_POINTER_STATE
 /// @summary Define the data associated with a list of user input devices of the same type.
 template <typename T>
 struct WIN32_INPUT_DEVICE_LIST
-{   static size_t const MAX_DEVICES = 4;       /// The maximum number of attached devices.
-    size_t DeviceCount;                        /// The number of attached devices.
-    HANDLE DeviceHandle[MAX_DEVICES];          /// The OS device handle for each device.
-    T      DeviceState [MAX_DEVICES];          /// The current state for each device.
+{   static size_t const  MAX_DEVICES = 4;       /// The maximum number of attached devices.
+    static size_t const  N = MAX_DEVICES;       /// An alias for MAX_DEVICES used for array sizing.
+    size_t               DeviceCount;           /// The number of attached devices.
+    HANDLE               DeviceHandle[N];       /// The OS device handle for each device.
+    T                    DeviceState [N];       /// The current state for each device.
 };
 typedef WIN32_INPUT_DEVICE_LIST<WIN32_KEYBOARD_STATE> WIN32_KEYBOARD_LIST;
 typedef WIN32_INPUT_DEVICE_LIST<WIN32_GAMEPAD_STATE>  WIN32_GAMEPAD_LIST;
 typedef WIN32_INPUT_DEVICE_LIST<WIN32_POINTER_STATE>  WIN32_POINTER_LIST;
 
-/// @summary Define a macro for easy static initialization of a keyboard list.
+/// @summary Define a macro for easy static initialization of a keyboard device list.
 #define WIN32_KEYBOARD_LIST_STATIC_INIT                                        \
     {                                                                          \
         0, /* DeviceCount */                                                   \
@@ -114,7 +115,7 @@ typedef WIN32_INPUT_DEVICE_LIST<WIN32_POINTER_STATE>  WIN32_POINTER_LIST;
       }    /* DeviceState */                                                   \
     }
 
-/// @summary Define a macro for easy static initialzation of a gamepad list.
+/// @summary Define a macro for easy static initialzation of a gamepad device list.
 #define WIN32_GAMEPAD_LIST_STATIC_INIT                                         \
     {                                                                          \
         0, /* DeviceCount */                                                   \
@@ -130,7 +131,7 @@ typedef WIN32_INPUT_DEVICE_LIST<WIN32_POINTER_STATE>  WIN32_POINTER_LIST;
       }    /* DeviceState */                                                   \
     }
 
-/// @summary Define a macro for easy static initialization of a pointer (mouse) list.
+/// @summary Define a macro for easy static initialization of a pointing device list.
 #define WIN32_POINTER_LIST_STATIC_INIT                                         \
     {                                                                          \
         0, /* DeviceCount */                                                   \
@@ -146,95 +147,145 @@ typedef WIN32_INPUT_DEVICE_LIST<WIN32_POINTER_STATE>  WIN32_POINTER_LIST;
       }    /* DeviceState */                                                   \
     }
 
+/// @summary Define the possible values for membership in a Raw Input device set.
+enum WIN32_INPUT_DEVICE_SET_MEMBERSHIP : uint32_t
+{
+    WIN32_INPUT_DEVICE_MEMBERSHIP_NONE  = (0 << 0),  /// The Raw Input device is not in either the current or previous snapshot.
+    WIN32_INPUT_DEVICE_MEMBERSHIP_PREV  = (1 << 0),  /// The Raw Input device is in the previous state snapshot.
+    WIN32_INPUT_DEVICE_MEMBERSHIP_CURR  = (1 << 1),  /// The Raw Input device is in the current state snapshot.
+    WIN32_INPUT_DEVICE_MEMBERSHIP_BOTH  = WIN32_INPUT_DEVICE_MEMBERSHIP_PREV | WIN32_INPUT_DEVICE_MEMBERSHIP_CURR
+};
+
+/// @summary Defines the data associated with a Raw Input device membership set computed from two device list snapshots.
+struct WIN32_INPUT_DEVICE_SET
+{   static size_t const  MAX_DEVICES = 4;
+    static size_t const  N = MAX_DEVICES * 2;        /// The maximum device set size is 2 * the maximum number of devices in a device list.
+    size_t               DeviceCount;                /// The number of devices in the device set.
+    HANDLE               DeviceIds[N];               /// The Win32 device identifiers. There are no duplicates in the list.
+    uint32_t             Membership[N];              /// The WIN32_INPUT_DEVICE_SET_MEMBERSHIP values for each device.
+    uint8_t              PrevIndex[N];               /// The zero-based indices of the device in the previous device list.
+    uint8_t              CurrIndex[N];               /// The zero-based indices of the device in the current device list.
+};
+
+/// @summary Define a macro for easy initialization of a device set to empty.
+#define WIN32_INPUT_DEVICE_SET_STATIC_INIT                                     \
+    {                                                                          \
+        0, /* DeviceCount */                                                   \
+        { WIN32_INPUT_DEVICE_HANDLE_NONE,                                      \
+          WIN32_INPUT_DEVICE_HANDLE_NONE,                                      \
+          WIN32_INPUT_DEVICE_HANDLE_NONE,                                      \
+          WIN32_INPUT_DEVICE_HANDLE_NONE,                                      \
+          WIN32_INPUT_DEVICE_HANDLE_NONE,                                      \
+          WIN32_INPUT_DEVICE_HANDLE_NONE,                                      \
+          WIN32_INPUT_DEVICE_HANDLE_NONE,                                      \
+          WIN32_INPUT_DEVICE_HANDLE_NONE                                       \
+        }, /* DeviceIds */                                                     \
+        { WIN32_INPUT_DEVICE_MEMBERSHIP_NONE,                                  \
+          WIN32_INPUT_DEVICE_MEMBERSHIP_NONE,                                  \
+          WIN32_INPUT_DEVICE_MEMBERSHIP_NONE,                                  \
+          WIN32_INPUT_DEVICE_MEMBERSHIP_NONE,                                  \
+          WIN32_INPUT_DEVICE_MEMBERSHIP_NONE,                                  \
+          WIN32_INPUT_DEVICE_MEMBERSHIP_NONE,                                  \
+          WIN32_INPUT_DEVICE_MEMBERSHIP_NONE,                                  \
+          WIN32_INPUT_DEVICE_MEMBERSHIP_NONE                                   \
+        }, /* Membership */                                                    \
+        {                                                                      \
+          0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF                       \
+        }, /* PrevIndex */                                                     \
+        {                                                                      \
+          0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF                       \
+        }  /* CurrIndex */                                                     \
+    }
+
 /// @summary Define the data used to report events generated by a keyboard device between two state snapshots.
 struct WIN32_KEYBOARD_EVENTS
-{   static size_t const  MAX_KEYS = 8;          /// The maximum number of key events reported.
-    size_t               DownCount;             /// The number of keys currently in the down state.
-    size_t               PressedCount;          /// The number of keys just pressed.
-    size_t               ReleasedCount;         /// The number of keys just released.
-    uint8_t              Down[MAX_KEYS];        /// The virtual key codes for all keys currently down.
-    uint8_t              Pressed[MAX_KEYS];     /// The virtual key codes for all keys just pressed.
-    uint8_t              Released[MAX_KEYS];    /// The virtual key codes for all keys just released.
+{   static size_t const  MAX_KEYS = 8;               /// The maximum number of key events reported.
+    size_t               DownCount;                  /// The number of keys currently in the down state.
+    size_t               PressedCount;               /// The number of keys just pressed.
+    size_t               ReleasedCount;              /// The number of keys just released.
+    uint8_t              Down[MAX_KEYS];             /// The virtual key codes for all keys currently down.
+    uint8_t              Pressed[MAX_KEYS];          /// The virtual key codes for all keys just pressed.
+    uint8_t              Released[MAX_KEYS];         /// The virtual key codes for all keys just released.
 };
 
 /// @summary Define the data used to report events generated by a pointer device between two state snapshots.
 struct WIN32_POINTER_EVENTS
-{   static size_t const  MAX_BUTTONS = 8;       /// The maximum number of button events reported.
-    int32_t              Cursor[2];             /// The absolute position of the cursor in virtual display space.
-    int32_t              Mickeys[2];            /// The relative movement of the pointer from the last update, in mickeys.
-    int32_t              WheelDelta;            /// The mouse wheel delta from the last update.
-    size_t               DownCount;             /// The number of buttons currently in the pressed state.
-    size_t               PressedCount;          /// The number of buttons just pressed.
-    size_t               ReleasedCount;         /// The number of buttons just released.
-    uint16_t             Down[MAX_BUTTONS];     /// The MK_nBUTTON identifiers for all buttons in the down state.
-    uint16_t             Pressed[MAX_BUTTONS];  /// The MK_nBUTTON identifiers for all buttons that were just pressed.
-    uint16_t             Released[MAX_BUTTONS]; /// The MK_nBUTTON identifiers for all buttons that were just released.
+{   static size_t const  MAX_BUTTONS = 8;            /// The maximum number of button events reported.
+    int32_t              Cursor[2];                  /// The absolute position of the cursor in virtual display space.
+    int32_t              Mickeys[2];                 /// The relative movement of the pointer from the last update, in mickeys.
+    int32_t              WheelDelta;                 /// The mouse wheel delta from the last update.
+    size_t               DownCount;                  /// The number of buttons currently in the pressed state.
+    size_t               PressedCount;               /// The number of buttons just pressed.
+    size_t               ReleasedCount;              /// The number of buttons just released.
+    uint16_t             Down[MAX_BUTTONS];          /// The MK_nBUTTON identifiers for all buttons in the down state.
+    uint16_t             Pressed[MAX_BUTTONS];       /// The MK_nBUTTON identifiers for all buttons that were just pressed.
+    uint16_t             Released[MAX_BUTTONS];      /// The MK_nBUTTON identifiers for all buttons that were just released.
 };
 
 /// @summary Define the data used to report events generated by an XInput gamepad device between two state snapshots.
 struct WIN32_GAMEPAD_EVENTS
-{   static size_t const  MAX_BUTTONS = 8;       /// The maximum number of button events reported.
-    float                LeftTrigger;           /// The left trigger value, in [0, 255].
-    float                RightTrigger;          /// The right trigger value, in [0, 255].
-    float                LeftStick[2];          /// The left analog stick normalized X and Y.
-    float                LeftStickMagnitude;    /// The normalized magnitude of the left stick vector.
-    float                RightStick[2];         /// The right analog stick normalized X and Y.
-    float                RightStickMagnitude;   /// The normalized magnitude of the right stick vector.
-    size_t               DownCount;             /// The number of buttons currently in the pressed state.
-    size_t               PressedCount;          /// The number of buttons just pressed.
-    size_t               ReleasedCount;         /// The number of buttons just released.
-    uint16_t             Down[MAX_BUTTONS];     /// The XINPUT_GAMEPAD_x identifiers for all buttons in the down state.
-    uint16_t             Pressed[MAX_BUTTONS];  /// The XINPUT_GAMEPAD_x identifiers for all buttons that were just pressed.
-    uint16_t             Released[MAX_BUTTONS]; /// The XINPUT_GAMEPAD_x identifiers for all buttons that were just released.
+{   static size_t const  MAX_BUTTONS = 8;            /// The maximum number of button events reported.
+    float                LeftTrigger;                /// The left trigger value, in [0, 255].
+    float                RightTrigger;               /// The right trigger value, in [0, 255].
+    float                LeftStick[2];               /// The left analog stick normalized X and Y.
+    float                LeftStickMagnitude;         /// The normalized magnitude of the left stick vector.
+    float                RightStick[2];              /// The right analog stick normalized X and Y.
+    float                RightStickMagnitude;        /// The normalized magnitude of the right stick vector.
+    size_t               DownCount;                  /// The number of buttons currently in the pressed state.
+    size_t               PressedCount;               /// The number of buttons just pressed.
+    size_t               ReleasedCount;              /// The number of buttons just released.
+    uint16_t             Down[MAX_BUTTONS];          /// The XINPUT_GAMEPAD_x identifiers for all buttons in the down state.
+    uint16_t             Pressed[MAX_BUTTONS];       /// The XINPUT_GAMEPAD_x identifiers for all buttons that were just pressed.
+    uint16_t             Released[MAX_BUTTONS];      /// The XINPUT_GAMEPAD_x identifiers for all buttons that were just released.
 };
 
 /// @summary Define the data used to report input events for all input devices attached to the system at a given point in time.
 struct WIN32_INPUT_EVENTS
-{   static size_t const   MAX_DEVICES = 4;       /// The maximum number of devices of each type that can be recognized simultaneously.
-    static size_t const   N = MAX_DEVICES;       /// Alias for MAX_DEVICE used to define internal array sizes.
+{   static size_t const   MAX_DEVICES = 4;            /// The maximum number of devices of each type that can be recognized simultaneously.
+    static size_t const   N = MAX_DEVICES;            /// Alias for MAX_DEVICES used to define internal array sizes.
 
-    size_t                KeyboardAttachCount;   /// The number of keyboard devices newly attached during the tick.
-    HANDLE                KeyboardAttach[N];     /// The system device identifiers of the newly attached keyboard devices.
+    size_t                KeyboardAttachCount;        /// The number of keyboard devices newly attached during the tick.
+    HANDLE                KeyboardAttach[N];          /// The system device identifiers of the newly attached keyboard devices.
     
-    size_t                KeyboardRemoveCount;   /// The number of keyboard devices newly removed during the tick.
-    HANDLE                KeyboardRemove[N];     /// The system device identifiers of the newly removed keyboard devices.
+    size_t                KeyboardRemoveCount;        /// The number of keyboard devices newly removed during the tick.
+    HANDLE                KeyboardRemove[N];          /// The system device identifiers of the newly removed keyboard devices.
 
-    size_t                KeyboardCount;         /// The number of keyboard devices for which input events are reported.
-    HANDLE                KeyboardIds[N];        /// The system device identifiers of the keyboards for which input events are reported.
-    WIN32_KEYBOARD_EVENTS KeyboardEvents[N];     /// The input event data for keyboard devices.
+    size_t                KeyboardCount;              /// The number of keyboard devices for which input events are reported.
+    HANDLE                KeyboardIds[N];             /// The system device identifiers of the keyboards for which input events are reported.
+    WIN32_KEYBOARD_EVENTS KeyboardEvents[N];          /// The input event data for keyboard devices.
 
-    size_t                PointerAttachCount;    /// The number of pointer devices newly attached during the tick.
-    HANDLE                PointerAttach[N];      /// The system device identifiers of the newly attached pointer devices.
+    size_t                PointerAttachCount;         /// The number of pointer devices newly attached during the tick.
+    HANDLE                PointerAttach[N];           /// The system device identifiers of the newly attached pointer devices.
 
-    size_t                PointerRemoveCount;    /// The number of pointer devices newly removed during the tick.
-    HANDLE                PointerRemove[N];      /// The system device identifiers of the newly removed pointer devices.
+    size_t                PointerRemoveCount;         /// The number of pointer devices newly removed during the tick.
+    HANDLE                PointerRemove[N];           /// The system device identifiers of the newly removed pointer devices.
 
-    size_t                PointerCount;          /// The number of pointer devices for which input events are reported.
-    HANDLE                PointerIds[N];         /// The system device identifiers of the pointer devices for which input events are reported.
-    WIN32_POINTER_EVENTS  PointerEvents[N];      /// The input event data for pointer devices.
+    size_t                PointerCount;               /// The number of pointer devices for which input events are reported.
+    HANDLE                PointerIds[N];              /// The system device identifiers of the pointer devices for which input events are reported.
+    WIN32_POINTER_EVENTS  PointerEvents[N];           /// The input event data for pointer devices.
 
-    size_t                GamepadAttachCount;    /// The number of gamepad devices newly attached during the tick.
-    DWORD                 GamepadAttach[N];      /// The gamepad port indices of the newly attached gamepad devices.
+    size_t                GamepadAttachCount;         /// The number of gamepad devices newly attached during the tick.
+    DWORD                 GamepadAttach[N];           /// The gamepad port indices of the newly attached gamepad devices.
 
-    size_t                GamepadRemoveCount;    /// The number of gamepad devices newly removed during the tick.
-    DWORD                 GamepadRemove[N];      /// The gamepad port indices of the newly removed gamepad devices.
+    size_t                GamepadRemoveCount;         /// The number of gamepad devices newly removed during the tick.
+    DWORD                 GamepadRemove[N];           /// The gamepad port indices of the newly removed gamepad devices.
 
-    size_t                GamepadCount;          /// The number of gamepad devices for which input events are reported.
-    DWORD                 GamepadIds[N];         /// The gamepad port indices of the gamepad devices for which input events are reported.
-    WIN32_GAMEPAD_EVENTS  GamepadEvents[N];      /// The input event data for gamepad devices.
+    size_t                GamepadCount;               /// The number of gamepad devices for which input events are reported.
+    DWORD                 GamepadIds[N];              /// The gamepad port indices of the gamepad devices for which input events are reported.
+    WIN32_GAMEPAD_EVENTS  GamepadEvents[N];           /// The input event data for gamepad devices.
 };
 
 /// @summary Define the data associated with the low-level input system.
 struct WIN32_INPUT_SYSTEM
 {
-    uint64_t              LastPollTime;          /// The timestamp value at the last poll of all gamepad ports.
-    uint32_t              PrevPortIds;           /// Bitvector for gamepad ports connected on the previous tick.
-    uint32_t              CurrPortIds;           /// Bitvector for gamepad ports connected on the current tick.
+    uint64_t              LastPollTime;               /// The timestamp value at the last poll of all gamepad ports.
+    uint32_t              PrevPortIds;                /// Bitvector for gamepad ports connected on the previous tick.
+    uint32_t              CurrPortIds;                /// Bitvector for gamepad ports connected on the current tick.
     
-    size_t                BufferIndex;           /// Used to identify the "current" device state buffer.
-    WIN32_KEYBOARD_LIST   KeyboardBuffer[2];     /// Identifier and state information for keyboard devices.
-    WIN32_POINTER_LIST    PointerBuffer [2];     /// Identifier and state information for pointer devices.
-    WIN32_GAMEPAD_LIST    GamepadBuffer [2];     /// Identifier and state information for gamepad devices.
+    size_t                BufferIndex;                /// Used to identify the "current" device state buffer.
+    WIN32_KEYBOARD_LIST   KeyboardBuffer[2];          /// Identifier and state information for keyboard devices.
+    WIN32_POINTER_LIST    PointerBuffer [2];          /// Identifier and state information for pointer devices.
+    WIN32_GAMEPAD_LIST    GamepadBuffer [2];          /// Identifier and state information for gamepad devices.
 };
 
 /*///////////////
@@ -464,19 +515,19 @@ ProcessPointerPacket
 
     // grab the current mouse pointer position, in pixels.
     GetCursorPos(&cursor);
-    state->Pointer[0]  = cursor.x;
-    state->Pointer[1]  = cursor.y;
-
-    // store the high-resolution values. these could be absolute (pen, etc.) or relative (mouse.)
-    state->Relative[0] = mouse.lLastX;
-    state->Relative[1] = mouse.lLastY;
+    state->Pointer[0] = cursor.x;
+    state->Pointer[1] = cursor.y;
 
     if (mouse.usFlags & MOUSE_MOVE_ABSOLUTE)
     {   // the device is a pen, touchscreen, etc. and specifies absolute coordinates.
+        state->Relative[0]  = mouse.lLastX;
+        state->Relative[1]  = mouse.lLastY;
         state->Flags = WIN32_POINTER_FLAGS_ABSOLUTE;
     }
     else
     {   // the device has specified relative coordinates in mickeys.
+        state->Relative[0] += mouse.lLastX;
+        state->Relative[1] += mouse.lLastY;
         state->Flags = WIN32_POINTER_FLAGS_NONE;
     }
     if (mouse.usButtonFlags & RI_MOUSE_WHEEL)
@@ -630,12 +681,54 @@ PollGamepads
     return num_gamepads;
 }
 
+/// @summary Given a two device list snapshots, populate a device set specifying whether a given device is in none, one or both snapshots.
+/// @param set The device set to populate. This set should be initialized with WIN32_INPUT_DEVICE_SET_STATIC_INIT prior to calling this function.
+/// @param prev The device list from the previous state snapshot.
+/// @param curr The device list from the current state snapshot.
+template <typename T>
+internal_function void
+DetermineDeviceSet
+(
+    WIN32_INPUT_DEVICE_SET      *set, 
+    WIN32_INPUT_DEVICE_LIST<T> *prev,
+    WIN32_INPUT_DEVICE_LIST<T> *curr
+)
+{   assert(set->DeviceCount == 0);
+    // build a table of 'unique' devices and which set(s) they belong to.
+    set->DeviceCount = prev->DeviceCount;
+    for (size_t i = 0, n = prev->DeviceCount; i < n; ++i)
+    {   // the table starts out empty, so this step is just a simple copy.
+        set->DeviceIds [i] = prev->DeviceHandle[i];
+        set->Membership[i] = WIN32_INPUT_DEVICE_MEMBERSHIP_PREV;
+        set->PrevIndex [i] =(uint8_t) i;
+    }
+    for (size_t i = 0, n = curr->DeviceCount; i < n; ++i)
+    {   // the table may not be empty, so filter out duplicate devices.
+        HANDLE id = curr->DeviceHandle[i];
+        size_t ix = set->DeviceCount;
+        size_t in = 1;
+        for (size_t j = 0, m = set->DeviceCount; j < m; ++j)
+        {
+            if (set->DeviceIds[j] == id)
+            {   // found an existing entry with the same handle.
+                ix = j; // update the existing entry.
+                in = 0; // don't increment the device count.
+                break;
+            }
+        }
+        set->DeviceIds [ix]  = id;
+        set->Membership[ix] |= WIN32_INPUT_DEVICE_MEMBERSHIP_CURR;
+        set->CurrIndex [ix]  =(uint8_t) i;
+        set->DeviceCount    += in;
+    }
+}
+
 /// @summary Given two keyboard state snapshots, generate keyboard events for keys down, pressed and released.
 /// @param keys The keyboard events data to populate.
 /// @param prev The previous keyboard state snapshot.
 /// @param curr The current keyboard state snapshot.
 internal_function void
-GenerateKeyboardEvents
+GenerateKeyboardInputEvents
 (
     WIN32_KEYBOARD_EVENTS      *keys,
     WIN32_KEYBOARD_STATE const *prev, 
@@ -674,64 +767,53 @@ GenerateKeyboardEvents
     }
 }
 
-/// @summary Detect keyboard devices that are attached or removed between two state snapshots and emit events.
-/// @param events The input events to update with any device attach/removal events.
-/// @param prev The state snapshot from the previous tick.
-/// @param curr The state snapshot from the current tick.
+/// @summary Generate keyboard device and input events for all keyboard devices given two device list snapshots.
+/// @param events The input events structure to populate.
+/// @param prev The device list from the previous tick.
+/// @param curr The device list from the current tick.
 internal_function void
-GenerateKeyboardAttachRemove
+GenerateKeyboardEvents
 (
-    WIN32_INPUT_EVENTS  *events,
-    WIN32_KEYBOARD_LIST   *prev,
-    WIN32_KEYBOARD_LIST   *curr
+    WIN32_INPUT_EVENTS *events, 
+    WIN32_KEYBOARD_LIST  *prev,
+    WIN32_KEYBOARD_LIST  *curr
 )
-{   // NOTE: the WM_INPUT_DEVICE_CHANGE doesn't provide all of the desired information.
-    // specifically, it doesn't tell us what type of device was added or removed.
-    uint32_t const IN_CURR     = (1UL << 0UL);
-    uint32_t const IN_PREV     = (1UL << 1UL);
-    size_t   const MAX_DEVICES = WIN32_KEYBOARD_LIST::MAX_DEVICES * 2;
+{
+    WIN32_INPUT_DEVICE_SET device_set = WIN32_INPUT_DEVICE_SET_STATIC_INIT;
 
-    // build a table of 'unique' devices and which set(s) they belong to.
-    // values in device_set must be initialized to 0.
-    HANDLE   device_ids[MAX_DEVICES];
-    uint32_t device_set[MAX_DEVICES] = {};
-    size_t   num_devices = prev->DeviceCount;
-    for (size_t i = 0, n = prev->DeviceCount; i < n; ++i)
-    {   // the table starts out empty, so this is just a simple copy.
-        device_ids[i] = prev->DeviceHandle[i];
-        device_set[i] = IN_PREV;
-    }
-    for (size_t i = 0, n = curr->DeviceCount; i < n; ++i)
-    {   // the device table might not be empty, so filter duplicates.
-        HANDLE id = curr->DeviceHandles[i];
-        size_t ix = num_devices;
-        size_t in = 1;
-        for (size_t j = 0, m = num_devices; j < m; ++j)
-        {
-            if (device_ids[j] == id)
-            {   // found an existing entry with the same ID.
-                ix = j; // update the existing entry
-                in = 0; // don't increment num_devices
-                break;
-            }
-        }
-        device_ids[ix]  = id;
-        device_set[ix] |= IN_CURR;
-        num_devices    += in;
-    }
+    // determine the device set, which is used to determine whether devices were added or removed, 
+    // and also whether or not (or how) to generate state-based input events for a given device.
+    DetermineDeviceSet(&device_set, prev, curr);
 
-    // go through the table we just built and detect attach/remove.
+    // loop through each individual device and emit events.
     events->KeyboardAttachCount = 0;
     events->KeyboardRemoveCount = 0;
-    for (size_t i = 0; i < num_devices; ++i)
+    events->KeyboardCount       = 0;
+    for (size_t i = 0, n = device_set.DeviceCount; i < n; ++i)
     {
-        if (device_set[i] == IN_PREV)
-        {   // this device was just removed from the system.
-            events->KeyboardRemove[events->KeyboardRemoveCount++] = device_ids[i];
-        }
-        else if (device_set[i] == IN_CURR)
-        {   // this device was just attached to the system.
-            events->KeyboardAttach[events->KeyboardAttachCount++] = device_ids[i];
+        switch (device_set.Membership[i])
+        {
+            case WIN32_INPUT_DEVICE_MEMBERSHIP_PREV:
+                {   // this input device was just removed. no device state events are generated.
+                    events->KeyboardRemove[events->KeyboardRemoveCount] = device_set.DeviceIds[i];
+                    events->KeyboardRemoveCount++;
+                } break;
+
+            case WIN32_INPUT_DEVICE_MEMBERSHIP_CURR:
+                {   // this input device was just attached. no device state events are generated.
+                    events->KeyboardAttach[events->KeyboardAttachCount] = device_set.DeviceIds[i];
+                    events->KeyboardAttachCount++;
+                } break;
+
+            case WIN32_INPUT_DEVICE_MEMBERSHIP_BOTH:
+                {   // this input device was present in both snapshots.
+                    WIN32_KEYBOARD_EVENTS *input_ev = &events->KeyboardEvents[events->KeyboardCount];
+                    WIN32_KEYBOARD_STATE  *state_pp = &prev->DeviceState[device_set.PrevIndex[i]];
+                    WIN32_KEYBOARD_STATE  *state_cp = &curr->DeviceState[device_set.CurrIndex[i]];
+                    events->KeyboardIds[events->KeyboardCount] = device_set.DeviceIds[i];
+                    GenerateKeyboardInputEvents(input_ev, state_pp, state_cp);
+                    events->KeyboardCount++;
+                } break;
         }
     }
 }
@@ -741,7 +823,7 @@ GenerateKeyboardAttachRemove
 /// @param prev The previous pointer device state snapshot.
 /// @param curr The current pointer device state snapshot.
 internal_function void
-GeneratePointerEvents
+GeneratePointerInputEvents
 (
     WIN32_POINTER_EVENTS   *pointer, 
     WIN32_POINTER_STATE const *prev, 
@@ -792,64 +874,53 @@ GeneratePointerEvents
     }
 }
 
-/// @summary Detect pointer devices that are attached or removed between two state snapshots and emit events.
-/// @param events The input events to update with any device attach/removal events.
-/// @param prev The state snapshot from the previous tick.
-/// @param curr The state snapshot from the current tick.
+/// @summary Generate pointer device and input events for all pointer devices given two device list snapshots.
+/// @param events The input events structure to populate.
+/// @param prev The device list from the previous tick.
+/// @param curr The device list from the current tick.
 internal_function void
-GeneratePointerAttachRemove
+GeneratePointerEvents
 (
-    WIN32_INPUT_EVENTS  *events,
-    WIN32_POINTER_LIST    *prev,
-    WIN32_POINTER_LIST    *curr
+    WIN32_INPUT_EVENTS *events, 
+    WIN32_POINTER_LIST   *prev,
+    WIN32_POINTER_LIST   *curr
 )
-{   // NOTE: the WM_INPUT_DEVICE_CHANGE doesn't provide all of the desired information.
-    // specifically, it doesn't tell us what type of device was added or removed.
-    uint32_t const IN_CURR     = (1UL << 0UL);
-    uint32_t const IN_PREV     = (1UL << 1UL);
-    size_t   const MAX_DEVICES = WIN32_POINTER_LIST::MAX_DEVICES * 2;
+{
+    WIN32_INPUT_DEVICE_SET device_set = WIN32_INPUT_DEVICE_SET_STATIC_INIT;
 
-    // build a table of 'unique' devices and which set(s) they belong to.
-    // values in device_set must be initialized to 0.
-    HANDLE   device_ids[MAX_DEVICES];
-    uint32_t device_set[MAX_DEVICES] = {};
-    size_t   num_devices = prev->DeviceCount;
-    for (size_t i = 0, n = prev->DeviceCount; i < n; ++i)
-    {   // the table starts out empty, so this is just a simple copy.
-        device_ids[i] = prev->DeviceHandle[i];
-        device_set[i] = IN_PREV;
-    }
-    for (size_t i = 0, n = curr->DeviceCount; i < n; ++i)
-    {   // the device table might not be empty, so filter duplicates.
-        HANDLE id = curr->DeviceHandles[i];
-        size_t ix = num_devices;
-        size_t in = 1;
-        for (size_t j = 0, m = num_devices; j < m; ++j)
-        {
-            if (device_ids[j] == id)
-            {   // found an existing entry with the same ID.
-                ix = j; // update the existing entry
-                in = 0; // don't increment num_devices
-                break;
-            }
-        }
-        device_ids[ix]  = id;
-        device_set[ix] |= IN_CURR;
-        num_devices    += in;
-    }
+    // determine the device set, which is used to determine whether devices were added or removed, 
+    // and also whether or not (or how) to generate state-based input events for a given device.
+    DetermineDeviceSet(&device_set, prev, curr);
 
-    // go through the table we just built and detect attach/remove.
+    // loop through each individual device and emit events.
     events->PointerAttachCount = 0;
     events->PointerRemoveCount = 0;
-    for (size_t i = 0; i < num_devices; ++i)
+    events->PointerCount       = 0;
+    for (size_t i = 0, n = device_set.DeviceCount; i < n; ++i)
     {
-        if (device_set[i] == IN_PREV)
-        {   // this device was just removed from the system.
-            events->PointerRemove[events->PointerRemoveCount++] = device_ids[i];
-        }
-        else if (device_set[i] == IN_CURR)
-        {   // this device was just attached to the system.
-            events->PointerAttach[events->PointerAttachCount++] = device_ids[i];
+        switch (device_set.Membership[i])
+        {
+            case WIN32_INPUT_DEVICE_MEMBERSHIP_PREV:
+                {   // this input device was just removed. no device state events are generated.
+                    events->PointerRemove[events->PointerRemoveCount] = device_set.DeviceIds[i];
+                    events->PointerRemoveCount++;
+                } break;
+
+            case WIN32_INPUT_DEVICE_MEMBERSHIP_CURR:
+                {   // this input device was just attached. no device state events are generated.
+                    events->PointerAttach[events->PointerAttachCount] = device_set.DeviceIds[i];
+                    events->PointerAttachCount++;
+                } break;
+
+            case WIN32_INPUT_DEVICE_MEMBERSHIP_BOTH:
+                {   // this input device was present in both snapshots.
+                    WIN32_POINTER_EVENTS *input_ev = &events->PointerEvents[events->PointerCount];
+                    WIN32_POINTER_STATE  *state_pp = &prev->DeviceState[device_set.PrevIndex[i]];
+                    WIN32_POINTER_STATE  *state_cp = &curr->DeviceState[device_set.CurrIndex[i]];
+                    events->PointerIds[events->PointerCount] = device_set.DeviceIds[i];
+                    GeneratePointerInputEvents(input_ev, state_pp, state_cp);
+                    events->PointerCount++;
+                } break;
         }
     }
 }
@@ -859,7 +930,7 @@ GeneratePointerAttachRemove
 /// @param prev The previous gamepad device state snapshot.
 /// @param curr The current gamepad device state snapshot.
 internal_function void
-GenerateGamepadEvents
+GenerateGamepadInputEvents
 (
     WIN32_GAMEPAD_EVENTS   *gamepad, 
     WIN32_GAMEPAD_STATE const *prev,
@@ -905,34 +976,54 @@ GenerateGamepadEvents
     }
 }
 
-/// @summary Detect gamepad devices that are attached or removed between two state snapshots and emit events.
-/// @param events The input events to update with any device attach/removal events.
-/// @param prev_ports The bitvector specifying the gamepad ports in use on the previous tick.
-/// @param curr_ports The bitvector specifying the gamepad ports in use on the current tick.
+/// @summary Generate gamepad device and input events for all gamepad devices given two device list snapshots.
+/// @param events The input events structure to populate.
+/// @param prev The device list from the previous tick.
+/// @param curr The device list from the current tick.
 internal_function void
-GenerateGamepadAttachRemove
+GenerateGamepadEvents
 (
-    WIN32_INPUT_EVENTS    *events, 
-    uint32_t           prev_ports, 
-    uint32_t           curr_ports
+    WIN32_INPUT_EVENTS *events, 
+    WIN32_GAMEPAD_LIST   *prev,
+    WIN32_GAMEPAD_LIST   *curr
 )
 {
-    uint32_t changes =(curr_ports ^  prev_ports);
-    uint32_t attach  =(changes    &  curr_ports);
-    uint32_t remove  =(changes    & ~curr_ports);
+    WIN32_INPUT_DEVICE_SET device_set = WIN32_INPUT_DEVICE_SET_STATIC_INIT;
 
-    // go through the bits indicating attach/remove and emit events.
+    // determine the device set, which is used to determine whether devices were added or removed, 
+    // and also whether or not (or how) to generate state-based input events for a given device.
+    DetermineDeviceSet(&device_set, prev, curr);
+
+    // loop through each individual device and emit events.
     events->GamepadAttachCount = 0;
     events->GamepadRemoveCount = 0;
-    for (uint32_t i = 0, n = WIN32_INPUT_EVENTS::MAX_DEVICES; i < n; ++i)
+    events->GamepadCount       = 0;
+    for (size_t i = 0, n = device_set.DeviceCount; i < n; ++i)
     {
-        if (remove & (1UL << i))
-        {   // this device was just removed from the system.
-            events->GamepadRemove[events->GamepadRemoveCount++] = i;
-        }
-        if (attach & (1UL << i))
-        {   // this device was just attached to the system.
-            events->GamepadAttach[events->GamepadAttachCount++] = i;
+        DWORD   device_id = (DWORD) ((uintptr_t) device_set.DeviceIds[i]);
+        switch (device_set.Membership[i])
+        {
+            case WIN32_INPUT_DEVICE_MEMBERSHIP_PREV:
+                {   // this input device was just removed. no device state events are generated.
+                    events->GamepadRemove[events->GamepadRemoveCount] = device_id;
+                    events->GamepadRemoveCount++;
+                } break;
+
+            case WIN32_INPUT_DEVICE_MEMBERSHIP_CURR:
+                {   // this input device was just attached. no device state events are generated.
+                    events->GamepadAttach[events->GamepadAttachCount] = device_id;
+                    events->GamepadAttachCount++;
+                } break;
+
+            case WIN32_INPUT_DEVICE_MEMBERSHIP_BOTH:
+                {   // this input device was present in both snapshots.
+                    WIN32_GAMEPAD_EVENTS *input_ev = &events->GamepadEvents[events->GamepadCount];
+                    WIN32_GAMEPAD_STATE  *state_pp = &prev->DeviceState[device_set.PrevIndex[i]];
+                    WIN32_GAMEPAD_STATE  *state_cp = &curr->DeviceState[device_set.CurrIndex[i]];
+                    events->GamepadIds[events->GamepadCount] = device_id;
+                    GenerateGamepadInputEvents(input_ev, state_pp, state_cp);
+                    events->GamepadCount++;
+                } break;
         }
     }
 }
@@ -1071,7 +1162,6 @@ ConsumeInputEvents
     // increment the buffer index to swap the buffers.
     size_t   curr_buffer = system->BufferIndex & 1;
     size_t   prev_buffer = 1 - curr_buffer;
-    uint32_t prev_ports  = system->PrevPortIds;
     system->PrevPortIds  = system->CurrPortIds;
     system->BufferIndex++;
 
@@ -1085,14 +1175,8 @@ ConsumeInputEvents
     }
 
     // generate the events for all keyboards, pointers and gamepads.
-    GenerateKeyboardAttachRemove(events, &system->KeyboardBuffer[prev_buffer], &system->KeyboardBuffer[curr_buffer]);
-    GeneratePointerAttachRemove (events, &system->PointerBuffer [prev_buffer], &system->PointerBuffer [curr_buffer]);
-    GenerateGamepadAttachRemove (events, prev_ports, system->CurrPortIds);
-    // TODO(rlk): Need to know which devices are actually attached...
-    // Device removed: Don't emit any events
-    // Device attached: Diff between default state and current state
-    // Otherwise: Diff between previous state and current state
-
-    // swap the 
+    GenerateKeyboardEvents(events, &system->KeyboardBuffer[prev_buffer], &system->KeyboardBuffer[curr_buffer]);
+    GeneratePointerEvents (events, &system->PointerBuffer [prev_buffer], &system->PointerBuffer [curr_buffer]);
+    GenerateGamepadEvents (events, &system->GamepadBuffer [prev_buffer], &system->GamepadBuffer [curr_buffer]);
 }
 
