@@ -1170,6 +1170,7 @@ ConsumeInputEvents
     // basically, we want to poll gamepads, generate events for all devices, and then swap buffers.
     if (ElapsedNanoseconds(system->LastPollTime, tick_time) >= MillisecondsToNanoseconds(1000))
     {   // poll all gamepad ports to detect any recently plugged-in controllers.
+        // TODO(rlk): need to poll raw input devices as well; can't rely on WM_INPUT_DEVICE_CHANGE.
         PollGamepads(&system->GamepadBuffer[curr_buffer], WIN32_ALL_GAMEPAD_PORTS, system->CurrPortIds);
         system->LastPollTime = tick_time;
     }
@@ -1178,5 +1179,11 @@ ConsumeInputEvents
     GenerateKeyboardEvents(events, &system->KeyboardBuffer[prev_buffer], &system->KeyboardBuffer[curr_buffer]);
     GeneratePointerEvents (events, &system->PointerBuffer [prev_buffer], &system->PointerBuffer [curr_buffer]);
     GenerateGamepadEvents (events, &system->GamepadBuffer [prev_buffer], &system->GamepadBuffer [curr_buffer]);
+
+    // re-initialize the new 'current' buffer to the default state.
+    // TODO(rlk): need to copy the device list from the old current buffer to the new current buffer.
+    system->KeyboardBuffer[prev_buffer] = WIN32_KEYBOARD_LIST_STATIC_INIT;
+    system->PointerBuffer [prev_buffer] = WIN32_POINTER_LIST_STATIC_INIT;
+    system->GamepadBuffer [prev_buffer] = WIN32_GAMEPAD_LIST_STATIC_INIT;
 }
 
