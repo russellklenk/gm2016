@@ -436,13 +436,13 @@ WinMain
         for (size_t i = 0, n = input_events.KeyboardCount; i < n; ++i)
         {
             WIN32_KEYBOARD_EVENTS &ev = input_events.KeyboardEvents[i];
-            for (size_t j = 0, m = ev.DownCount; j < m; ++j)
-            {
-                ConsoleOutput("Key %u down on keyboard %016p\n", ev.Down[j], input_events.KeyboardIds[i]);
-            }
             for (size_t j = 0, m = ev.PressedCount; j < m; ++j)
             {
                 ConsoleOutput("Key %u pressed on keyboard %016p\n", ev.Pressed[j], input_events.KeyboardIds[i]);
+            }
+            for (size_t j = 0, m = ev.DownCount; j < m; ++j)
+            {
+                ConsoleOutput("Key %u down on keyboard %016p\n", ev.Down[j], input_events.KeyboardIds[i]);
             }
             for (size_t j = 0, m = ev.ReleasedCount; j < m; ++j)
             {
@@ -456,13 +456,13 @@ WinMain
             {
                 ConsoleOutput("Pointer move by (%d, %d) on pointer %016p\n", ev.Mickeys[0], ev.Mickeys[1], input_events.PointerIds[i]);
             }
-            for (size_t j = 0, m = ev.DownCount; j < m; ++j)
-            {
-                ConsoleOutput("Button %u down on pointer %016p\n", ev.Down[j], input_events.PointerIds[i]);
-            }
             for (size_t j = 0, m = ev.PressedCount; j < m; ++j)
             {
                 ConsoleOutput("Button %u pressed on pointer %016p\n", ev.Pressed[j], input_events.PointerIds[i]);
+            }
+            for (size_t j = 0, m = ev.DownCount; j < m; ++j)
+            {
+                ConsoleOutput("Button %u down on pointer %016p\n", ev.Down[j], input_events.PointerIds[i]);
             }
             for (size_t j = 0, m = ev.ReleasedCount; j < m; ++j)
             {
