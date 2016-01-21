@@ -1094,7 +1094,7 @@ PollRawInputDevices
     UINT const         max_devices = 128;
     UINT               num_devices = max_devices;
     RAWINPUTDEVICELIST device_list  [max_devices];
-    size_t             curr_buffer = system->BufferIndex & 1;
+    //size_t             curr_buffer = system->BufferIndex & 1;
     UINT               result      = GetRawInputDeviceList(device_list, &num_devices, sizeof(RAWINPUTDEVICELIST));
     if (result != 0xFFFFFFFFUL)
     {   // the call returned one or more devices.
@@ -1104,6 +1104,7 @@ PollRawInputDevices
     else
     {   // the most likely case is that GetLastError() returns ERROR_INSUFFICIENT_BUFFER.
     }
+    UNUSED_ARG(system);
 }
 
 /// @summary Simulate a key press event; useful for input playback.
