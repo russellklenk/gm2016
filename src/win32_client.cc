@@ -199,6 +199,7 @@ MessageWindowCallback
 
         case WM_INPUT_DEVICE_CHANGE:
             {   // a keyboard or mouse was attached or removed.
+                PushRawInputDeviceChange(&InputSystem, wparam, lparam);
             } break;
 
         default:
@@ -408,7 +409,7 @@ WinMain
         // update the state of all user input devices.
         ConsumeInputEvents(&input_events, input_system, tick_start);
 
-        /*for (size_t i = 0, n = input_events.KeyboardAttachCount; i < n; ++i)
+        for (size_t i = 0, n = input_events.KeyboardAttachCount; i < n; ++i)
         {
             ConsoleOutput("Keyboard attached as 0x%016p\n", input_events.KeyboardAttach[i]);
         }
@@ -420,6 +421,10 @@ WinMain
         {
             ConsoleOutput("Gamepad attached as 0x%08u\n", input_events.GamepadAttach[i]);
         }
+        for (size_t i = 0, n = input_events.KeyboardRemoveCount; i < n; ++i)
+        {
+            ConsoleOutput("Keyboard 0x%016p removed\n", input_events.KeyboardRemove[i]);
+        }
         for (size_t i = 0, n = input_events.PointerRemoveCount; i < n; ++i)
         {
             ConsoleOutput("Pointer 0x%016p removed\n", input_events.PointerRemove[i]);
@@ -427,7 +432,43 @@ WinMain
         for (size_t i = 0, n = input_events.GamepadRemoveCount; i < n; ++i)
         {
             ConsoleOutput("Gamepad 0x%08u removed\n", input_events.GamepadRemove[i]);
-        }*/
+        }
+        for (size_t i = 0, n = input_events.KeyboardCount; i < n; ++i)
+        {
+            WIN32_KEYBOARD_EVENTS &ev = input_events.KeyboardEvents[i];
+            for (size_t j = 0, m = ev.DownCount; j < m; ++j)
+            {
+                ConsoleOutput("Key %u down on keyboard %016p\n", ev.Down[j], input_events.KeyboardIds[i]);
+            }
+            for (size_t j = 0, m = ev.PressedCount; j < m; ++j)
+            {
+                ConsoleOutput("Key %u pressed on keyboard %016p\n", ev.Pressed[j], input_events.KeyboardIds[i]);
+            }
+            for (size_t j = 0, m = ev.ReleasedCount; j < m; ++j)
+            {
+                ConsoleOutput("Key %u released on keyboard %016p\n", ev.Released[j], input_events.KeyboardIds[i]);
+            }
+        }
+        for (size_t i = 0, n = input_events.PointerCount; i < n; ++i)
+        {
+            WIN32_POINTER_EVENTS &ev = input_events.PointerEvents[i];
+            if (ev.Mickeys[0] != 0 || ev.Mickeys[1] != 0)
+            {
+                ConsoleOutput("Pointer move by (%d, %d) on pointer %016p\n", ev.Mickeys[0], ev.Mickeys[1], input_events.PointerIds[i]);
+            }
+            for (size_t j = 0, m = ev.DownCount; j < m; ++j)
+            {
+                ConsoleOutput("Button %u down on pointer %016p\n", ev.Down[j], input_events.PointerIds[i]);
+            }
+            for (size_t j = 0, m = ev.PressedCount; j < m; ++j)
+            {
+                ConsoleOutput("Button %u pressed on pointer %016p\n", ev.Pressed[j], input_events.PointerIds[i]);
+            }
+            for (size_t j = 0, m = ev.ReleasedCount; j < m; ++j)
+            {
+                ConsoleOutput("Button %u released on pointer %016p\n", ev.Released[j], input_events.PointerIds[i]);
+            }
+        }
     }
 
     ConsoleOutput("The main thread has exited.\n");
