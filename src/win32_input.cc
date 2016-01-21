@@ -315,6 +315,70 @@ FindInputDeviceForHandle
     return WIN32_INPUT_DEVICE_NOT_FOUND;
 }
 
+/// @summary Adds a device to a device list.
+/// @param devices The list of devices to search.
+/// @param device The handle of the device to insert.
+/// @param default_state The initial device state to associate with the device, if the device was not already present in the device list.
+/// @return The zero-based index of the device in the list, or WIN32_INPUT_DEVICE_TOO_MANY.
+template <typename T>
+internal_function size_t
+DeviceAttached
+(
+    WIN32_INPUT_DEVICE_LIST<T>       *devices,
+    HANDLE                             device,
+    T const                    &default_state
+)
+{
+    size_t index = 0;
+
+    // search for the device in the device list to avoid duplicate devices.
+    for (size_t i = 0, n = devices->DeviceCount; i < n; ++i)
+    {
+        if (devices->DeviceHandle[i] == device)
+        {   // the device is already present in the device list. don't modify its state.
+            return i;
+        }
+    }
+    // the device isn't present in the device list, so add it.
+    if (devices->DeviceCount == WIN32_INPUT_DEVICE_LIST<T>::MAX_DEVICES)
+    {   // there are too many devices of the specified type attached; cannot add.
+        return WIN32_INPUT_DEVICE_TOO_MANY;
+    }
+    index = devices->DeviceCount++;
+    devices->DeviceHandle[index] = device;
+    devices->DeviceState [index] = default_state;
+    return index;
+}
+
+/// @summary Removes a device from a device list.
+/// @param devices The list of devices to search.
+/// @param device The handle of the device to remove.
+/// @return true if the device was found in the device list.
+template <typename T>
+internal_function bool
+DeviceRemoved
+(
+    WIN32_INPUT_DEVICE_LIST<T> *devices,
+    HANDLE                       device 
+)
+{   // locate the device in the device list.
+    for (size_t i = 0, n = devices->DeviceCount; i < n; ++i)
+    {
+        if (devices->DeviceHandle[i] == device)
+        {   // the device has been located. swap the last item into its slot.
+            size_t   last_index = devices->DeviceCount - 1;
+            if (i != last_index)
+            {
+                devices->DeviceHandle[i] = devices->DeviceHandle[last_index];
+                devices->DeviceState [i] = devices->DeviceState [last_index];
+            }
+            devices->DeviceCount--;
+            return true;
+        }
+    }
+    return false;
+}
+
 /// @summary Given a Raw Input keyboard packet, retrieve the virtual key code and scan code values.
 /// @param key The Raw Input keyboard packet to process.
 /// @param vkey_code On return, stores the virtual key code identifier (always less than or equal to 255.)
@@ -459,6 +523,7 @@ ProcessKeyboardPacket
         index  = devices->DeviceCount++;
         state  =&devices->DeviceState[index];
         devices->DeviceHandle[index] = header.hDevice;
+        devices->DeviceState [index] = WIN32_KEYBOARD_STATE_STATIC_INIT;
     }
     if (!GetVirtualKeyAndScanCode(key, vkey, scan))
     {   // discard fake keys; these are just part of an escaped sequence.
@@ -511,6 +576,7 @@ ProcessPointerPacket
         index  = devices->DeviceCount++;
         state  =&devices->DeviceState[index];
         devices->DeviceHandle[index] = header.hDevice;
+        devices->DeviceState [index] = WIN32_POINTER_STATE_STATIC_INIT;
     }
 
     // grab the current mouse pointer position, in pixels.
@@ -540,13 +606,16 @@ ProcessPointerPacket
     }
 
     // rebuild the button state vector. Raw Input supports up to 5 buttons.
-    uint32_t  b[5] = {};
-    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_1_DOWN) b[0] = MK_LBUTTON;
-    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_2_DOWN) b[1] = MK_RBUTTON;
-    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_3_DOWN) b[2] = MK_MBUTTON;
-    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN) b[3] = MK_XBUTTON1;
-    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN) b[4] = MK_XBUTTON2;
-    state->Buttons = (b[0] | b[1] | b[2] | b[3] | b[4]);
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_1_DOWN) state->Buttons |=  MK_LBUTTON;
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_1_UP  ) state->Buttons &= ~MK_LBUTTON;
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_2_DOWN) state->Buttons |=  MK_RBUTTON;
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_2_UP  ) state->Buttons &= ~MK_RBUTTON;
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_3_DOWN) state->Buttons |=  MK_MBUTTON;
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_3_UP  ) state->Buttons &= ~MK_MBUTTON;
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN) state->Buttons |=  MK_XBUTTON1;
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_4_UP  ) state->Buttons &= ~MK_XBUTTON1;
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN) state->Buttons |=  MK_XBUTTON2;
+    if (mouse.usButtonFlags & RI_MOUSE_BUTTON_5_UP  ) state->Buttons &= ~MK_XBUTTON2;
     return index;
 }
 
@@ -624,6 +693,7 @@ ProcessGamepadPacket
         index  = devices->DeviceCount++;
         state  =&devices->DeviceState[index];
         devices->DeviceHandle[index] = hDevice;
+        devices->DeviceState [index] = WIN32_GAMEPAD_STATE_STATIC_INIT;
     }
 
     // apply deadzone filtering to the trigger inputs.
@@ -1028,6 +1098,52 @@ GenerateGamepadEvents
     }
 }
 
+/// @summary Copy keyboard devices and state from the current 'current' buffer to the next 'current' buffer.
+/// @param dst The 'current' buffer for the next tick.
+/// @param src The 'current' buffer for the current tick.
+internal_function inline void
+ForwardKeyboardBuffer
+(
+    WIN32_KEYBOARD_LIST *dst, 
+    WIN32_KEYBOARD_LIST *src
+)
+{   // copy over the device list and key state.
+    CopyMemory(dst, src, sizeof(WIN32_KEYBOARD_LIST));
+}
+
+/// @summary Copy pointer devices and state from the current 'current' buffer to the next 'current' buffer.
+/// @param dst The 'current' buffer for the next tick.
+/// @param src The 'current' buffer for the current tick.
+internal_function inline void
+ForwardPointerBuffer
+(
+    WIN32_POINTER_LIST *dst, 
+    WIN32_POINTER_LIST *src
+)
+{   // copy over the device list, but zero out the relative fields of the state.
+    CopyMemory(dst, src, sizeof(WIN32_POINTER_LIST));
+    for (size_t i = 0, n = dst->DeviceCount; i < n; ++i)
+    {
+        dst->DeviceState[i].Relative[0] = 0;
+        dst->DeviceState[i].Relative[1] = 0;
+        dst->DeviceState[i].Flags = WIN32_POINTER_FLAGS_NONE;
+    }
+}
+
+/// @summary Copy gamepad devices and state from the current 'current' buffer to the next 'current' buffer.
+/// @param dst The 'current' buffer for the next tick.
+/// @param src The 'current' buffer for the current tick.
+internal_function inline void
+ForwardGamepadBuffer
+(
+    WIN32_GAMEPAD_LIST *dst, 
+    WIN32_GAMEPAD_LIST *src
+)
+{
+    UNUSED_ARG(dst);
+    UNUSED_ARG(src);
+}
+
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
@@ -1081,30 +1197,64 @@ PushRawInput
     }
 }
 
-/// @summary Poll the system for the set of attached Raw Input devices. Call this function in response to a WM_INPUT_DEVICE_CHANGE message.
-/// Polling for the current set of Raw Input devices is necessary because devices only report events when something changes, and Windows 
-/// doesn't ever report which device was attached or removed.
+/// @summary Push a Raw Input device change notification to the input system when a device is attached or removed.
 /// @param system The low-level input system to update.
+/// @param wparam The WPARAM value from the WM_INPUT_DEVICE_CHANGE message, specifying whether a device was attached or removed.
+/// @param lparam The LPARAM value from the WM_INPUT_DEVICE_CHANGE message, specifying the device HANDLE.
 public_function void
-PollRawInputDevices
+PushRawInputDeviceChange
 (
-    WIN32_INPUT_SYSTEM *system
+    WIN32_INPUT_SYSTEM *system, 
+    WPARAM              wparam, 
+    LPARAM              lparam
 )
 {
-    UINT const         max_devices = 128;
-    UINT               num_devices = max_devices;
-    RAWINPUTDEVICELIST device_list  [max_devices];
-    //size_t             curr_buffer = system->BufferIndex & 1;
-    UINT               result      = GetRawInputDeviceList(device_list, &num_devices, sizeof(RAWINPUTDEVICELIST));
-    if (result != 0xFFFFFFFFUL)
-    {   // the call returned one or more devices.
-        // if a device was just attached, go through the returned devices looking for a keyboard or mouse we don't have in our list.
-        // if a device was just removed, go through our keyboard and mouse device lists looking for an item that is not in device_list.
+#ifndef RIDI_DEVICEINFO
+    UINT const      RIDI_DEVICEINFO = 0x2000000bUL;
+#endif
+    RID_DEVICE_INFO device_info     = {};
+    UINT            info_size       = sizeof(RID_DEVICE_INFO);
+    size_t          curr_buffer     = system->BufferIndex & 1;
+    HANDLE          hDevice         = (HANDLE) lparam;
+
+    device_info.cbSize = sizeof(RID_DEVICE_INFO);
+    if (GetRawInputDeviceInfo(hDevice, RIDI_DEVICEINFO, &device_info, &info_size) <= info_size)
+    {   // the device information was successfully retrieved.
+        if (wparam == GIDC_ARRIVAL)
+        {   // what type of device was just attached?
+            if (device_info.dwType == RIM_TYPEMOUSE)
+            {
+                WIN32_POINTER_STATE state = WIN32_POINTER_STATE_STATIC_INIT;
+                DeviceAttached(&system->PointerBuffer[curr_buffer], hDevice, state);
+            }
+            else if (device_info.dwType == RIM_TYPEKEYBOARD)
+            {
+                WIN32_KEYBOARD_STATE state = WIN32_KEYBOARD_STATE_STATIC_INIT;
+                DeviceAttached(&system->KeyboardBuffer[curr_buffer], hDevice, state);
+            }
+        }
+        else if (wparam == GIDC_REMOVAL)
+        {   // what type of device was just removed?
+            if (device_info.dwType == RIM_TYPEMOUSE)
+            {
+                DeviceRemoved(&system->PointerBuffer[curr_buffer], hDevice);
+            }
+            else if (device_info.dwType == RIM_TYPEKEYBOARD)
+            {
+                DeviceRemoved(&system->KeyboardBuffer[curr_buffer], hDevice);
+            }
+        }
     }
     else
-    {   // the most likely case is that GetLastError() returns ERROR_INSUFFICIENT_BUFFER.
+    {   // typically when a device is removed, GetRawInputDeviceInfo fails.
+        if (wparam == GIDC_REMOVAL)
+        {   // not much can be done aside from guessing. try keyboards first.
+            if (!DeviceRemoved(&system->KeyboardBuffer[curr_buffer], hDevice))
+            {   // not a keyboard, so try pointer devices next.
+                DeviceRemoved(&system->PointerBuffer[curr_buffer], hDevice);
+            }
+        }
     }
-    UNUSED_ARG(system);
 }
 
 /// @summary Simulate a key press event; useful for input playback.
@@ -1196,7 +1346,6 @@ ConsumeInputEvents
     // basically, we want to poll gamepads, generate events for all devices, and then swap buffers.
     if (ElapsedNanoseconds(system->LastPollTime, tick_time) >= MillisecondsToNanoseconds(1000))
     {   // poll all gamepad ports to detect any recently plugged-in controllers.
-        // TODO(rlk): need to poll raw input devices as well; can't rely on WM_INPUT_DEVICE_CHANGE.
         PollGamepads(&system->GamepadBuffer[curr_buffer], WIN32_ALL_GAMEPAD_PORTS, system->CurrPortIds);
         system->LastPollTime = tick_time;
     }
@@ -1207,9 +1356,8 @@ ConsumeInputEvents
     GenerateGamepadEvents (events, &system->GamepadBuffer [prev_buffer], &system->GamepadBuffer [curr_buffer]);
 
     // re-initialize the new 'current' buffer to the default state.
-    // TODO(rlk): need to copy the device list from the old current buffer to the new current buffer.
-    system->KeyboardBuffer[prev_buffer] = WIN32_KEYBOARD_LIST_STATIC_INIT;
-    system->PointerBuffer [prev_buffer] = WIN32_POINTER_LIST_STATIC_INIT;
-    system->GamepadBuffer [prev_buffer] = WIN32_GAMEPAD_LIST_STATIC_INIT;
+    ForwardKeyboardBuffer(&system->KeyboardBuffer[prev_buffer], &system->KeyboardBuffer[curr_buffer]);
+    ForwardPointerBuffer (&system->PointerBuffer [prev_buffer], &system->PointerBuffer [curr_buffer]);
+    ForwardGamepadBuffer (&system->GamepadBuffer [prev_buffer], &system->GamepadBuffer [curr_buffer]);
 }
 
