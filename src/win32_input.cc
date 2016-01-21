@@ -1081,6 +1081,31 @@ PushRawInput
     }
 }
 
+/// @summary Poll the system for the set of attached Raw Input devices. Call this function in response to a WM_INPUT_DEVICE_CHANGE message.
+/// Polling for the current set of Raw Input devices is necessary because devices only report events when something changes, and Windows 
+/// doesn't ever report which device was attached or removed.
+/// @param system The low-level input system to update.
+public_function void
+PollRawInputDevices
+(
+    WIN32_INPUT_SYSTEM *system
+)
+{
+    UINT const         max_devices = 128;
+    UINT               num_devices = max_devices;
+    RAWINPUTDEVICELIST device_list  [max_devices];
+    size_t             curr_buffer = system->BufferIndex & 1;
+    UINT               result      = GetRawInputDeviceList(device_list, &num_devices, sizeof(RAWINPUTDEVICELIST));
+    if (result != 0xFFFFFFFFUL)
+    {   // the call returned one or more devices.
+        // if a device was just attached, go through the returned devices looking for a keyboard or mouse we don't have in our list.
+        // if a device was just removed, go through our keyboard and mouse device lists looking for an item that is not in device_list.
+    }
+    else
+    {   // the most likely case is that GetLastError() returns ERROR_INSUFFICIENT_BUFFER.
+    }
+}
+
 /// @summary Simulate a key press event; useful for input playback.
 /// @param system The low-level input system to update.
 /// @param device The system keyboard device identifier, or INVALID_HANDLE_VALUE to broadcast to all devices.
