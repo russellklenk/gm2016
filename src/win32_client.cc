@@ -127,6 +127,9 @@ CreateConsoleAndRedirectStdio
     void
 )
 {
+    HANDLE console_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    bool          is_file = GetFileType (console_stdout) == FILE_TYPE_DISK; // true if output is being rediirected to a file.
+
     if (AllocConsole())
     {   // a process can only have one console associated with it. this function just 
         // allocated that console, so perform the buffer setup and I/O redirection.
@@ -134,9 +137,8 @@ CreateConsoleAndRedirectStdio
         CONSOLE_SCREEN_BUFFER_INFO    buffer_info;
         SHORT const                 lines_visible = 9999;
         SHORT const                 chars_visible = 120;
-        HANDLE                      console_stdin = GetStdHandle(STD_INPUT_HANDLE);
-        HANDLE                     console_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
-        HANDLE                     console_stderr = GetStdHandle(STD_ERROR_HANDLE);
+        FILE                              *conout = NULL;
+        FILE                               *conin = NULL;
 
         // set up the console size to be the Windows default of 120x30.
         GetConsoleScreenBufferInfo(console_stdout, &buffer_info);
@@ -144,23 +146,14 @@ CreateConsoleAndRedirectStdio
         buffer_info.dwSize.Y = lines_visible;
         SetConsoleScreenBufferSize(console_stdout,  buffer_info.dwSize);
 
-        // redirect stdin to the new console window:
-        int      new_stdin   = _open_osfhandle((intptr_t) console_stdin , _O_TEXT);
-        FILE     *fp_stdin   = _fdopen(new_stdin, "r");
-        *stdin = *fp_stdin;  setvbuf(stdin, NULL, _IONBF, 0);
-
-        // redirect stdout to the new console window:
-        int      new_stdout  = _open_osfhandle((intptr_t) console_stdout, _O_TEXT);
-        FILE     *fp_stdout  = _fdopen(new_stdout, "w");
-        *stdout= *fp_stdout; setvbuf(stdout, NULL, _IONBF, 0);
-
-        // redirect stderr to the new console window:
-        int      new_stderr  = _open_osfhandle((intptr_t) console_stderr, _O_TEXT);
-        FILE     *fp_stderr  = _fdopen(new_stderr, "w");
-        *stderr= *fp_stderr; setvbuf(stderr, NULL, _IONBF, 0);
-
-        // synchronize everything that uses <iostream>.
-        std::ios::sync_with_stdio();
+        if (!is_file)
+        {   // console output is not being redirected, so re-open the streams.
+            freopen_s(&conin , "conin$" , "r", stdin);
+            freopen_s(&conout, "conout$", "w", stdout);
+            freopen_s(&conout, "conout$", "w", stderr);
+            // synchronize everything that uses <iostream>.
+            std::ios::sync_with_stdio();
+        }
     }
 }
 
@@ -190,8 +183,8 @@ MessageWindowCallback
 
         case WM_INPUT:
             {   // a fixed-size buffer on the stack should be sufficient for storing the packet.
-                UINT       packet_used = 0;
                 UINT const packet_size = 256;
+                UINT       packet_used = packet_size;
                 uint8_t    packet[packet_size];
                 if (GetRawInputData((HRAWINPUT) lparam, RID_INPUT, packet, &packet_used, sizeof(RAWINPUTHEADER)) > 0)
                 {   // wparam is RIM_INPUT (foreground) or RIM_INPUTSINK (background).
@@ -332,6 +325,9 @@ WinMain
     UNUSED_ARG(command_line);
     UNUSED_ARG(show_command);
 
+    // query the frequency of the system high-resolution timer.
+    QueryClockFrequency();
+
     // initialize the state of the low-level user input system, needed by the message window's WndProc.
     ResetInputSystem(input_system);
 
@@ -411,6 +407,27 @@ WinMain
 
         // update the state of all user input devices.
         ConsumeInputEvents(&input_events, input_system, tick_start);
+
+        /*for (size_t i = 0, n = input_events.KeyboardAttachCount; i < n; ++i)
+        {
+            ConsoleOutput("Keyboard attached as 0x%016p\n", input_events.KeyboardAttach[i]);
+        }
+        for (size_t i = 0, n = input_events.PointerAttachCount; i < n; ++i)
+        {
+            ConsoleOutput("Pointer attached as 0x%016p\n", input_events.PointerAttach[i]);
+        }
+        for (size_t i = 0, n = input_events.GamepadAttachCount; i < n; ++i)
+        {
+            ConsoleOutput("Gamepad attached as 0x%08u\n", input_events.GamepadAttach[i]);
+        }
+        for (size_t i = 0, n = input_events.PointerRemoveCount; i < n; ++i)
+        {
+            ConsoleOutput("Pointer 0x%016p removed\n", input_events.PointerRemove[i]);
+        }
+        for (size_t i = 0, n = input_events.GamepadRemoveCount; i < n; ++i)
+        {
+            ConsoleOutput("Gamepad 0x%08u removed\n", input_events.GamepadRemove[i]);
+        }*/
     }
 
     ConsoleOutput("The main thread has exited.\n");
