@@ -128,23 +128,24 @@ CreateConsoleAndRedirectStdio
 )
 {
     HANDLE console_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
-    bool          is_file = GetFileType (console_stdout) == FILE_TYPE_DISK; // true if output is being rediirected to a file.
+    bool          is_file = GetFileType (console_stdout) == FILE_TYPE_DISK;
+    // is_file is true if stdout/stderr are being redirected to a file.
 
     if (AllocConsole())
     {   // a process can only have one console associated with it. this function just 
         // allocated that console, so perform the buffer setup and I/O redirection.
         // the default size is 120 characters wide and 30 lines tall.
-        CONSOLE_SCREEN_BUFFER_INFO    buffer_info;
-        SHORT const                 lines_visible = 9999;
-        SHORT const                 chars_visible = 120;
-        FILE                              *conout = NULL;
-        FILE                               *conin = NULL;
+        CONSOLE_SCREEN_BUFFER_INFO   buffer_info;
+        SHORT const                lines_visible = 9999;
+        SHORT const                chars_visible = 120;
+        FILE                             *conout = NULL;
+        FILE                              *conin = NULL;
 
         // set up the console size to be the Windows default of 120x30.
         GetConsoleScreenBufferInfo(console_stdout, &buffer_info);
         buffer_info.dwSize.X = chars_visible;
         buffer_info.dwSize.Y = lines_visible;
-        SetConsoleScreenBufferSize(console_stdout,  buffer_info.dwSize);
+        SetConsoleScreenBufferSize(console_stdout, buffer_info.dwSize);
 
         if (!is_file)
         {   // console output is not being redirected, so re-open the streams.
