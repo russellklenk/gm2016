@@ -45,8 +45,6 @@
 /*///////////////
 //   Globals   //
 ///////////////*/
-/// @summary Define the data associated with the low-level input system as local to this module.
-global_variable WIN32_INPUT_SYSTEM InputSystem;
 
 /*//////////////////////////
 //   Internal Functions   //
@@ -172,13 +170,23 @@ MessageWindowCallback
     WPARAM wparam, 
     LPARAM lparam
 )
-{
+{   // WM_NCCREATE performs special handling to store the WIN32_THREAD_ARGS pointer in the user data of the window.
+    // the handler for WM_NCCREATE executes before the call to CreateWindowEx returns in CreateMessageWindow.
+    if (message == WM_NCCREATE)
+    {   // store the WIN32_THREAD_ARGS in the window user data.
+        CREATESTRUCT *cs  = (CREATESTRUCT*) lparam;
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR) cs->lpCreateParams);
+        return DefWindowProc(hwnd, message, wparam, lparam);
+    }
+
+    // process all other messages sent (or posted) to the window.
+    WIN32_THREAD_ARGS *thread_args = (WIN32_THREAD_ARGS*) GetWindowLongPtr(hwnd, GWLP_USERDATA);
     LRESULT result = 0;
     switch (message)
     {
         case WM_DESTROY:
             {   // termination was signaled from another thread. 
-                // post WM_QUIT to terminate the main game loop.
+                // post WM_QUIT to terminate the main time loop.
                 PostQuitMessage(0);
             } break;
 
@@ -189,7 +197,7 @@ MessageWindowCallback
                 uint8_t    packet[packet_size];
                 if (GetRawInputData((HRAWINPUT) lparam, RID_INPUT, packet, &packet_used, sizeof(RAWINPUTHEADER)) > 0)
                 {   // wparam is RIM_INPUT (foreground) or RIM_INPUTSINK (background).
-                    PushRawInput(&InputSystem, (RAWINPUT*)packet);
+                    PushRawInput(thread_args->InputSystem, (RAWINPUT*) packet);
                     result = DefWindowProc(hwnd, message, wparam, lparam);
                 }
                 else
@@ -200,7 +208,7 @@ MessageWindowCallback
 
         case WM_INPUT_DEVICE_CHANGE:
             {   // a keyboard or mouse was attached or removed.
-                PushRawInputDeviceChange(&InputSystem, wparam, lparam);
+                PushRawInputDeviceChange(thread_args->InputSystem, wparam, lparam);
             } break;
 
         default:
@@ -213,11 +221,13 @@ MessageWindowCallback
 
 /// @summary Create a message-only window for the sole purpose of gathering user input and receiving messages from other threads.
 /// @param this_instance The HINSTANCE of the application passed to WinMain.
+/// @param thread_args The global data passed to all threads. This data is also available to the message window.
 /// @return The handle of the message-only window used to communicate with the main thread and gather user input.
 internal_function HWND 
 CreateMessageWindow
 (
-    HINSTANCE this_instance
+    HINSTANCE         this_instance, 
+    WIN32_THREAD_ARGS  *thread_args
 )
 {
     TCHAR const *class_name = _T("GM2016_MessageWindow");
@@ -252,7 +262,18 @@ CreateMessageWindow
     int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
     // return the window handle. the window is not visible.
-    return CreateWindowEx(0, class_name, class_name, 0, x, y, w, h, HWND_MESSAGE, NULL, this_instance, NULL);
+    HWND hwnd  = CreateWindowEx(0, class_name, class_name, 0, x, y, w, h, HWND_MESSAGE, NULL, this_instance, thread_args);
+    if  (hwnd != NULL)
+    {   // the message window was successfully created. save the handle in thread_args.
+        // the thread_args value is stored in the user data pointer of the window. see WM_CREATE in MessageWindowCallback.
+        thread_args->MessageWindow = hwnd;
+        return hwnd;
+    }
+    else
+    {   // if the message window could not be created, execution cannot continue.
+        DebugPrintf(_T("ERROR: Unable to create the message window; reason = 0x%08X.\n"), GetLastError());
+        return NULL;
+    }
 }
 
 /// @summary Performs all setup and initialization for the input system. User input is handled on the main thread.
@@ -314,7 +335,7 @@ WinMain
     WIN32_COMMAND_LINE          argv;
     WIN32_THREAD_ARGS    thread_args = {};
     WIN32_INPUT_EVENTS  input_events = {};
-    WIN32_INPUT_SYSTEM *input_system =&InputSystem; // global; module-local
+    WIN32_INPUT_SYSTEM  input_system = {};
     HANDLE                  ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                  ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE               thread_draw = NULL; // frame composition thread and main UI thread
@@ -327,12 +348,6 @@ WinMain
     UNUSED_ARG(command_line);
     UNUSED_ARG(show_command);
 
-    // query the frequency of the system high-resolution timer.
-    QueryClockFrequency();
-
-    // initialize the state of the low-level user input system, needed by the message window's WndProc.
-    ResetInputSystem(input_system);
-
     // set up the runtime environment. if any of these steps fail, the game cannot run.
     if (!ParseCommandLine(&argv))
     {   // bail out if the command line cannot be parsed successfully.
@@ -343,27 +358,36 @@ WinMain
     {   // if the necessary privileges could not be obtained, there's no point in proceeding.
         goto cleanup_and_shutdown;
     }
-    if ((message_window = CreateMessageWindow(this_instance)) == NULL)
+
+    // initialize low-level services for timing, user input, etc.
+    // initialize the data that is available to all worker threads.
+    // the MessageWindow field of thread_args is set by CreateMessageWindow.
+    QueryClockFrequency();
+    ResetInputSystem(&input_system);
+    thread_args.StartEvent     = ev_start;
+    thread_args.TerminateEvent = ev_break;
+    thread_args.ModuleBaseAddr = this_instance;
+    thread_args.MessageWindow  = NULL;
+    thread_args.CommandLine    = &argv;
+    thread_args.InputSystem    = &input_system;
+
+    // create the message window used to receive user input and messages from other threads.
+    if ((message_window = CreateMessageWindow(this_instance, &thread_args)) == NULL)
     {   // without the message window, no user input can be processed.
-        goto cleanup_and_shutdown;
-    }
-    if (!SetupInputDevices(message_window))
-    {   // no user input services are available.
         goto cleanup_and_shutdown;
     }
     if (argv.CreateConsole)
     {   // for some reason, this has to be done *after* the message window is created.
         CreateConsoleAndRedirectStdio();
     }
-    // ConsoleError and ConsoleOutput should be used past this point.
-    // 
+
+    // register for Raw Input from keyboard and pointer devices.
+    if (!SetupInputDevices(message_window))
+    {   // no user input services are available.
+        goto cleanup_and_shutdown;
+    }
 
     // set up explicit threads for frame composition, network I/O and file I/O.
-    thread_args.StartEvent     = ev_start;
-    thread_args.TerminateEvent = ev_break;
-    thread_args.ModuleBaseAddr = this_instance;
-    thread_args.MessageWindow  = message_window;
-    thread_args.CommandLine    =&argv;
     if ((thread_draw = SpawnExplicitThread(RenderThread, &thread_args)) == NULL)
     {
         ConsoleError("ERROR: Unable to spawn the rendering thread.\n");
@@ -408,7 +432,7 @@ WinMain
         }
 
         // update the state of all user input devices.
-        ConsumeInputEvents(&input_events, input_system, tick_start);
+        ConsumeInputEvents(&input_events, &input_system, tick_start);
 
         for (size_t i = 0, n = input_events.KeyboardAttachCount; i < n; ++i)
         {

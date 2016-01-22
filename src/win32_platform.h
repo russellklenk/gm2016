@@ -5,6 +5,9 @@
 /*//////////////////
 //   Data Types   //
 //////////////////*/
+/// @summary Forward-declare the low-level input system type.
+struct WIN32_INPUT_SYSTEM;
+
 /// @summary Defines the data representing the result of parsing command line arguments.
 struct WIN32_COMMAND_LINE
 {
@@ -19,6 +22,7 @@ struct WIN32_THREAD_ARGS
     HINSTANCE           ModuleBaseAddr;  /// The module load address of the executable.
     HWND                MessageWindow;   /// The background message window used to communicate with the main thread.
     WIN32_COMMAND_LINE *CommandLine;     /// Parsed command-line argument information.
+    WIN32_INPUT_SYSTEM *InputSystem;     /// The low-level input system.
 };
 
 /// @summary Define the function signature for a thread entry point.
