@@ -211,6 +211,20 @@ MessageWindowCallback
                 PushRawInputDeviceChange(thread_args->InputSystem, wparam, lparam);
             } break;
 
+        case WM_ACTIVATE:
+            {   // the application is being activated or deactivated. adjust the system scheduler frequency accordingly.
+                if (wparam)
+                {
+                    ConsoleOutput("STATUS: Increase scheduler frequency to 1ms.\n");
+                    timeBeginPeriod(1);
+                }
+                else
+                {
+                    ConsoleOutput("STATUS: Decrease scheduler frequency to default.\n");
+                    timeEndPeriod(1);
+                }
+            } break;
+
         default:
             {   // pass the message on to the default handler:
                 result = DefWindowProc(hwnd, message, wparam, lparam);
@@ -407,8 +421,6 @@ WinMain
     miss_time     = 0;
     wait_time     = 0;
 
-    timeBeginPeriod(1);
-
     // enter the main game loop:
     while (keep_running)
     {   
@@ -473,8 +485,8 @@ WinMain
         if ((absolute_time = TimestampInNanoseconds()) >= next_tick)
         {
             miss_time   = absolute_time - next_tick;
-            next_tick   =(absolute_time - miss_time) + SliceOfSecond(60);
-            //ConsoleOutput("Launch tick at %0.06f, next at %0.06f, missed by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(absolute_time) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
+            next_tick   =(absolute_time - miss_time) + SliceOfSecond(30);
+            ConsoleOutput("Launch tick at %0.06f, next at %0.06f, missed by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(absolute_time) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
         }
 
         // figure out how many milliseconds to sleep for prior to waking up.

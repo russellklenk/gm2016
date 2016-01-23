@@ -254,13 +254,23 @@ MainWindowCallback
     WPARAM wparam, 
     LPARAM lparam
 )
-{
+{   // WM_NCCREATE performs special handling to store the WIN32_THREAD_ARGS pointer in the window data.
+    // the handler for WM_NCCREATE executes before the call to CreateWindowEx returns in CreateWindowOnDisplay.
+    if (message == WM_NCCREATE)
+    {   // store the WIN32_THREAD_ARGS in the window user data.
+        CREATESTRUCT *cs = (CREATESTRUCT*) lparam;
+        SetWindowLongPtr(window, GWLP_USERDATA, (LONG_PTR) cs->lpCreateParams);
+        return DefWindowProc(window, message, wparam, lparam);
+    }
+
+    // process all other messages sent (or posted) to the window.
+    WIN32_THREAD_ARGS *thread_args = (WIN32_THREAD_ARGS*) GetWindowLongPtr(window, GWLP_USERDATA);
     LRESULT result = 0;
     switch (message)
     {
-        case WM_ACTIVATEAPP:
-            {   // wparam is TRUE if the window is being activated, or FALSE if
-                // the window is being deactivated. 
+        case WM_ACTIVATE:
+            {   // wparam is TRUE if the window is being activated, or FALSE if the window is being deactivated. 
+                SendMessage(thread_args->MessageWindow, message, wparam, lparam);
             } break;
 
         case WM_CLOSE:
@@ -291,6 +301,7 @@ MainWindowCallback
 /// @summary Create a new window on a given display.
 /// @param window The window definition to initialize.
 /// @param this_instance The HINSTANCE of the application (passed to WinMain) or GetModuleHandle(NULL).
+/// @param thread_args The global data passed to all threads. This data is also available to the message window.
 /// @param display The target display, or NULL to use the primary display.
 /// @param width The width of the window, or 0 to use the entire width of the display.
 /// @param height The height of the window, or 0 to use the entire height of the display.
@@ -299,12 +310,13 @@ MainWindowCallback
 internal_function bool
 CreateWindowOnDisplay
 (
-    WIN32_WINDOW        *window,
-    HINSTANCE     this_instance,
-    WIN32_DISPLAY      *display, 
-    int                   width, 
-    int                  height, 
-    bool             fullscreen
+    WIN32_WINDOW           *window,
+    HINSTANCE        this_instance,
+    WIN32_DISPLAY         *display, 
+    WIN32_THREAD_ARGS *thread_args,
+    int                      width, 
+    int                     height, 
+    bool                fullscreen
 )
 {
     TCHAR const *class_name = _T("GM2016_WndClass");
@@ -358,7 +370,7 @@ CreateWindowOnDisplay
     DWORD style    =(fullscreen ? 0 : WS_OVERLAPPEDWINDOW) | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
     TCHAR*title    = display->DisplayInfo.DeviceName;
     RECT  client   = {};
-    HWND  hwnd     = CreateWindowEx(style_ex, class_name, title, style, x, y, width, height, NULL, NULL, this_instance, NULL);
+    HWND  hwnd     = CreateWindowEx(style_ex, class_name, title, style, x, y, width, height, NULL, NULL, this_instance, thread_args);
     if   (hwnd  == NULL)
     {   // the window cannot be created.
         return false;
@@ -483,7 +495,7 @@ RenderThread
     }
 
     // create the main application window on the primary display.
-    if (!CreateWindowOnDisplay(&main_window, thread_args->ModuleBaseAddr, main_display, 800, 600, false))
+    if (!CreateWindowOnDisplay(&main_window, thread_args->ModuleBaseAddr, main_display, thread_args, 800, 600, false))
     {   // unable to create the main application window; there's no point in proceeding.
         ConsoleError("ERROR: Unable to create the main window on display %s.\n", DisplayName(main_display));
         goto terminate_thread;
@@ -521,7 +533,7 @@ RenderThread
         }
 
         // TODO(rlk): Present the backbuffer
-
+        Sleep(16);
     }
 
     ConsoleError("STATUS: The render thread is exiting.\n");
