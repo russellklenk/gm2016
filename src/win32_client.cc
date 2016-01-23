@@ -355,8 +355,9 @@ WinMain
     HANDLE               thread_draw = NULL; // frame composition thread and main UI thread
     HANDLE               thread_disk = NULL; // asynchronous disk I/O thread
     HANDLE               thread_net  = NULL; // network I/O thread
-    uint64_t           absolute_time = 0;    // the current absolute time, in nanoseconds
-    uint64_t               next_tick = 0;    // nanosecond timestamp at which the next tick will launch
+    uint64_t               next_tick = 0;    // the ideal launch time of the next tick
+    uint64_t            current_tick = 0;    // the launch time of the current tick
+    uint64_t           previous_tick = 0;    // the launch time of the previous tick
     uint64_t               miss_time = 0;    // number of nanoseconds over the launch time
     DWORD                  wait_time = 0;    // number of milliseconds the timer thread will sleep for
     HWND              message_window = NULL; // for receiving input and notification from other threads
@@ -416,8 +417,8 @@ WinMain
     SetEvent(ev_start);
 
     // grab an initial absolute timestamp and initialize global time values.
-    absolute_time = TimestampInNanoseconds();
-    next_tick     = absolute_time;
+    previous_tick = TimestampInNanoseconds();
+    next_tick     = previous_tick;
     miss_time     = 0;
     wait_time     = 0;
 
@@ -426,33 +427,15 @@ WinMain
     {   
         MSG msg;
 
-        // wait for externally-signaled termination or for a message to be posted to the message window queue.
-        // if the thread is woken up because this call times out, it's time to launch the next tick.
-        /*switch (MsgWaitForMultipleObjects(1, &ev_break, FALSE, wait_time, QS_ALLINPUT))
-        {
-            case WAIT_OBJECT_0:
-                {   // application termination was signaled by an external thread.
-                    DestroyWindow(message_window);
-                } break;
-
-            case WAIT_OBJECT_0 + 1: // messages are waiting
-            case WAIT_TIMEOUT:      // the wait timeout elapsed
-                {   // wake up and check for work to be done.
-                } break;
-
-            default:
-                {   // an error has occurred - terminate the main loop.
-                    ConsoleError("ERROR: Abandoned or failed wait in time thread; reason = 0x%08X.\n", GetLastError());
-                    keep_running = false;
-                } break;
-        }*/
-
+        // check to see if termination has been signaled by an external thread.
         if (WaitForSingleObject(ev_break, 0) == WAIT_OBJECT_0)
         {   // termination signalled externally.
             DestroyWindow(message_window);
         }
 
         // poll the Windows message queue for the thread to receive WM_INPUT and other critical notifications.
+        // unfortunately, this needs to be done before launching the tick in order to minimize input latency.
+        // typically work should be done *after* the tick is launched, for maximum launch accuracy.
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE) && keep_running)
         {   // dispatch the message to the MessageWindowCallback.
             switch (msg.message)
@@ -468,38 +451,33 @@ WinMain
                         DispatchMessage (&msg);
                     } break;
             }
-            if (next_tick != 0)
-            {   // determine whether it's time to launch the next tick.
-                if ((absolute_time = TimestampInNanoseconds()) >= next_tick)
-                {   // it is time to launch the next tick. stop message processing for now.
-                    break;
-                }
-            }
         }
         if (!keep_running)
         {   // time to break out of the main loop.
             break;
         }
 
-        // launch the next tick, if it's time to do so.
-        if ((absolute_time = TimestampInNanoseconds()) >= next_tick)
-        {
-            miss_time   = absolute_time - next_tick;
-            next_tick   =(absolute_time - miss_time) + SliceOfSecond(30);
-            ConsoleOutput("Launch tick at %0.06f, next at %0.06f, missed by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(absolute_time) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
-        }
-
-        // figure out how many milliseconds to sleep for prior to waking up.
-        if ((absolute_time = TimestampInNanoseconds()) >= next_tick)
-        {
-            wait_time = 0;
+        // immediately launch the current frame.
+        // TODO(rlk): miss_time can be used to calculate an interpolation factor, it tells us how far into the current tick we are.
+        current_tick  = TimestampInNanoseconds();
+        if (current_tick < next_tick)
+        {   // the tick is launching slightly early.
+            miss_time = next_tick - current_tick;
+            next_tick =(miss_time + current_tick) + SliceOfSecond(60);
         }
         else
-        {
-            wait_time = NanosecondsToWholeMilliseconds(next_tick - absolute_time);
-            if (wait_time > 0)
-            {
-                //ConsoleOutput("Wait for %u milliseconds\n", wait_time);
+        {   // the tick is launching slightly late.
+            miss_time = current_tick - next_tick;
+            next_tick =(current_tick - miss_time) + SliceOfSecond(60);
+        }
+        ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(current_tick) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
+
+        // all work for the current tick has completed.
+        if ((previous_tick = TimestampInNanoseconds()) < next_tick)
+        {   // this tick has finished early. how long should we sleep for?
+            if ((wait_time = NanosecondsToWholeMilliseconds(next_tick - previous_tick)) > 1)
+            {   // put the thread to sleep for at least 1ms.
+                //ConsoleOutput("Sleep for at least %ums.\n", wait_time);
                 Sleep(wait_time);
             }
         }
