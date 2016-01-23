@@ -341,6 +341,10 @@ WinMain
     HANDLE               thread_draw = NULL; // frame composition thread and main UI thread
     HANDLE               thread_disk = NULL; // asynchronous disk I/O thread
     HANDLE               thread_net  = NULL; // network I/O thread
+    uint64_t           absolute_time = 0;    // the current absolute time, in nanoseconds
+    uint64_t               next_tick = 0;    // nanosecond timestamp at which the next tick will launch
+    uint64_t               miss_time = 0;    // number of nanoseconds over the launch time
+    DWORD                  wait_time = 0;    // number of milliseconds the timer thread will sleep for
     HWND              message_window = NULL; // for receiving input and notification from other threads
     bool                keep_running = true;
 
@@ -397,21 +401,48 @@ WinMain
     // start all of the explicit threads running:
     SetEvent(ev_start);
 
+    // grab an initial absolute timestamp and initialize global time values.
+    absolute_time = TimestampInNanoseconds();
+    next_tick     = absolute_time;
+    miss_time     = 0;
+    wait_time     = 0;
+
+    timeBeginPeriod(1);
+
     // enter the main game loop:
     while (keep_running)
     {   
-        uint64_t tick_start = TimestampInTicks();
-        MSG      msg;
+        MSG msg;
 
-        // poll for externally-signaled application termination.
+        // wait for externally-signaled termination or for a message to be posted to the message window queue.
+        // if the thread is woken up because this call times out, it's time to launch the next tick.
+        /*switch (MsgWaitForMultipleObjects(1, &ev_break, FALSE, wait_time, QS_ALLINPUT))
+        {
+            case WAIT_OBJECT_0:
+                {   // application termination was signaled by an external thread.
+                    DestroyWindow(message_window);
+                } break;
+
+            case WAIT_OBJECT_0 + 1: // messages are waiting
+            case WAIT_TIMEOUT:      // the wait timeout elapsed
+                {   // wake up and check for work to be done.
+                } break;
+
+            default:
+                {   // an error has occurred - terminate the main loop.
+                    ConsoleError("ERROR: Abandoned or failed wait in time thread; reason = 0x%08X.\n", GetLastError());
+                    keep_running = false;
+                } break;
+        }*/
+
         if (WaitForSingleObject(ev_break, 0) == WAIT_OBJECT_0)
-        {   // some other thread (probably the render thread) has signaled termination.
+        {   // termination signalled externally.
             DestroyWindow(message_window);
         }
 
-        // poll the Windows message queue for the thread to receive WM_INPUT notifications.
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
-        {
+        // poll the Windows message queue for the thread to receive WM_INPUT and other critical notifications.
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE) && keep_running)
+        {   // dispatch the message to the MessageWindowCallback.
             switch (msg.message)
             {
                 case WM_QUIT:
@@ -425,73 +456,39 @@ WinMain
                         DispatchMessage (&msg);
                     } break;
             }
+            if (next_tick != 0)
+            {   // determine whether it's time to launch the next tick.
+                if ((absolute_time = TimestampInNanoseconds()) >= next_tick)
+                {   // it is time to launch the next tick. stop message processing for now.
+                    break;
+                }
+            }
         }
         if (!keep_running)
         {   // time to break out of the main loop.
             break;
         }
 
-        // update the state of all user input devices.
-        ConsumeInputEvents(&input_events, &input_system, tick_start);
+        // launch the next tick, if it's time to do so.
+        if ((absolute_time = TimestampInNanoseconds()) >= next_tick)
+        {
+            miss_time   = absolute_time - next_tick;
+            next_tick   =(absolute_time - miss_time) + SliceOfSecond(60);
+            //ConsoleOutput("Launch tick at %0.06f, next at %0.06f, missed by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(absolute_time) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
+        }
 
-        for (size_t i = 0, n = input_events.KeyboardAttachCount; i < n; ++i)
+        // figure out how many milliseconds to sleep for prior to waking up.
+        if ((absolute_time = TimestampInNanoseconds()) >= next_tick)
         {
-            ConsoleOutput("Keyboard attached as 0x%016p\n", input_events.KeyboardAttach[i]);
+            wait_time = 0;
         }
-        for (size_t i = 0, n = input_events.PointerAttachCount; i < n; ++i)
+        else
         {
-            ConsoleOutput("Pointer attached as 0x%016p\n", input_events.PointerAttach[i]);
-        }
-        for (size_t i = 0, n = input_events.GamepadAttachCount; i < n; ++i)
-        {
-            ConsoleOutput("Gamepad attached as 0x%08u\n", input_events.GamepadAttach[i]);
-        }
-        for (size_t i = 0, n = input_events.KeyboardRemoveCount; i < n; ++i)
-        {
-            ConsoleOutput("Keyboard 0x%016p removed\n", input_events.KeyboardRemove[i]);
-        }
-        for (size_t i = 0, n = input_events.PointerRemoveCount; i < n; ++i)
-        {
-            ConsoleOutput("Pointer 0x%016p removed\n", input_events.PointerRemove[i]);
-        }
-        for (size_t i = 0, n = input_events.GamepadRemoveCount; i < n; ++i)
-        {
-            ConsoleOutput("Gamepad 0x%08u removed\n", input_events.GamepadRemove[i]);
-        }
-        for (size_t i = 0, n = input_events.KeyboardCount; i < n; ++i)
-        {
-            WIN32_KEYBOARD_EVENTS &ev = input_events.KeyboardEvents[i];
-            for (size_t j = 0, m = ev.PressedCount; j < m; ++j)
+            wait_time = NanosecondsToWholeMilliseconds(next_tick - absolute_time);
+            if (wait_time > 0)
             {
-                ConsoleOutput("Key %u pressed on keyboard %016p\n", ev.Pressed[j], input_events.KeyboardIds[i]);
-            }
-            for (size_t j = 0, m = ev.DownCount; j < m; ++j)
-            {
-                ConsoleOutput("Key %u down on keyboard %016p\n", ev.Down[j], input_events.KeyboardIds[i]);
-            }
-            for (size_t j = 0, m = ev.ReleasedCount; j < m; ++j)
-            {
-                ConsoleOutput("Key %u released on keyboard %016p\n", ev.Released[j], input_events.KeyboardIds[i]);
-            }
-        }
-        for (size_t i = 0, n = input_events.PointerCount; i < n; ++i)
-        {
-            WIN32_POINTER_EVENTS &ev = input_events.PointerEvents[i];
-            if (ev.Mickeys[0] != 0 || ev.Mickeys[1] != 0)
-            {
-                ConsoleOutput("Pointer move by (%d, %d) on pointer %016p\n", ev.Mickeys[0], ev.Mickeys[1], input_events.PointerIds[i]);
-            }
-            for (size_t j = 0, m = ev.PressedCount; j < m; ++j)
-            {
-                ConsoleOutput("Button %u pressed on pointer %016p\n", ev.Pressed[j], input_events.PointerIds[i]);
-            }
-            for (size_t j = 0, m = ev.DownCount; j < m; ++j)
-            {
-                ConsoleOutput("Button %u down on pointer %016p\n", ev.Down[j], input_events.PointerIds[i]);
-            }
-            for (size_t j = 0, m = ev.ReleasedCount; j < m; ++j)
-            {
-                ConsoleOutput("Button %u released on pointer %016p\n", ev.Released[j], input_events.PointerIds[i]);
+                //ConsoleOutput("Wait for %u milliseconds\n", wait_time);
+                Sleep(wait_time);
             }
         }
     }
