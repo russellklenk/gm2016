@@ -25,7 +25,7 @@ QueryClockFrequency
 
 /// @summary Retrieve a high-resolution timestamp value.
 /// @return A high-resolution timestamp. The timestamp is specified in counts per-second.
-public_function uint64_t
+public_function inline uint64_t
 TimestampInTicks
 (
     void
@@ -36,11 +36,38 @@ TimestampInTicks
     return uint64_t(ticks.QuadPart);
 }
 
+/// @summary Retrieve a nanosecond-resolution timestamp value.
+/// @return The current timestamp value, in nanoseconds.
+public_function inline uint64_t
+TimestampInNanoseconds
+(
+    void
+)
+{   // MSDN says this will always succeed on Windows XP and later.
+    LARGE_INTEGER ticks;
+    QueryPerformanceCounter(&ticks);
+    // scale the tick value by the nanoseconds-per-second multiplier
+    // before scaling back down by ticks-per-second to avoid loss of precision.
+    return (1000000000ULL * uint64_t(ticks.QuadPart)) / GlobalClockFrequency;
+}
+
+/// @summary Calculates the number of whole nanoseconds in a fixed slice of a whole second.
+/// @param fraction The fraction of a second. For example, to calculate the number of nanoseconds in 1/60 of a second, specify 60.
+/// @return The number of nanoseconds in the specified fraction of a second.
+public_function inline uint64_t
+SliceOfSecond
+(
+    uint64_t fraction
+)
+{
+    return 1000000000ULL / fraction;
+}
+
 /// @summary Given two timestamp values, calculate the number of nanoseconds between them.
 /// @param start_ticks The TimestampInTicks at the beginning of the measured interval.
 /// @param end_ticks The TimestampInTicks at the end of the measured interval.
 /// @return The elapsed time between the timestamps, specified in nanoseconds.
-public_function uint64_t
+public_function inline uint64_t
 ElapsedNanoseconds
 (
     uint64_t start_ticks, 
