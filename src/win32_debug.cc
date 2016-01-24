@@ -39,6 +39,15 @@ struct INDENT_SCOPE
     void   Set(int indent);      /// Save the current indentation level and apply a new indentation level.
 };
 
+/// @summary Define the data used to specify the name of a thread. Copied straight from MSDN.
+struct WIN32_THREAD_NAME_INFO
+{
+    DWORD  Type;                 /// Must be 0x1000.
+    LPCSTR Name;                 /// Pointer to the thread name in user address space.
+    DWORD  ThreadId;             /// The thread identifier, or -1 to indicate the calling thread.
+    DWORD  Flags;                /// Reserved for future reference, set to 0.
+};
+
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
@@ -174,6 +183,33 @@ DebugPrintf
         OutputDebugString(_T("ERROR: DebugPrintf invalid arguments or buffer too small...\n"));
     }
     va_end(arg_list);
+}
+
+/// @summary Set the name of a thread for easier identification in the debugger.
+/// @param thread_id The system identifier of the thread, or -1 to set the name of the calling thread.
+/// @param thread_name Pointer to a zero-terminated ASCII string speifying the thread name.
+public_function void
+SetThreadName
+(
+    DWORD    thread_id, 
+    LPCSTR thread_name
+)
+{
+    WIN32_THREAD_NAME_INFO info = {
+        0x1000, 
+        thread_name, 
+        thread_id, 
+        0
+    };
+
+    __try
+    {
+        RaiseException(0x406D1388, 0, sizeof(info) / sizeof(DWORD), (ULONG_PTR const *) &info);
+    }
+    __except (EXCEPTION_CONTINUE_EXECUTION)
+    {
+        /* empty */
+    }
 }
 
 /// @summary Save the current indentation level and possibly apply a new indentation level.

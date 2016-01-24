@@ -478,6 +478,9 @@ RenderThread
     WIN32_THREAD_ARGS *thread_args  = (WIN32_THREAD_ARGS*) args;
     bool               keep_running = true;
 
+    // set the name of the thread in the debugger.
+    SetThreadName(GetCurrentThreadId(), "GraphicsSubmitThread");
+
     if (!EnumerateAttachedDisplays())
     {
         ConsoleError("ERROR: No displays are attached to the system; render thread cannot start.\n");
