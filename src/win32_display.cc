@@ -11,43 +11,45 @@
 /// @summary Define various flags specifying window states or attributes.
 enum   WINDOW_FLAGS : uint32_t
 {
-    WINDOW_FLAGS_NONE       = (0UL << 0UL),    /// No flags are set on the window.
-    WINDOW_FLAGS_WINDOWED   = (1UL << 0UL),    /// The window is currently presented in a windowed style.
-    WINDOW_FLAGS_FULLSCREEN = (1UL << 1UL),    /// The window is currently presented in a fullscreen style.
+    WINDOW_FLAGS_NONE       = (0UL << 0UL),        /// No flags are set on the window.
+    WINDOW_FLAGS_WINDOWED   = (1UL << 0UL),        /// The window is currently presented in a windowed style.
+    WINDOW_FLAGS_FULLSCREEN = (1UL << 1UL),        /// The window is currently presented in a fullscreen style.
 };
 
 /// @summary Stores the data associated with a display output attached to the system.
 struct WIN32_DISPLAY
 {
-    DWORD           Ordinal;                   /// The unique display ordinal.
-    HMONITOR        Monitor;                   /// The operating system monitor identifier.
-    int             DisplayX;                  /// The x-coordinate of the upper-left corner of the display, in virtual screen space.
-    int             DisplayY;                  /// The y-coordinate of the upper-left corner of the display, in virtual screen space.
-    int             DisplayWidth;              /// The width of the display, in pixels.
-    int             DisplayHeight;             /// The height of the display, in pixels.
-    DEVMODE         DisplayMode;               /// The active display settings.
-    DISPLAY_DEVICE  DisplayInfo;               /// Information uniquely identifying the display to the operating system.
+    DWORD               Ordinal;                    /// The unique display ordinal.
+    HMONITOR            Monitor;                    /// The operating system monitor identifier.
+    int                 DisplayX;                   /// The x-coordinate of the upper-left corner of the display, in virtual screen space.
+    int                 DisplayY;                   /// The y-coordinate of the upper-left corner of the display, in virtual screen space.
+    int                 DisplayWidth;               /// The width of the display, in pixels.
+    int                 DisplayHeight;              /// The height of the display, in pixels.
+    DEVMODE             DisplayMode;                /// The active display settings.
+    DISPLAY_DEVICE      DisplayInfo;                /// Information uniquely identifying the display to the operating system.
 };
 
 /// @summary Stores data associated with a window.
 struct WIN32_WINDOW
 {
-    HWND            Window;                    /// The handle of the window.
-    WINDOWPLACEMENT Placement;                 /// The placement of the window on the display.
-    uint32_t        Flags;                     /// Current state and attribute flags.
+    HWND                Window;                     /// The handle of the window.
+    HDC                 WindowDC;                   /// The device context associated with the window.
+    WINDOWPLACEMENT     Placement;                  /// The placement of the window on the display.
+    uint32_t            Flags;                      /// Current state and attribute flags.
+};
+
+/// @summary Stores global data associated with the rendering coordination thread.
+struct WIN32_DISPLAY_THREAD_ARGS
+{   static size_t const MAX_DISPLAYS = 32;          /// The maximum number of displays recognized on the local system.
+    WIN32_THREAD_ARGS  *MainThreadArgs;             /// Pointer to thread arguments passed from the main thread.
+    size_t              DisplayCount;               /// The number of displays attached to the local system.
+    WIN32_DISPLAY       DisplayList[MAX_DISPLAYS];  /// Information about the displays attached to the local system.
+    WIN32_WINDOW        OutputWindow;               /// The window into which the presentation thread renders.
 };
 
 /*///////////////
 //   Globals   //
 ///////////////*/
-/// @summary Define the maximum number of attached displays recognized by the application.
-global_variable size_t const  MAX_ATTACHED_DISPLAYS                    = 32;
-
-/// @summary Define storage for a list of attributes of all attached displays.
-global_variable WIN32_DISPLAY GlobalDisplayList[MAX_ATTACHED_DISPLAYS] = {};
-
-/// @summary Define the number of valid records in the list of attached displays.
-global_variable size_t        GlobalDisplayCount                       =  0;
 
 /*//////////////////////////
 //   Internal Functions   //
@@ -56,7 +58,8 @@ global_variable size_t        GlobalDisplayCount                       =  0;
 /// @param display_list The caller-managed array of display information to populate.
 /// @param max_displays The maximum number of display records that can be written to display_list.
 /// @param num_displays On return, stores the number of display records written to display_list.
-internal_function void
+/// @return The number of displays attached to the system.
+internal_function size_t
 EnumerateAttachedDisplays
 (
     WIN32_DISPLAY *display_list, 
@@ -110,19 +113,7 @@ EnumerateAttachedDisplays
         CopyMemory(&display->DisplayMode, &dm, (SIZE_T) dm.dmSize);
         CopyMemory(&display->DisplayInfo, &dd, (SIZE_T) dd.cb);
     }
-}
-
-/// @summary Helper function to enumerate all displays attached to the system. Display information is stored in the global list.
-/// @return true if display resources are initialized and at least one display is attached to the system.
-internal_function bool
-EnumerateAttachedDisplays
-(
-    void
-)
-{
-    GlobalDisplayCount = 0;
-    EnumerateAttachedDisplays(GlobalDisplayList, MAX_ATTACHED_DISPLAYS, GlobalDisplayCount);
-    return (GlobalDisplayCount > 0);
+    return num_displays;
 }
 
 /// @summary Locate the display containing a given window.
@@ -176,17 +167,6 @@ FindPrimaryDisplay
         }
     }
     return primary_display;
-}
-
-/// @summary Locate the primary display attached to the system.
-/// @return A pointer to the record associated with the primary display, or NULL if no displays are attached.
-internal_function inline WIN32_DISPLAY*
-FindPrimaryDisplay
-(
-    void
-)
-{
-    return FindPrimaryDisplay(GlobalDisplayList, GlobalDisplayCount);
 }
 
 /// @summary Retrieve the current refresh rate, in Hz, for a given display or window.
@@ -254,23 +234,31 @@ MainWindowCallback
     WPARAM wparam, 
     LPARAM lparam
 )
-{   // WM_NCCREATE performs special handling to store the WIN32_THREAD_ARGS pointer in the window data.
+{   // WM_NCCREATE performs special handling to store the WIN32_DISPLAY_THREAD_ARGS pointer in the window data.
     // the handler for WM_NCCREATE executes before the call to CreateWindowEx returns in CreateWindowOnDisplay.
     if (message == WM_NCCREATE)
-    {   // store the WIN32_THREAD_ARGS in the window user data.
+    {   // store the WIN32_DISPLAY_THREAD_ARGS in the window user data.
         CREATESTRUCT *cs = (CREATESTRUCT*) lparam;
         SetWindowLongPtr(window, GWLP_USERDATA, (LONG_PTR) cs->lpCreateParams);
         return DefWindowProc(window, message, wparam, lparam);
     }
 
+    // this WndProc may receive several messages before receiving WM_NCCREATE.
+    // if the user data hasn't been set yet, pass through to the default handler.
+    WIN32_DISPLAY_THREAD_ARGS *thread_args = (WIN32_DISPLAY_THREAD_ARGS*) GetWindowLongPtr(window, GWLP_USERDATA);
+    if (thread_args == NULL)
+    {   // let the default implementation handle the message.
+        return DefWindowProc(window, message, wparam, lparam);
+    }
+
     // process all other messages sent (or posted) to the window.
-    WIN32_THREAD_ARGS *thread_args = (WIN32_THREAD_ARGS*) GetWindowLongPtr(window, GWLP_USERDATA);
+    WIN32_THREAD_ARGS *main_args = (WIN32_THREAD_ARGS*) thread_args->MainThreadArgs;
     LRESULT result = 0;
     switch (message)
     {
         case WM_ACTIVATE:
             {   // wparam is TRUE if the window is being activated, or FALSE if the window is being deactivated. 
-                SendMessage(thread_args->MessageWindow, message, wparam, lparam);
+                SendMessage(main_args->MessageWindow, message, wparam, lparam);
             } break;
 
         case WM_CLOSE:
@@ -287,7 +275,8 @@ MainWindowCallback
         case WM_DISPLAYCHANGE:
             {   // re-enumerate all attached displays. a display may have been added or removed, 
                 // and likely the geometry of all attached displays was affected in some way.
-                EnumerateAttachedDisplays();
+                thread_args->DisplayCount = 0;
+                EnumerateAttachedDisplays(thread_args->DisplayList, WIN32_DISPLAY_THREAD_ARGS::MAX_DISPLAYS, thread_args->DisplayCount);
             } break;
 
         default:
@@ -301,7 +290,7 @@ MainWindowCallback
 /// @summary Create a new window on a given display.
 /// @param window The window definition to initialize.
 /// @param this_instance The HINSTANCE of the application (passed to WinMain) or GetModuleHandle(NULL).
-/// @param thread_args The global data passed to all threads. This data is also available to the message window.
+/// @param thread_args The global data passed to all threads. This data is also available to the new window.
 /// @param display The target display, or NULL to use the primary display.
 /// @param width The width of the window, or 0 to use the entire width of the display.
 /// @param height The height of the window, or 0 to use the entire height of the display.
@@ -310,13 +299,13 @@ MainWindowCallback
 internal_function bool
 CreateWindowOnDisplay
 (
-    WIN32_WINDOW           *window,
-    HINSTANCE        this_instance,
-    WIN32_DISPLAY         *display, 
-    WIN32_THREAD_ARGS *thread_args,
-    int                      width, 
-    int                     height, 
-    bool                fullscreen
+    WIN32_WINDOW                   *window,
+    HINSTANCE                this_instance,
+    WIN32_DISPLAY                 *display, 
+    WIN32_DISPLAY_THREAD_ARGS *thread_args,
+    int                              width, 
+    int                             height, 
+    bool                        fullscreen
 )
 {
     TCHAR const *class_name = _T("GM2016_WndClass");
@@ -324,7 +313,7 @@ CreateWindowOnDisplay
 
     if (display == NULL)
     {   // create the window on the primary display.
-        if ((display = FindPrimaryDisplay(GlobalDisplayList, GlobalDisplayCount)) == NULL)
+        if ((display = FindPrimaryDisplay(thread_args->DisplayList, thread_args->DisplayCount)) == NULL)
         {   // no displays are attached to the system, so fail.
             return NULL;
         }
@@ -367,7 +356,7 @@ CreateWindowOnDisplay
     int   x        = display->DisplayX;
     int   y        = display->DisplayY;
     DWORD style_ex = 0;
-    DWORD style    =(fullscreen ? 0 : WS_OVERLAPPEDWINDOW) | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+    DWORD style    =(fullscreen ? 0 : (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME)) | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
     TCHAR*title    = display->DisplayInfo.DeviceName;
     RECT  client   = {};
     HWND  hwnd     = CreateWindowEx(style_ex, class_name, title, style, x, y, width, height, NULL, NULL, this_instance, thread_args);
@@ -391,7 +380,8 @@ CreateWindowOnDisplay
     }
 
     // finally, display the window and return the handle.
-    window->Window = hwnd;
+    window->Window   = hwnd;
+    window->WindowDC = GetDC(hwnd);
     window->Placement.length = sizeof(WINDOWPLACEMENT);
     GetWindowPlacement(hwnd, &window->Placement);
 
@@ -411,9 +401,10 @@ ToggleFullscreen
     WIN32_WINDOW *window
 )
 {
-    HWND      hwnd = window->Window;
-    LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
-    if (style & WS_OVERLAPPEDWINDOW)
+    HWND            hwnd = window->Window;
+    LONG_PTR       style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    LONG_PTR    windowed = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME;
+    if (style & windowed)
     {   // switch to a fullscreen style window.
         MONITORINFO monitor_info = { sizeof(MONITORINFO) };
         WINDOWPLACEMENT win_info = { sizeof(WINDOWPLACEMENT) };
@@ -421,7 +412,7 @@ ToggleFullscreen
         {   // modify the window style, size and placement.
             RECT rc = monitor_info.rcMonitor;
             CopyMemory(&window->Placement, &win_info, (SIZE_T) win_info.length);
-            SetWindowLongPtr(hwnd, GWL_STYLE, style &~ WS_OVERLAPPEDWINDOW);
+            SetWindowLongPtr(hwnd, GWL_STYLE, style &~ windowed);
             SetWindowPos(hwnd, HWND_TOP, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
             window->Flags &= ~WINDOW_FLAGS_WINDOWED;
             window->Flags |=  WINDOW_FLAGS_FULLSCREEN;
@@ -429,7 +420,7 @@ ToggleFullscreen
     }
     else
     {   // switch to a windowed style window.
-        SetWindowLongPtr(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowLongPtr(hwnd, GWL_STYLE, style | windowed);
         SetWindowPlacement(hwnd, &window->Placement);
         SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED); 
         window->Flags &= ~WINDOW_FLAGS_FULLSCREEN;
@@ -468,37 +459,42 @@ IsWindowed
 /// @summary Implement the entry point for the main frame composition thread.
 /// @param args Pointer to a WIN32_THREAD_ARGS structure populated by the main thread.
 public_function unsigned int __cdecl
-RenderThread
+DisplayThread
 (
     void *args
 )
 {
-    WIN32_WINDOW       main_window  = {};
-    WIN32_DISPLAY     *main_display = NULL;
-    WIN32_THREAD_ARGS *thread_args  = (WIN32_THREAD_ARGS*) args;
-    bool               keep_running = true;
+    WIN32_WINDOW              main_window  = {};
+    WIN32_DISPLAY           *main_display = NULL;
+    WIN32_THREAD_ARGS          *main_args =(WIN32_THREAD_ARGS*) args;
+    WIN32_DISPLAY_THREAD_ARGS thread_args = {};
+    size_t const             max_displays = WIN32_DISPLAY_THREAD_ARGS::MAX_DISPLAYS;
+    bool                     keep_running = true;
 
     // set the name of the thread in the debugger.
-    SetThreadName(GetCurrentThreadId(), "GraphicsSubmitThread");
+    SetThreadName(GetCurrentThreadId(), "DisplayThread");
 
-    if (!EnumerateAttachedDisplays())
+    // set up the global data for the display thread.
+    thread_args.DisplayCount   = 0;
+    thread_args.MainThreadArgs = main_args;
+    if (!EnumerateAttachedDisplays(thread_args.DisplayList, max_displays, thread_args.DisplayCount))
     {
         ConsoleError("ERROR: No displays are attached to the system; render thread cannot start.\n");
         goto terminate_thread;
     }
-    if ((main_display = FindPrimaryDisplay()) == NULL)
+    if ((main_display = FindPrimaryDisplay(thread_args.DisplayList, thread_args.DisplayCount)) == NULL)
     {
         ConsoleError("ERROR: Unable to find the primary display.\n");
         goto terminate_thread;
     }
-    if (WaitForSingleObject(thread_args->StartEvent, INFINITE) != WAIT_OBJECT_0)
+    if (WaitForSingleObject(main_args->StartEvent, INFINITE) != WAIT_OBJECT_0)
     {
         ConsoleError("ERROR: Render thread failed while waiting on launch signal.\n");
         goto terminate_thread;
     }
 
     // create the main application window on the primary display.
-    if (!CreateWindowOnDisplay(&main_window, thread_args->ModuleBaseAddr, main_display, thread_args, 800, 600, false))
+    if (!CreateWindowOnDisplay(&thread_args.OutputWindow, main_args->ModuleBaseAddr, main_display, &thread_args, 800, 600, false))
     {   // unable to create the main application window; there's no point in proceeding.
         ConsoleError("ERROR: Unable to create the main window on display %s.\n", DisplayName(main_display));
         goto terminate_thread;
@@ -510,7 +506,7 @@ RenderThread
         MSG msg;
 
         // check for externally-signaled thread termination.
-        if (WaitForSingleObject(thread_args->TerminateEvent, 0) == WAIT_OBJECT_0)
+        if (WaitForSingleObject(main_args->TerminateEvent, 0) == WAIT_OBJECT_0)
         {   // early termination was signaled by an outside thread.
             keep_running = false;
         }
@@ -539,12 +535,12 @@ RenderThread
         Sleep(16);
     }
 
-    ConsoleError("STATUS: The render thread is exiting.\n");
-    SetEvent(thread_args->TerminateEvent);
+    ConsoleError("STATUS: The display thread is exiting.\n");
+    SetEvent(main_args->TerminateEvent);
     return 0;
 
 terminate_thread:
-    SetEvent(thread_args->TerminateEvent);
+    SetEvent(main_args->TerminateEvent);
     return 1;
 }
 

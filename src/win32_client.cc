@@ -33,7 +33,7 @@
 #include "win32_timestamp.cc"
 #include "win32_parse.cc"
 #include "win32_memarena.cc"
-#include "win32_render.cc"
+#include "win32_display.cc"
 #include "win32_input.cc"
 
 #include "memarena.cc"
@@ -407,9 +407,9 @@ WinMain
     }
 
     // set up explicit threads for frame composition, network I/O and file I/O.
-    if ((thread_draw = SpawnExplicitThread(RenderThread, &thread_args)) == NULL)
+    if ((thread_draw = SpawnExplicitThread(DisplayThread, &thread_args)) == NULL)
     {
-        ConsoleError("ERROR: Unable to spawn the rendering thread.\n");
+        ConsoleError("ERROR: Unable to spawn the display thread.\n");
         goto cleanup_and_shutdown;
     }
 
