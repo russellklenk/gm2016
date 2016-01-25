@@ -345,23 +345,24 @@ WinMain
     int        show_command
 )
 {
-    WIN32_COMMAND_LINE          argv;
-    WIN32_THREAD_ARGS    thread_args = {};
-    WIN32_INPUT_EVENTS  input_events = {};
-    WIN32_INPUT_SYSTEM  input_system = {};
-    WIN32_CPU_INFO          host_cpu = {};
-    HANDLE                  ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
-    HANDLE                  ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
-    HANDLE               thread_draw = NULL; // frame composition thread and main UI thread
-    HANDLE               thread_disk = NULL; // asynchronous disk I/O thread
-    HANDLE               thread_net  = NULL; // network I/O thread
-    uint64_t               next_tick = 0;    // the ideal launch time of the next tick
-    uint64_t            current_tick = 0;    // the launch time of the current tick
-    uint64_t           previous_tick = 0;    // the launch time of the previous tick
-    uint64_t               miss_time = 0;    // number of nanoseconds over the launch time
-    DWORD                  wait_time = 0;    // number of milliseconds the timer thread will sleep for
-    HWND              message_window = NULL; // for receiving input and notification from other threads
-    bool                keep_running = true;
+    WIN32_COMMAND_LINE             argv;
+    WIN32_THREAD_ARGS       thread_args = {};
+    WIN32_TASK_SCHEDULER task_scheduler = {};
+    WIN32_INPUT_EVENTS     input_events = {};
+    WIN32_INPUT_SYSTEM     input_system = {};
+    WIN32_CPU_INFO             host_cpu = {};
+    HANDLE                     ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+    HANDLE                     ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+    HANDLE                  thread_draw = NULL; // frame composition thread and main UI thread
+    HANDLE                  thread_disk = NULL; // asynchronous disk I/O thread
+    HANDLE                  thread_net  = NULL; // network I/O thread
+    uint64_t                  next_tick = 0;    // the ideal launch time of the next tick
+    uint64_t               current_tick = 0;    // the launch time of the current tick
+    uint64_t              previous_tick = 0;    // the launch time of the previous tick
+    uint64_t                  miss_time = 0;    // number of nanoseconds over the launch time
+    DWORD                     wait_time = 0;    // number of milliseconds the timer thread will sleep for
+    HWND                 message_window = NULL; // for receiving input and notification from other threads
+    bool                   keep_running = true;
 
     UNUSED_ARG(prev_instance);
     UNUSED_ARG(command_line);
@@ -412,6 +413,11 @@ WinMain
     if ((thread_draw = SpawnExplicitThread(DisplayThread, &thread_args)) == NULL)
     {
         ConsoleError("ERROR: Unable to spawn the display thread.\n");
+        goto cleanup_and_shutdown;
+    }
+    if (!LaunchTaskScheduler(&task_scheduler, &thread_args))
+    {
+        ConsoleError("ERROR: Unable to launch the task scheduler.\n");
         goto cleanup_and_shutdown;
     }
 
@@ -489,6 +495,7 @@ WinMain
     ConsoleOutput("The main thread has exited.\n");
 
 cleanup_and_shutdown:
+    // TODO(rlk): cleanup for the task scheduler
     if (ev_break    != NULL) SetEvent(ev_break);
     if (thread_draw != NULL) WaitForSingleObject(thread_draw, INFINITE);
     if (thread_disk != NULL) WaitForSingleObject(thread_disk, INFINITE);
