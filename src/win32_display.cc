@@ -116,6 +116,19 @@ EnumerateAttachedDisplays
     return num_displays;
 }
 
+/// @summary Enumerate and retrieve information for all displays attached to the system.
+/// @param args The thread-local data managing the display list.
+/// @return The number of displays attached to the system.
+internal_function size_t
+EnumerateAttachedDisplays
+(
+    WIN32_DISPLAY_THREAD_ARGS *args
+)
+{
+    args->DisplayCount = 0;
+    return EnumerateAttachedDisplays(args->DisplayList, WIN32_DISPLAY_THREAD_ARGS::MAX_DISPLAYS, args->DisplayCount);
+}
+
 /// @summary Locate the display containing a given window.
 /// @param display_list The list of attached displays to search.
 /// @param num_displays The number of records in the display_list.
@@ -167,6 +180,18 @@ FindPrimaryDisplay
         }
     }
     return primary_display;
+}
+
+/// @summary Locate the primary display attached to the system.
+/// @param args Thread-local data maintaining the display list to search.
+/// @return A pointer to the record associated with the primary display, or NULL if no displays are attached.
+internal_function WIN32_DISPLAY*
+FindPrimaryDisplay
+(
+    WIN32_DISPLAY_THREAD_ARGS *args
+)
+{
+    return FindPrimaryDisplay(args->DisplayList, args->DisplayCount);
 }
 
 /// @summary Retrieve the current refresh rate, in Hz, for a given display or window.
@@ -467,21 +492,19 @@ DisplayThread
     WIN32_DISPLAY           *main_display = NULL;
     WIN32_THREAD_ARGS          *main_args =(WIN32_THREAD_ARGS*) args;
     WIN32_DISPLAY_THREAD_ARGS thread_args = {};
-    size_t const             max_displays = WIN32_DISPLAY_THREAD_ARGS::MAX_DISPLAYS;
     bool                     keep_running = true;
 
     // set the name of the thread in the debugger.
     SetThreadName(GetCurrentThreadId(), "DisplayThread");
 
     // set up the global data for the display thread.
-    thread_args.DisplayCount   = 0;
     thread_args.MainThreadArgs = main_args;
-    if (!EnumerateAttachedDisplays(thread_args.DisplayList, max_displays, thread_args.DisplayCount))
+    if (!EnumerateAttachedDisplays(&thread_args))
     {
         ConsoleError("ERROR: No displays are attached to the system; render thread cannot start.\n");
         goto terminate_thread;
     }
-    if ((main_display = FindPrimaryDisplay(thread_args.DisplayList, thread_args.DisplayCount)) == NULL)
+    if ((main_display = FindPrimaryDisplay(&thread_args)) == NULL)
     {
         ConsoleError("ERROR: Unable to find the primary display.\n");
         goto terminate_thread;
