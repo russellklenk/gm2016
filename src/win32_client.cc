@@ -37,8 +37,6 @@
 #include "win32_display.cc"
 #include "win32_input.cc"
 
-#include "memarena.cc"
-
 /*//////////////////
 //   Data Types   //
 //////////////////*/
