@@ -109,6 +109,20 @@ enum WIN32_RUNTIME_TYPE : int
     WIN32_RUNTIME_TYPE_SERVER = 2,    /// The Win32 runtime is being loaded on the server.
 };
 
+/// @summary Define the CPU topology information reported to the application.
+struct WIN32_CPU_INFO
+{
+    size_t NumaNodes;                 /// The number of NUMA nodes in the system.
+    size_t PhysicalCPUs;              /// The number of physical CPUs installed in the system.
+    size_t PhysicalCores;             /// The total number of physical cores in all CPUs.
+    size_t HardwareThreads;           /// The total number of hardware threads in all CPUs.
+    size_t ThreadsPerCore;            /// The number of hardware threads per physical core.
+    char   VendorName[13];            /// The CPUID vendor string.
+    char   PreferAMD;                 /// Set to 1 if AMD OpenCL implementations are preferred.
+    char   PreferIntel;               /// Set to 1 if Intel OpenCL implementations are preferred.
+    char   IsVirtualMachine;          /// Set to 1 if the process is running in a virtual machine.
+};
+
 DECLARE_WIN32_RUNTIME_FUNCTION(void    , WINAPI, XInputEnable                      , BOOL);                                                   // XInput1_4.dll
 DECLARE_WIN32_RUNTIME_FUNCTION(DWORD   , WINAPI, XInputGetState                    , DWORD, XINPUT_STATE*);                                   // XInput1_4.dll
 DECLARE_WIN32_RUNTIME_FUNCTION(DWORD   , WINAPI, XInputSetState                    , DWORD, XINPUT_VIBRATION*);                               // XInput1_4.dll
@@ -121,7 +135,6 @@ DECLARE_WIN32_RUNTIME_FUNCTION(BOOL    , WINAPI, GetQueuedCompletionStatusEx    
 DECLARE_WIN32_RUNTIME_FUNCTION(BOOL    , WINAPI, SetFileCompletionNotificationModes, HANDLE , UCHAR);                                         // Kernel32.dll
 DECLARE_WIN32_RUNTIME_FUNCTION(DWORD   , WINAPI, GetFinalPathNameByHandleA         , HANDLE , LPSTR , DWORD, DWORD);                          // Kernel32.dll
 DECLARE_WIN32_RUNTIME_FUNCTION(DWORD   , WINAPI, GetFinalPathNameByHandleW         , HANDLE , LPWSTR, DWORD, DWORD);                          // Kernel32.dll
-
 
 /*///////////////
 //   Globals   //
@@ -542,5 +555,110 @@ InitializeRuntime
     
     }
     return ElevateProcessPrivileges();
+}
+
+/// @summary Enumerate all CPU resources of the host system. Allocates temporary memory with malloc/free.
+/// @param cpu_info The structure to populate with information about host CPU resources.
+/// @return true if the host CPU information was successfully retrieved.
+public_function bool
+EnumerateHostCPU
+(
+    WIN32_CPU_INFO *cpu_info
+)
+{
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *lpibuf = NULL;
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *info   = NULL;
+    size_t     smt_count = 0;
+    uint8_t     *bufferp = NULL;
+    uint8_t     *buffere = NULL;
+    DWORD    buffer_size = 0;
+    int          regs[4] ={0, 0, 0, 0};
+
+    // zero out the CPU information returned to the caller.
+    ZeroMemory(cpu_info, sizeof(WIN32_CPU_INFO));
+    
+    // retrieve the CPU vendor string using the __cpuid intrinsic.
+    __cpuid(regs  , 0); // CPUID function 0
+    *((int*)&cpu_info->VendorName[0]) = regs[1]; // EBX
+    *((int*)&cpu_info->VendorName[4]) = regs[3]; // ECX
+    *((int*)&cpu_info->VendorName[8]) = regs[2]; // EDX
+         if (!strcmp(cpu_info->VendorName, "AuthenticAMD")) cpu_info->PreferAMD        = true;
+    else if (!strcmp(cpu_info->VendorName, "GenuineIntel")) cpu_info->PreferIntel      = true;
+    else if (!strcmp(cpu_info->VendorName, "KVMKVMKVMKVM")) cpu_info->IsVirtualMachine = true;
+    else if (!strcmp(cpu_info->VendorName, "Microsoft Hv")) cpu_info->IsVirtualMachine = true;
+    else if (!strcmp(cpu_info->VendorName, "VMwareVMware")) cpu_info->IsVirtualMachine = true;
+    else if (!strcmp(cpu_info->VendorName, "XenVMMXenVMM")) cpu_info->IsVirtualMachine = true;
+
+    // figure out the amount of space required, and allocate a temporary buffer:
+    GetLogicalProcessorInformationEx(RelationAll, NULL, &buffer_size);
+    if ((lpibuf = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) malloc(size_t(buffer_size))) == NULL)
+    {   // unable to allocate the required memory:
+        cpu_info->NumaNodes       = 1;
+        cpu_info->PhysicalCPUs    = 1;
+        cpu_info->PhysicalCores   = 1;
+        cpu_info->HardwareThreads = 1;
+        cpu_info->ThreadsPerCore  = 1;
+        return false;
+    }
+    GetLogicalProcessorInformationEx(RelationAll, lpibuf, &buffer_size);
+
+    // initialize the output counts:
+    cpu_info->NumaNodes       = 0;
+    cpu_info->PhysicalCPUs    = 0;
+    cpu_info->PhysicalCores   = 0;
+    cpu_info->HardwareThreads = 0;
+    cpu_info->ThreadsPerCore  = 0;
+
+    // step through the buffer and update counts:
+    bufferp = (uint8_t*) lpibuf;
+    buffere =((uint8_t*) lpibuf) + size_t(buffer_size);
+    while (bufferp < buffere)
+    {
+        info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) bufferp;
+        switch (info->Relationship)
+        {
+            case RelationNumaNode:
+                {
+                    cpu_info->NumaNodes++;
+                } break;
+
+            case RelationProcessorPackage:
+                {
+                    cpu_info->PhysicalCPUs++;
+                } break;
+
+            case RelationProcessorCore:
+                {
+                    cpu_info->PhysicalCores++;
+                    if (info->Processor.Flags == LTP_PC_SMT)
+                        smt_count++;
+                } break;
+
+            default:
+                {   // RelationGroup, RelationCache - don't care.
+                } break;
+        }
+        bufferp += size_t(info->Size);
+    }
+    // free the temporary buffer:
+    free(lpibuf);
+
+    // determine the total number of logical processors in the system.
+    // use this value to figure out the number of threads per-core.
+    if (smt_count > 0)
+    {   // determine the number of logical processors in the system and
+        // use this value to figure out the number of threads per-core.
+        SYSTEM_INFO sysinfo;
+        GetNativeSystemInfo(&sysinfo);
+        cpu_info->ThreadsPerCore = size_t(sysinfo.dwNumberOfProcessors) / smt_count;
+    }
+    else
+    {   // there are no SMT-enabled CPUs in the system, so 1 thread per-core.
+        cpu_info->ThreadsPerCore = 1;
+    }
+
+    // calculate the total number of available hardware threads.
+    cpu_info->HardwareThreads = (smt_count * cpu_info->ThreadsPerCore) + (cpu_info->PhysicalCores - smt_count);
+    return true;
 }
 

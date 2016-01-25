@@ -30,9 +30,10 @@
 
 #include "win32_debug.cc"
 #include "win32_runtime.cc"
-#include "win32_timestamp.cc"
-#include "win32_parse.cc"
 #include "win32_memarena.cc"
+#include "win32_timestamp.cc"
+#include "win32_tasksched.cc"
+#include "win32_parse.cc"
 #include "win32_display.cc"
 #include "win32_input.cc"
 
@@ -350,6 +351,7 @@ WinMain
     WIN32_THREAD_ARGS    thread_args = {};
     WIN32_INPUT_EVENTS  input_events = {};
     WIN32_INPUT_SYSTEM  input_system = {};
+    WIN32_CPU_INFO          host_cpu = {};
     HANDLE                  ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                  ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE               thread_draw = NULL; // frame composition thread and main UI thread
@@ -382,11 +384,13 @@ WinMain
     // initialize the data that is available to all worker threads.
     // the MessageWindow field of thread_args is set by CreateMessageWindow.
     QueryClockFrequency();
+    EnumerateHostCPU(&host_cpu);
     ResetInputSystem(&input_system);
     thread_args.StartEvent     = ev_start;
     thread_args.TerminateEvent = ev_break;
     thread_args.ModuleBaseAddr = this_instance;
     thread_args.MessageWindow  = NULL;
+    thread_args.HostCPUInfo    = &host_cpu;
     thread_args.CommandLine    = &argv;
     thread_args.InputSystem    = &input_system;
 
@@ -481,6 +485,7 @@ WinMain
                 Sleep(wait_time);
             }
         }
+        UNUSED_LOCAL(input_events);
     }
 
     ConsoleOutput("The main thread has exited.\n");

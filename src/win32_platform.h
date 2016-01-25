@@ -5,8 +5,9 @@
 /*//////////////////
 //   Data Types   //
 //////////////////*/
-/// @summary Forward-declare the low-level input system type.
-struct WIN32_INPUT_SYSTEM;
+/// @summary Forward-declare several types referenced by the WIN32_THREAD_ARGS structure.
+struct WIN32_CPU_INFO;                   /// See win32_runtime.cc
+struct WIN32_INPUT_SYSTEM;               /// See win32_input.cc
 
 /// @summary Defines the data representing the result of parsing command line arguments.
 struct WIN32_COMMAND_LINE
@@ -21,6 +22,7 @@ struct WIN32_THREAD_ARGS
     HANDLE              TerminateEvent;  /// All threads poll this manual-reset event. If signaled, they terminate.
     HINSTANCE           ModuleBaseAddr;  /// The module load address of the executable.
     HWND                MessageWindow;   /// The background message window used to communicate with the main thread.
+    WIN32_CPU_INFO     *HostCPUInfo;     /// Information about the CPU resources of the host system.
     WIN32_COMMAND_LINE *CommandLine;     /// Parsed command-line argument information.
     WIN32_INPUT_SYSTEM *InputSystem;     /// The low-level input system.
 };
