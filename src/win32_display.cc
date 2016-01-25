@@ -464,7 +464,6 @@ DisplayThread
     void *args
 )
 {
-    WIN32_WINDOW              main_window  = {};
     WIN32_DISPLAY           *main_display = NULL;
     WIN32_THREAD_ARGS          *main_args =(WIN32_THREAD_ARGS*) args;
     WIN32_DISPLAY_THREAD_ARGS thread_args = {};
