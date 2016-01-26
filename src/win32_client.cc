@@ -8,6 +8,7 @@
 //   Includes   //
 ////////////////*/
 #include <iostream>
+#include <atomic>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -345,24 +346,26 @@ WinMain
     int        show_command
 )
 {
-    WIN32_COMMAND_LINE             argv;
-    WIN32_THREAD_ARGS       thread_args = {};
-    WIN32_TASK_SCHEDULER task_scheduler = {};
-    WIN32_INPUT_EVENTS     input_events = {};
-    WIN32_INPUT_SYSTEM     input_system = {};
-    WIN32_CPU_INFO             host_cpu = {};
-    HANDLE                     ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
-    HANDLE                     ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
-    HANDLE                  thread_draw = NULL; // frame composition thread and main UI thread
-    HANDLE                  thread_disk = NULL; // asynchronous disk I/O thread
-    HANDLE                  thread_net  = NULL; // network I/O thread
-    uint64_t                  next_tick = 0;    // the ideal launch time of the next tick
-    uint64_t               current_tick = 0;    // the launch time of the current tick
-    uint64_t              previous_tick = 0;    // the launch time of the previous tick
-    uint64_t                  miss_time = 0;    // number of nanoseconds over the launch time
-    DWORD                     wait_time = 0;    // number of milliseconds the timer thread will sleep for
-    HWND                 message_window = NULL; // for receiving input and notification from other threads
-    bool                   keep_running = true;
+    WIN32_COMMAND_LINE              argv;
+    WIN32_THREAD_ARGS        thread_args = {};
+    WIN32_MEMORY_ARENA     main_os_arena = {};
+    WIN32_INPUT_EVENTS      input_events = {};
+    WIN32_INPUT_SYSTEM      input_system = {};
+    WIN32_CPU_INFO              host_cpu = {};
+    WIN32_TASK_SCHEDULER *task_scheduler = NULL;
+    MEMORY_ARENA              main_arena = {};
+    HANDLE                      ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+    HANDLE                      ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+    HANDLE                   thread_draw = NULL; // frame composition thread and main UI thread
+    HANDLE                   thread_disk = NULL; // asynchronous disk I/O thread
+    HANDLE                   thread_net  = NULL; // network I/O thread
+    uint64_t                   next_tick = 0;    // the ideal launch time of the next tick
+    uint64_t                current_tick = 0;    // the launch time of the current tick
+    uint64_t               previous_tick = 0;    // the launch time of the previous tick
+    uint64_t                   miss_time = 0;    // number of nanoseconds over the launch time
+    DWORD                      wait_time = 0;    // number of milliseconds the timer thread will sleep for
+    HWND                  message_window = NULL; // for receiving input and notification from other threads
+    bool                    keep_running = true;
 
     UNUSED_ARG(prev_instance);
     UNUSED_ARG(command_line);
@@ -376,6 +379,18 @@ WinMain
     }
     if (!InitializeRuntime(WIN32_RUNTIME_TYPE_CLIENT))
     {   // if the necessary privileges could not be obtained, there's no point in proceeding.
+        goto cleanup_and_shutdown;
+    }
+
+    // set up the global memory arena.
+    if (CreateMemoryArena(&main_os_arena, 32 * 1024 * 1024) < 0)
+    {
+        DebugPrintf(_T("ERROR: Unable to allocate the required global memory.\n"));
+        goto cleanup_and_shutdown;
+    }
+    if (CreateArena(&main_arena, 32 * 1024 * 1024, sizeof(intptr_t), &main_os_arena) < 0)
+    {
+        DebugPrintf(_T("ERROR: Unable to initialize the global memory arena.\n"));
         goto cleanup_and_shutdown;
     }
 
@@ -415,7 +430,8 @@ WinMain
         ConsoleError("ERROR: Unable to spawn the display thread.\n");
         goto cleanup_and_shutdown;
     }
-    if (!LaunchTaskScheduler(&task_scheduler, &thread_args))
+    // TODO(rlk): Need to separate into Make and Launch steps - Make up above, launch here.
+    if ((task_scheduler = MakeTaskScheduler(&main_arena, &thread_args)) == NULL)
     {
         ConsoleError("ERROR: Unable to launch the task scheduler.\n");
         goto cleanup_and_shutdown;
