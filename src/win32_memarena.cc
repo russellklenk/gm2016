@@ -7,7 +7,7 @@
 //   Data Types   //
 //////////////////*/
 /// @summary Define the data associated with an operating system arena allocator. General-purpose sub-arenas can be created from a single underlying arena.
-struct OS_MEMORY_ARENA
+struct WIN32_MEMORY_ARENA
 {
     size_t   NextOffset;         /// The offset, in bytes relative to BaseAddress, of the next available byte.
     size_t   BytesCommitted;     /// The number of bytes committed for the arena.
@@ -35,8 +35,8 @@ struct MEMORY_ARENA
 public_function int
 CreateMemoryArena
 (
-    OS_MEMORY_ARENA       *arena, 
-    size_t            arena_size
+    WIN32_MEMORY_ARENA     *arena, 
+    size_t             arena_size
 )
 {   // virtual memory allocations are rounded up to the next even multiple of the system 
     // page size, and have a starting address that is an even multiple of the system 
@@ -71,7 +71,7 @@ CreateMemoryArena
 public_function void
 DeleteMemoryArena
 (
-    OS_MEMORY_ARENA *arena
+    WIN32_MEMORY_ARENA *arena
 )
 {
     if (arena->BaseAddress != NULL)
@@ -92,7 +92,7 @@ DeleteMemoryArena
 public_function size_t
 MemoryArenaMarker
 (
-    OS_MEMORY_ARENA *arena
+    WIN32_MEMORY_ARENA *arena
 )
 {
     return arena->NextOffset;
@@ -104,7 +104,7 @@ MemoryArenaMarker
 public_function size_t
 MemoryArenaPageSize
 (
-    OS_MEMORY_ARENA *arena
+    WIN32_MEMORY_ARENA *arena
 )
 {
     return size_t(arena->PageSize);
@@ -118,9 +118,9 @@ MemoryArenaPageSize
 public_function void*
 MemoryArenaAllocate
 (
-    OS_MEMORY_ARENA          *arena, 
-    size_t               alloc_size, 
-    size_t          alloc_alignment
+    WIN32_MEMORY_ARENA          *arena, 
+    size_t                  alloc_size, 
+    size_t             alloc_alignment
 )
 {
     size_t base_address    = size_t(arena->BaseAddress) + arena->NextOffset;
@@ -150,9 +150,9 @@ MemoryArenaAllocate
 public_function void*
 MemoryArenaReserve
 (
-    OS_MEMORY_ARENA          *arena, 
-    size_t             reserve_size, 
-    size_t          alloc_alignment
+    WIN32_MEMORY_ARENA          *arena, 
+    size_t                reserve_size, 
+    size_t             alloc_alignment
 )
 {
     if (arena->ReserveAlignBytes != 0 || arena->ReserveTotalBytes != 0)
@@ -186,8 +186,8 @@ MemoryArenaReserve
 public_function int
 MemoryArenaCommit
 (
-    OS_MEMORY_ARENA      *arena, 
-    size_t          commit_size
+    WIN32_MEMORY_ARENA      *arena, 
+    size_t             commit_size
 )
 {
     if (commit_size == 0)
@@ -216,7 +216,7 @@ MemoryArenaCommit
 public_function void
 MemoryArenaCancel
 (
-    OS_MEMORY_ARENA *arena
+    WIN32_MEMORY_ARENA *arena
 )
 {
     arena->ReserveAlignBytes = 0;
@@ -229,8 +229,8 @@ MemoryArenaCancel
 public_function void
 MemoryArenaResetToMarker
 (
-    OS_MEMORY_ARENA       *arena,
-    size_t          arena_marker
+    WIN32_MEMORY_ARENA       *arena,
+    size_t             arena_marker
 )
 {
     if (arena_marker <= arena->NextOffset)
@@ -242,7 +242,7 @@ MemoryArenaResetToMarker
 public_function void
 MemoryArenaReset
 (
-    OS_MEMORY_ARENA *arena
+    WIN32_MEMORY_ARENA *arena
 )
 {
     arena->NextOffset = 0;
@@ -254,8 +254,8 @@ MemoryArenaReset
 public_function void
 MemoryArenaDecommitToMarker
 (
-    OS_MEMORY_ARENA       *arena, 
-    size_t          arena_marker
+    WIN32_MEMORY_ARENA       *arena, 
+    size_t             arena_marker
 )
 {
     if (arena_marker < arena->NextOffset)
@@ -281,7 +281,7 @@ MemoryArenaDecommitToMarker
 public_function void
 MemoryArenaDecommit
 (
-    OS_MEMORY_ARENA *arena
+    WIN32_MEMORY_ARENA *arena
 )
 {
     if (arena->BytesCommitted > 0)
@@ -300,10 +300,10 @@ MemoryArenaDecommit
 public_function int
 CreateArena
 (
-    MEMORY_ARENA             *arena,
-    size_t               arena_size,
-    size_t          arena_alignment,
-    OS_MEMORY_ARENA   *source_arena
+    MEMORY_ARENA                *arena,
+    size_t                  arena_size,
+    size_t             arena_alignment,
+    WIN32_MEMORY_ARENA   *source_arena
 )
 {
     // allocate and touch all of the pages.
