@@ -634,4 +634,13 @@ MakeTaskScheduler
 // begin add task(s) locks global table. if performing a batch add, create one pseudo-task with children; return handle to pseudo-task.
 // finish add task allows user to specify queue, or NULL to use main scheduler queue. worker threads would specify their own queue.
 // when finishing, a task needs to know what tasks depend on it, so it can launch them.
+//
+// Another thing to try - refer to tasks via handle, and have ont task buffer/worker thread/tick.
+// Handle would be something like:
+// 12 bits thread ID, 16 bits array index, 4 bits buffer index
+// This allows up to 4096 threads, 65536 tasks per-tick, and 16 ticks buffered.
+// If a task is 64 bytes with a max of 8192 tasks/tick and three ticks are buffered, for a 40-core system this is 1.5MB/thread or 60MB total overhead.
+// A more reasonable 4096 tasks/tick gives overhead of 40MB (1MB/thread.) This is pretty much a worst-case for systems in use.
+// High-end would be a 24 core system (2x 6 cores w/SMT).
+// 
 
