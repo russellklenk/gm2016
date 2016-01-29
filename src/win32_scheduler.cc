@@ -68,16 +68,28 @@
 /// @summary Use a unique 32-bit integer to identify a task.
 typedef uint32_t task_id_t;
 
-enum TASK_ID_TYPE   : uint32_t
+/// @summary Define identifiers for task ID validity. An ID can only be valid or invalid.
+enum TASK_ID_TYPE : uint32_t
 {
     TASK_ID_TYPE_INVALID    = 0, 
     TASK_ID_TYPE_VALID      = 1,
 };
 
+/// @summary Define identifiers for supported scheduler types. Only two scheduler types are supported since only one bit is available in the task ID.
 enum SCHEDULER_TYPE : uint32_t
 {
     SCHEDULER_TYPE_ASYNC    = 0,
     SCHEDULER_TYPE_COMPUTE  = 1,
+};
+
+/// @summary Define a structure specifying the constituent parts of a task ID.
+struct TASK_ID_PARTS
+{
+    uint32_t    ValidTask;     /// One of TASK_ID_TYPE specifying whether the task is valid.
+    uint32_t    SchedulerType; /// One of SCHEDULER_TYPE specifying the scheduler that owns the task.
+    uint32_t    ThreadIndex;   /// The zero-based index of the thread that defines the task.
+    uint32_t    BufferIndex;   /// The zero-based index of the thread-local buffer that defines the task.
+    uint32_t    TaskIndex;     /// The zero-based index of the task within the thread-local buffer.
 };
 
 /*//////////////////////////
@@ -109,5 +121,46 @@ MakeTaskId
            ((task_index     & TASK_ID_MASK_INDEX_U ) << TASK_ID_SHIFT_INDEX ) |
            ((thread_index   & TASK_ID_MASK_THREAD_U) << TASK_ID_SHIFT_THREAD) | 
            ((task_id_type   & TASK_ID_MASK_VALID_U ) << TASK_ID_SHIFT_VALID );
+}
+
+/// @summary Determine whether an ID identifies a valid task.
+/// @param id The task identifier to check.
+/// @return true if the identifier specifies a valid task.
+public_function inline bool
+IsValidTask
+(
+    task_id_t id
+)
+{
+    return (((id & TASK_ID_MASK_VALID_P) >> TASK_ID_SHIFT_VALID) != 0);
+}
+
+/// @summary Retrieve the zero-based index of the thread that created a task.
+/// @param id The task identifier.
+/// @return The zero-based index of the thread that created the task.
+public_function inline uint32_t
+GetSourceThreadForTask
+(
+    task_id_t id
+)
+{
+    return (id & TASK_ID_MASK_THREAD_P) >> TASK_ID_SHIFT_THREAD;
+}
+
+/// @summary Extract all of the information from a task identifier.
+/// @param parts The structure to populate with information extracted from the task identifier.
+/// @param id The task identifier.
+public_function inline void
+GetTaskIdParts
+(
+    TASK_ID_PARTS *parts, 
+    task_id_t         id
+)
+{
+    parts->ValidTask     = (id & TASK_ID_MASK_VALID_P ) >> TASK_ID_SHIFT_VALID;
+    parts->SchedulerType = (id & TASK_ID_MASK_TYPE_P  ) >> TASK_ID_SHIFT_TYPE;
+    parts->ThreadIndex   = (id & TASK_ID_MASK_THREAD_P) >> TASK_ID_SHIFT_THREAD;
+    parts->BufferIndex   = (id & TASK_ID_MASK_TICK_P  ) >> TASK_ID_SHIFT_TICK;
+    parts->TaskIndex     = (id & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
 }
 
