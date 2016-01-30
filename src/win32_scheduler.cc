@@ -74,77 +74,89 @@ typedef int (*TASK_ENTRY)(struct TASK_ARGS*);
 /// @summary Define identifiers for task ID validity. An ID can only be valid or invalid.
 enum TASK_ID_TYPE : uint32_t
 {
-    TASK_ID_TYPE_INVALID    = 0,    /// The task identifier specifies an invalid task.
-    TASK_ID_TYPE_VALID      = 1,    /// The task identifier specifies a valid task.
+    TASK_ID_TYPE_INVALID    = 0,     /// The task identifier specifies an invalid task.
+    TASK_ID_TYPE_VALID      = 1,     /// The task identifier specifies a valid task.
 };
 
 /// @summary Define identifiers for supported scheduler types. Only two scheduler types are supported since only one bit is available in the task ID.
 enum SCHEDULER_TYPE : uint32_t
 {
-    SCHEDULER_TYPE_ASYNC    = 0,    /// Identifies a standard asynchronous task scheduler.
-    SCHEDULER_TYPE_COMPUTE  = 1,    /// Identifies a compute-oriented task scheduler.
+    SCHEDULER_TYPE_ASYNC    = 0,     /// Identifies a standard asynchronous task scheduler.
+    SCHEDULER_TYPE_COMPUTE  = 1,     /// Identifies a compute-oriented task scheduler.
 };
 
 /// @summary Define a structure specifying the constituent parts of a task ID.
 struct TASK_ID_PARTS
 {
-    uint32_t      ValidTask;        /// One of TASK_ID_TYPE specifying whether the task is valid.
-    uint32_t      SchedulerType;    /// One of SCHEDULER_TYPE specifying the scheduler that owns the task.
-    uint32_t      ThreadIndex;      /// The zero-based index of the thread that defines the task.
-    uint32_t      BufferIndex;      /// The zero-based index of the thread-local buffer that defines the task.
-    uint32_t      TaskIndex;        /// The zero-based index of the task within the thread-local buffer.
+    uint32_t       ValidTask;        /// One of TASK_ID_TYPE specifying whether the task is valid.
+    uint32_t       SchedulerType;    /// One of SCHEDULER_TYPE specifying the scheduler that owns the task.
+    uint32_t       ThreadIndex;      /// The zero-based index of the thread that defines the task.
+    uint32_t       BufferIndex;      /// The zero-based index of the thread-local buffer that defines the task.
+    uint32_t       TaskIndex;        /// The zero-based index of the task within the thread-local buffer.
 };
 
 /// @summary Define a structure used to specify data used to configure a task scheduler instance at creation time.
 struct TASK_SCHEDULER_CONFIG
 {
-    size_t        MaxActiveTicks;   /// The maximum number of application ticks in-flight at any given time.
-    size_t        MaxWorkerThreads; /// The maximum number of worker threads that can be spawned.
-    size_t        MaxTasksPerTick;  /// The maximum number of tasks that can be created during a single application tick.
-    size_t        MaxTaskArenaSize; /// The number of bytes to allocate for each thread-local arena.
+    size_t         MaxActiveTicks;   /// The maximum number of application ticks in-flight at any given time.
+    size_t         MaxWorkerThreads; /// The maximum number of worker threads that can be spawned.
+    size_t         MaxTasksPerTick;  /// The maximum number of tasks that can be created during a single application tick.
+    size_t         MaxTaskArenaSize; /// The number of bytes to allocate for each thread-local arena.
 };
 
-/// @summary Define the data associated with a single work item.
+/// @summary Define the data associated with a work item.
 struct WORK_ITEM
 {
-    TASK_ENTRY    TaskMain;         /// The task entry point.
-    int32_t       WorkCount;        /// The number of outstanding work items associated with the task.
-    task_id_t     Dependency;       /// THe task that must complete before this task is launched.
-    char          ArgsData[48];     /// Space for additional data to be passed to the task.
+    TASK_ENTRY     TaskMain;         /// The task entry point.
+};
+
+/// @summary Define the data associated with the list of tasks that are waiting to run.
+struct WTR_TASK_LIST
+{
+    size_t         TaskCount;        /// The number of tasks in the waiting-to-run list.
+    task_id_t     *DependencyList;   /// The task ID of the task that must be completed before the waiting task can be launched.
+    uint16_t      *TaskIndexList;    /// The zero-based index of the task WORK_ITEM within the task buffer.
 };
 
 /// @summary Define the data associated with task definitions for a single in-flight tick.
 struct TASK_BUFFER
 {
-    size_t        TaskCount;        /// The number of tasks allocated from the buffer.
-    WORK_ITEM    *WorkItems;        /// Fixed-length storage for storing data associated with each task.
-    // TODO(rlk): Dependency lists - what tasks depend on this task?
+    size_t         TaskCount;        /// The number of tasks allocated from the buffer.
+    WORK_ITEM     *WorkItems;        /// Fixed-length storage for storing data associated with each task.
+    int32_t       *WorkRemaining;    /// Fixed-length storage for counters tracking the outstanding work for each task.
 };
 
 /// @summary Define the data associated with a single worker thread.
 struct TASK_WORKER
 {
-    size_t        MaxTasksPerTick;  /// The maximum number of tasks that can be created in a given tick.
-    MEMORY_ARENA  ThreadArena;      /// The thread-local memory arena.
-    TASK_BUFFER   TaskList[4];      /// The per-tick data used to track tasks created on that tick.
-    // TODO(rlk): WorkQueue
+    size_t         MaxTasksPerTick;  /// The maximum number of tasks that can be created in a given tick.
+    MEMORY_ARENA   ThreadArena;      /// The thread-local memory arena.
+    TASK_BUFFER    TaskList[4];      /// The per-tick data used to track tasks created on that tick.
+    // TODO(rlk):  WorkQueue
+    // TODO(rlk):  WTR list
 };
 
 /// @summary Define the data associated with an asynchronous task scheduler.
 struct WIN32_ASYNC_TASK_SCHEDULER
 {
-    HANDLE        ErrorSignal;      /// 
-    HANDLE        LaunchSignal;     /// 
+    HANDLE         ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
+    HANDLE         LaunchSignal;     /// Manual-reset event signaled when worker threads should start running tasks.
 
-    size_t        ThreadCount;      /// The number of worker threads managed by the scheduler.
-    unsigned int *OSThreadIds;      /// The operating system identifiers for each worker thread.
-    HANDLE       *OSThreadHandle;   /// The operating system thread handle for each worker thread.
-    TASK_WORKER  *WorkerThreads;    /// 
+    size_t         ThreadCount;      /// The number of worker threads managed by the scheduler.
+    unsigned int  *OSThreadIds;      /// The operating system identifiers for each worker thread.
+    HANDLE        *OSThreadHandle;   /// The operating system thread handle for each worker thread.
 };
 
 /// @summary Define the data associated with a compute-oriented task scheduler.
 struct WIN32_COMPUTE_TASK_SCHEDULER
 {
+    HANDLE         ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
+    HANDLE         LaunchSignal;     /// Manual-reset event signaled when worker threads should start running tasks.
+
+    size_t         ThreadCount;      /// The number of worker threads managed by the scheduler.
+    unsigned int  *OSThreadIds;      /// The operating system identifiers for each worker thread.
+    HANDLE        *OSThreadHandle;   /// The operating system thread handle for each worker thread.
+    TASK_WORKER   *WorkerThreads;    /// The state data for each worker thread.
 };
 
 /*//////////////////////////
@@ -217,5 +229,42 @@ GetTaskIdParts
     parts->ThreadIndex   = (id & TASK_ID_MASK_THREAD_P) >> TASK_ID_SHIFT_THREAD;
     parts->BufferIndex   = (id & TASK_ID_MASK_TICK_P  ) >> TASK_ID_SHIFT_TICK;
     parts->TaskIndex     = (id & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
+}
+
+public_function WIN32_ASYNC_TASK_SCHEDULER*
+CreateAsyncScheduler
+(
+    TASK_SCHEDULER_CONFIG *config, 
+    MEMORY_ARENA           *arena
+)
+{
+}
+
+public_function WIN32_COMPUTE_TASK_SCHEDULER*
+CreateComputeScheduler
+(
+    TASK_SCHEDULER_CONFIG *config, 
+    MEMORY_ARENA           *arena
+)
+{
+}
+
+public_function task_id_t
+CreateComputeTask
+(
+    WIN32_COMPUTE_TASK_SCHEDULER  *scheduler, 
+    TASK_ENTRY                   entry_point, 
+    task_id_t                     dependency
+)
+{
+}
+
+public_function void
+ReadyComputeTask
+(
+    WIN32_COMPUTE_TASK_SCHEDULER *scheduler,
+    task_id_t                          task
+)
+{
 }
 
