@@ -20,46 +20,56 @@
 /// B: The zero-based index of the task buffer. The system supports up to 4 ticks in-flight simultaneously.
 #ifndef TASK_ID_LAYOUT_DEFINED
 #define TASK_ID_LAYOUT_DEFINED
-#define TASK_ID_MASK_TICK_P      (0x00000003UL)
-#define TASK_ID_MASK_TICK_U      (0x00000003UL)
-#define TASK_ID_MASK_TYPE_P      (0x00000004UL)
-#define TASK_ID_MASK_TYPE_U      (0x00000001UL)
-#define TASK_ID_MASK_INDEX_P     (0x0007FFF8UL)
-#define TASK_ID_MASK_INDEX_U     (0x0000FFFFUL)
-#define TASK_ID_MASK_THREAD_P    (0x7FF80000UL)
-#define TASK_ID_MASK_THREAD_U    (0x00000FFFUL)
-#define TASK_ID_MASK_VALID_P     (0x80000000UL)
-#define TASK_ID_MASK_VALID_U     (0x00000001UL)
-#define TASK_ID_SHIFT_TICK       (0)
-#define TASK_ID_SHIFT_TYPE       (2)
-#define TASK_ID_SHIFT_INDEX      (3)
-#define TASK_ID_SHIFT_THREAD     (19)
-#define TASK_ID_SHIFT_VALID      (31)
+#define TASK_ID_MASK_TICK_P               (0x00000003UL)
+#define TASK_ID_MASK_TICK_U               (0x00000003UL)
+#define TASK_ID_MASK_TYPE_P               (0x00000004UL)
+#define TASK_ID_MASK_TYPE_U               (0x00000001UL)
+#define TASK_ID_MASK_INDEX_P              (0x0007FFF8UL)
+#define TASK_ID_MASK_INDEX_U              (0x0000FFFFUL)
+#define TASK_ID_MASK_THREAD_P             (0x7FF80000UL)
+#define TASK_ID_MASK_THREAD_U             (0x00000FFFUL)
+#define TASK_ID_MASK_VALID_P              (0x80000000UL)
+#define TASK_ID_MASK_VALID_U              (0x00000001UL)
+#define TASK_ID_SHIFT_TICK                (0)
+#define TASK_ID_SHIFT_TYPE                (2)
+#define TASK_ID_SHIFT_INDEX               (3)
+#define TASK_ID_SHIFT_THREAD              (19)
+#define TASK_ID_SHIFT_VALID               (31)
 #endif
 
 /// @summary Define the maximum number of worker threads supported by the scheduler.
 #ifndef MAX_WORKER_THREADS
-#define MAX_WORKER_THREADS       (4095)
+#define MAX_WORKER_THREADS                (4095)
 #endif
 
 /// @summary Define the maximum number of threads that can submit jobs to the scheduler. This is the number of worker threads plus one, to account for the main thread that submits the root tasks.
 #ifndef MAX_SCHEDULER_THREADS
-#define MAX_SCHEDULER_THREADS    (4096)
+#define MAX_SCHEDULER_THREADS             (4096)
 #endif
 
 /// @summary Define the maximum number of simultaneous ticks in-flight. The main thread will block and stop submitting ticks when this limit is reached. The runtime limit may be lower.
 #ifndef MAX_TICKS_IN_FLIGHT
-#define MAX_TICKS_IN_FLIGHT      (4)
+#define MAX_TICKS_IN_FLIGHT               (4)
 #endif
 
 /// @summary Define the maximum number of tasks that can be submitted during any given tick. The runtime limit may be lower.
 #ifndef MAX_TASKS_PER_TICK
-#define MAX_TASKS_PER_TICK       (65536)
+#define MAX_TASKS_PER_TICK                (65536)
+#endif
+
+/// @summary Define a special value used to indicate that no thread-local memory is required.
+#ifndef WORKER_THREAD_ARENA_NOT_NEEDED
+#define WORKER_THREAD_ARENA_NOT_NEEDED    (~size_t(0))
+#endif
+
+/// @summary Define the default size of the thread-local memory for each worker thread.
+#ifndef WORKER_THREAD_ARENA_SIZE_DEFAULT
+#define WORKER_THREAD_ARENA_SIZE_DEFAULT  (2UL * 1024UL * 1024UL)
 #endif
 
 /// @summary Define the identifier returned to represent an invalid task ID.
 #ifndef INVALID_TASK_ID
-#define INVALID_TASK_ID          ((task_id_t) 0x7FFFFFFFUL)
+#define INVALID_TASK_ID                   ((task_id_t) 0x7FFFFFFFUL)
 #endif
 
 /*//////////////////
@@ -231,13 +241,209 @@ GetTaskIdParts
     parts->TaskIndex     = (id & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
 }
 
+/// @summary Validates a given scheduler configuration and populates any default values with their actual values. Emits performance warnings if necessary.
+/// @param dst_config The configuration object to receive the validated configuration data.
+/// @param src_config The configuration object specifying the input configuration data.
+/// @param cpu_info Information about the CPU resources of the host system.
+/// @param scheduler_type One of SCHEDULER_TYPE specifying the type of task scheduler being created.
+/// @return true if no performance warnings were emitted.
+public_function bool
+CheckSchedulerConfiguration
+(
+    TASK_SCHEDULER_CONFIG    *dst_config, 
+    TASK_SCHEDULER_CONFIG    *src_config, 
+    WIN32_CPU_INFO             *cpu_info,
+    uint32_t              scheduler_type
+)
+{
+    if (dst_config == NULL)
+    {   // a destination configuration object MUST be supplied.
+        return false;
+    }
+    if (src_config == NULL)
+    {   // an input configuration object MUST be supplied.
+        return false;
+    }
+    if (cpu_info == NULL)
+    {   // information about host CPU resources MUST be supplied.
+        return false;
+    }
+    if (scheduler_type != SCHEDULER_TYPE_ASYNC && scheduler_type != SCHEDULER_TYPE_COMPUTE)
+    {   // the input scheduler type is not valid.
+        return false;
+    }
+
+    // we want to return a valid configuration, so track the source validation result.
+    bool performance_ok = true;
+    
+    // default (if necessary) and validate the maximum number of ticks-in-flight.
+    if (src_config->MaxActiveTicks == 0)
+    {   // give the destination configuration the default value.
+        dst_config->MaxActiveTicks  = 2;
+    }
+    else
+    {   // copy the value from the input configuration.
+        dst_config->MaxActiveTicks  = src_config->MaxActiveTicks;
+    }
+    // validate the MaxActiveTicks value.
+    if (dst_config->MaxActiveTicks  > MAX_TICKS_IN_FLIGHT)
+    {   // set to the largest acceptable value.
+        ConsoleOutput("WARNING: Too many active ticks in-flight may cause excessive memory usage.\n");
+        dst_config->MaxActiveTicks  = MAX_TICKS_IN_FLIGHT;
+        performance_ok = false;
+    }
+
+    // default (if necessary) and validate the maximum number of worker threads.
+    if (src_config->MaxWorkerThreads == 0)
+    {   // the default value of this item depends on the scheduler type.
+        if (scheduler_type == SCHEDULER_TYPE_ASYNC)
+        {   // an async task scheduler is expected to have most threads idle/waiting.
+            // therefore, allow it to have more worker threads total to handle additional requests.
+            dst_config->MaxWorkerThreads = cpu_info->HardwareThreads * 2;
+        }
+        else if (scheduler_type == SCHEDULER_TYPE_COMPUTE)
+        {   // a compute task scheduler shouldn't have more threads than there are hardware resources.
+            dst_config->MaxWorkerThreads = cpu_info->HardwareThreads;
+        }
+        else
+        {   // this case should have been caught by the check at the start of the function.
+            ConsoleError("ERROR: Unhandled scheduler_type when defaulting TASK_SCHEDULER_CONFIG::MaxWorkerThreads. Defaulting to 1 thread.\n");
+            dst_config->MaxWorkerThreads = 1;
+            performance_ok = false;
+        }
+    }
+    else
+    {   // copy the value from the input configuration.
+        dst_config->MaxWorkerThreads = src_config->MaxWorkerThreads;
+    }
+    // validate the MaxWorkerThreads value.
+    if (dst_config->MaxWorkerThreads > MAX_WORKER_THREADS)
+    {   // set to the largest acceptable value.
+        ConsoleOutput("WARNING: Too many worker threads requested. An excessive number of worker threads may reduce performance.\n");
+        dst_config->MaxWorkerThreads = MAX_WORKER_THREADS;
+        performance_ok = false;
+    }
+    if (dst_config->MaxWorkerThreads <(cpu_info->HardwareThreads - 2))
+    {   // spit out a warning in this case; the hardware is being under-utilized.
+        ConsoleOutput("WARNING: Fewer worker threads than hardware threads requested; the hardware may be under-utilized.\n");
+        performance_ok = false;
+    }
+    if (dst_config->MaxWorkerThreads >(cpu_info->HardwareThreads * 4))
+    {   // spit out a warning in this case, which is probably hurting more than helping.
+        ConsoleOutput("WARNING: Significantly more worker threads allowed than hardware resources available, which may decrease performance.\n");
+        performance_ok = false;
+    }
+
+    // default (if necessary) and validate the maximum number of tasks per-tick.
+    // this is really best set by the application, but use a reasonable default if none is specified.
+    if (src_config->MaxTasksPerTick == 0)
+    {   // the default value of this item depends on the scheduler type.
+        if (scheduler_type == SCHEDULER_TYPE_ASYNC)
+        {   // an async task scheduler will have far fewer tasks than a compute scheduler.
+            dst_config->MaxTasksPerTick = 512;
+        }
+        else if (scheduler_type == SCHEDULER_TYPE_COMPUTE)
+        {   // a compute task scheduler is expected to spawn many tasks.
+            dst_config->MaxTasksPerTick = 4096;
+        }
+        else
+        {   // this case should have been caught by the check at the start of the function.
+            ConsoleError("ERROR: Unhandled scheduler_type when defaulting TASK_SCHEDULER_CONFIG::MaxTasksPerTick. Defaulting to 2048 tasks per-tick.\n");
+            dst_config->MaxTasksPerTick = 2048;
+            performance_ok = false;
+        }
+    }
+    // the maximum number of tasks per-tick should always be a power of two.
+    if ((dst_config->MaxTasksPerTick & (dst_config->MaxTasksPerTick-1) != 0)
+    {   // round up to the next largest power-of-two.
+        size_t n = 1;
+        size_t m = dst_config->MaxTasksPerTick;
+        while (n < m)
+        {   // bump up to the next power-of-two.
+            n <<= 1;
+        }
+        dst_config->MaxTasksPerTick = m;
+    }
+    // validate the MaxTasksPerTick value.
+    if (dst_config->MaxTasksPerTick > MAX_TASKS_PER_TICK)
+    {   // set to the largest acceptable value.
+        ConsoleOutput("WARNING: Too many tasks per-tick will be spawned. Errors or excessive memory usage may result.\n");
+        dst_config->MaxTasksPerTick = MAX_TASKS_PER_TICK;
+        performance_ok = false;
+    }
+
+    // default (if necessary) and validate the maximum amount of worker thread-local memory.
+    if (src_config->MaxTaskArenaSize == 0)
+    {   // give each thread up to 2MB.
+        dst_config->MaxTaskArenaSize = WORKER_THREAD_ARENA_SIZE_DEFAULT;
+    }
+    else
+    {   // copy the value from the input configuration. this handles WORKER_THREAD_ARENA_NOT_NEEDED also.
+        dst_config->MaxTaskArenaSize = src_config->MaxTaskArenaSize;
+    }
+    // TODO(rlk): Use GlobalMemoryStatusEx to query physical memory.
+    // report an error if the requested memory is too high.
+
+    return performance_ok;
+}
+
+/// @summary Calculate the amount of memory required for a given scheduler configuration.
+/// @param config The scheduler configuration.
+/// @param scheduler_type The type of scheduler, one of SCHEDULER_TYPE.
+/// @return The number of bytes required to create a scheduler of the specified type with the given configuration, or 0 if the configuration or scheduler type is invalid.
+public_function size_t
+CalculateMemoryForScheduler
+(
+    TASK_SCHEDULER_CONFIG        *config,
+    uint32_t              scheduler_type, 
+    size_t                    &alignment
+)
+{
+    if (scheduler_type == SCHEDULER_TYPE_ASYNC)
+    {
+        size_t   align  = std::alignment_of<HANDLE>::value;
+        size_t    size  = sizeof(HANDLE) * 2; // ErrorSignal, LaunchSignal
+    }
+    if (scheduler_type == SCHEDULER_TYPE_COMPUTE)
+    {
+    }
+    // else, unknown scheduler type.
+    return 0;
+}
+
+/*
+struct TASK_SCHEDULER_CONFIG
+{
+    size_t         MaxActiveTicks;   /// The maximum number of application ticks in-flight at any given time.
+    size_t         MaxWorkerThreads; /// The maximum number of worker threads that can be spawned.
+    size_t         MaxTasksPerTick;  /// The maximum number of tasks that can be created during a single application tick.
+    size_t         MaxTaskArenaSize; /// The number of bytes to allocate for each thread-local arena.
+};
+    HANDLE         ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
+    HANDLE         LaunchSignal;     /// Manual-reset event signaled when worker threads should start running tasks.
+
+    size_t         ThreadCount;      /// The number of worker threads managed by the scheduler.
+    unsigned int  *OSThreadIds;      /// The operating system identifiers for each worker thread.
+    HANDLE        *OSThreadHandle;   /// The operating system thread handle for each worker thread.
+*/
+
 public_function WIN32_ASYNC_TASK_SCHEDULER*
 CreateAsyncScheduler
 (
     TASK_SCHEDULER_CONFIG *config, 
     MEMORY_ARENA           *arena
 )
-{
+{   // TODO(rlk): validate the configuration.
+    HANDLE                       ev_error = CreateEvent(NULL, TRUE, FALSE, NULL);
+    HANDLE                       ev_start = CreateEvent(NULL, TRUE, FALSE, NULL);
+    WIN32_ASYNC_TASK_SCHEDULER *scheduler = PushStruct<WIN32_ASYNC_TASK_SCHEDULER>(arena);
+    if (scheduler == NULL) return NULL;
+
+    //!ArenaCanAllocate(arena, alignment)
+
+cleanup_and_fail:
+    if (ev_start != NULL) CloseHandle(ev_start);
+    if (ev_error != NULL) CloseHandle(ev_error);
 }
 
 public_function WIN32_COMPUTE_TASK_SCHEDULER*
@@ -254,6 +460,7 @@ CreateComputeTask
 (
     WIN32_COMPUTE_TASK_SCHEDULER  *scheduler, 
     TASK_ENTRY                   entry_point, 
+    task_id_t                         parent,
     task_id_t                     dependency
 )
 {
