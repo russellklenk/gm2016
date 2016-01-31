@@ -308,7 +308,7 @@ CreateArena
 {
     // allocate and touch all of the pages.
     void  *base = MemoryArenaAllocate(source_arena, arena_size, arena_alignment);
-    if (base   != nullptr)
+    if (base   != NULL)
     {   // the memory arena was created successfully.
         arena->BytesTotal        = arena_size;
         arena->BytesUsed         = 0;
@@ -338,12 +338,14 @@ CreateArena
 
 /// @summary Determine whether a memory allocation request can be satisfied.
 /// @param arena The memory arena to query.
+/// @param size The size of the allocation request, in bytes.
 /// @param alignment The desired alignment of the returned address. This must be a power of two greater than zero.
 /// @return true if the specified allocation will succeed.
 public_function bool
 ArenaCanAllocate
 (
     MEMORY_ARENA    *arena, 
+    size_t            size,
     size_t       alignment
 )
 {
@@ -357,11 +359,41 @@ ArenaCanAllocate
     return true;
 }
 
+/// @summary Determine whether a memory allocation request can be satisfied.
+/// @typeparam T The type being allocated. This type is used to determine the required alignment.
+/// @param arena The memory arena to query.
+/// @return true if the specified allocation will succeed.
+template <typename T>
+public_function inline bool
+ArenaCanAllocateStruct
+(
+    MEMORY_ARENA *arena
+)
+{
+    return ArenaCanAllocate(arena, sizeof(T), std::alignment_of<T>::value);
+}
+
+/// @summary Determine whether a memory allocation request for an array can be satisfied.
+/// @typeparam T The type of array element. This type is used to determine the required alignment.
+/// @param arena The memory arena to query.
+/// @param count The number of items in the array.
+/// @return true if the specified allocation will succeed.
+template <typename T>
+public_function inline bool
+ArenaCanAllocateArray
+(
+    MEMORY_ARENA *arena,
+    size_t        count
+)
+{
+    return ArenaCanAllocate(arena, sizeof(T) * count, std::alignment_of<T>::value);
+}
+
 /// @summary Allocate aligned memory from an arena.
 /// @param arena The memory arena to allocate from.
 /// @param size The number of bytes to allocate.
 /// @param alignment The desired alignment of the returned address. This must be a power of two greater than zero.
-/// @return A pointer to the start of the allocated block, or nullptr if the request could not be satisfied.
+/// @return A pointer to the start of the allocated block, or NULL if the request could not be satisfied.
 public_function void*
 ArenaAllocate
 (
@@ -375,7 +407,7 @@ ArenaAllocate
     size_t     alloc_bytes = size + (aligned_address - base_address);
     if ((arena->BytesUsed + alloc_bytes) > arena->BytesTotal)
     {   // there's not enough space to satisfy the allocation request.
-        return nullptr;
+        return NULL;
     }
     arena->BytesUsed += alloc_bytes;
     return (void*) aligned_address;
@@ -396,14 +428,14 @@ ArenaReserve
 {
     if (arena->ReserveAlignBytes != 0 || arena->ReserveTotalBytes != 0)
     {   // there's an existing reservation, which must be committed or canceled first.
-        return nullptr;
+        return NULL;
     }
     size_t base_address    = size_t(arena->BaseAddress) + arena->BytesUsed;
     size_t aligned_address = AlignUp(base_address, alloc_alignment);
     size_t bytes_total     = reserve_size + (aligned_address - base_address);
     if ((arena->BytesUsed  + bytes_total) > arena->BytesTotal)
     {   // there's not enough reserved address space to satisfy the request.
-        return nullptr;
+        return NULL;
     }
     arena->ReserveAlignBytes = aligned_address - base_address;
     arena->ReserveTotalBytes = bytes_total;
@@ -465,10 +497,36 @@ ArenaReset
     arena->BytesUsed = 0;
 }
 
+/// @summary Retrieve an exact marker that can be used to reset the arena, preserving all current allocations.
+/// @param arena The memory arena to query.
+/// @return The marker representing the byte offset of the next allocation.
+public_function size_t
+ArenaMarker
+(
+    MEMORY_ARENA *arena
+)
+{
+    return arena->BytesUsed;
+}
+
+/// @summary Resets the state of the arena back to a marker, without decommitting any memory.
+/// @param arena The memory arena to reset.
+/// @param arena_marker The marker value returned by ArenaMarker().
+public_function void
+ArenaResetToMarker
+(
+    MEMORY_ARENA       *arena,
+    size_t       arena_marker
+)
+{
+    if (arena_marker <= arena->BytesUsed)
+        arena->BytesUsed = arena_marker;
+}
+
 /// @summary Allocate a new instance of a structure from a memory arena.
 /// @typeparam T The type of structure to allocate.
 /// @param arena The memory arena to allocate from.
-/// @return A pointer to the new instance, or nullptr.
+/// @return A pointer to the new instance, or NULL.
 template <typename T>
 public_function T*
 PushStruct
@@ -483,7 +541,7 @@ PushStruct
 /// @typeparam T The type of items in the array.
 /// @param arena The memory arena to allocate from.
 /// @param count The number of items of type T, representing the maximum size of the array (in items.)
-/// @return A pointer to the start of the array, or nullptr.
+/// @return A pointer to the start of the array, or NULL.
 template <typename T>
 public_function T*
 PushArray
@@ -511,7 +569,7 @@ CreateSubArena
 )
 {
     void  *base = ArenaAllocate(source_arena, arena_size, arena_alignment);
-    if (base != nullptr)
+    if (base != NULL)
     {   // the sub-arena was created successfully.
         arena->BytesTotal        = arena_size;
         arena->BytesUsed         = 0;

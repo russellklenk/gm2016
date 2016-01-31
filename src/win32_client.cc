@@ -33,7 +33,6 @@
 #include "win32_runtime.cc"
 #include "win32_memarena.cc"
 #include "win32_timestamp.cc"
-#include "win32_tasksched.cc"
 #include "win32_parse.cc"
 #include "win32_display.cc"
 #include "win32_input.cc"
@@ -352,7 +351,6 @@ WinMain
     WIN32_INPUT_EVENTS      input_events = {};
     WIN32_INPUT_SYSTEM      input_system = {};
     WIN32_CPU_INFO              host_cpu = {};
-    WIN32_TASK_SCHEDULER *task_scheduler = NULL;
     MEMORY_ARENA              main_arena = {};
     HANDLE                      ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                      ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
@@ -428,12 +426,6 @@ WinMain
     if ((thread_draw = SpawnExplicitThread(DisplayThread, &thread_args)) == NULL)
     {
         ConsoleError("ERROR: Unable to spawn the display thread.\n");
-        goto cleanup_and_shutdown;
-    }
-    // TODO(rlk): Need to separate into Make and Launch steps - Make up above, launch here.
-    if ((task_scheduler = MakeTaskScheduler(&main_arena, &thread_args)) == NULL)
-    {
-        ConsoleError("ERROR: Unable to launch the task scheduler.\n");
         goto cleanup_and_shutdown;
     }
 
