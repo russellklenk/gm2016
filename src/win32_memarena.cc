@@ -336,6 +336,27 @@ CreateArena
     }
 }
 
+/// @summary Determine whether a memory allocation request can be satisfied.
+/// @param arena The memory arena to query.
+/// @param alignment The desired alignment of the returned address. This must be a power of two greater than zero.
+/// @return true if the specified allocation will succeed.
+public_function bool
+ArenaCanAllocate
+(
+    MEMORY_ARENA    *arena, 
+    size_t       alignment
+)
+{
+    size_t    base_address = size_t(arena->BaseAddress) + arena->BytesUsed;
+    size_t aligned_address = AlignUp(base_address, alignment);
+    size_t     alloc_bytes = size + (aligned_address - base_address);
+    if ((arena->BytesUsed + alloc_bytes) > arena->BytesTotal)
+    {   // there's not enough space to satisfy the allocation request.
+        return false;
+    }
+    return true;
+}
+
 /// @summary Allocate aligned memory from an arena.
 /// @param arena The memory arena to allocate from.
 /// @param size The number of bytes to allocate.
