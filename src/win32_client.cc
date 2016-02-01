@@ -4,6 +4,13 @@
 /// background threads. User input is handled on the main thread.
 ///////////////////////////////////////////////////////////////////////////80*/
 
+/*////////////////////
+//   Preprocessor   //
+////////////////////*/
+#define Kilobytes(x)     (size_t((x)) * size_t(1024))
+#define Megabytes(x)     (size_t((x)) * size_t(1024) * size_t(1024))
+#define Gigabytes(x)     (size_t((x)) * size_t(1024) * size_t(1024) * size_t(1024))
+
 /*////////////////
 //   Includes   //
 ////////////////*/
@@ -363,6 +370,7 @@ WinMain
     uint64_t               previous_tick = 0;    // the launch time of the previous tick
     uint64_t                   miss_time = 0;    // number of nanoseconds over the launch time
     DWORD                      wait_time = 0;    // number of milliseconds the timer thread will sleep for
+    size_t const         main_arena_size = Megabytes(128);
     HWND                  message_window = NULL; // for receiving input and notification from other threads
     bool                    keep_running = true;
 
@@ -382,12 +390,12 @@ WinMain
     }
 
     // set up the global memory arena.
-    if (CreateMemoryArena(&main_os_arena, 32 * 1024 * 1024) < 0)
+    if (CreateMemoryArena(&main_os_arena, main_arena_size) < 0)
     {
         DebugPrintf(_T("ERROR: Unable to allocate the required global memory.\n"));
         goto cleanup_and_shutdown;
     }
-    if (CreateArena(&main_arena, 32 * 1024 * 1024, sizeof(intptr_t), &main_os_arena) < 0)
+    if (CreateArena(&main_arena, main_arena_size, std::alignment_of<void*>::value, &main_os_arena) < 0)
     {
         DebugPrintf(_T("ERROR: Unable to initialize the global memory arena.\n"));
         goto cleanup_and_shutdown;
