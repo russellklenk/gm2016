@@ -520,7 +520,11 @@ ArenaResetToMarker
 )
 {
     if (arena_marker <= arena->BytesUsed)
-        arena->BytesUsed = arena_marker;
+    {   // also cancel out any pending memory reservation.
+        arena->BytesUsed         = arena_marker;
+        arena->ReserveAlignBytes = 0;
+        arena->ReserveTotalBytes = 0;
+    }
 }
 
 /// @summary Allocate a new instance of a structure from a memory arena.
