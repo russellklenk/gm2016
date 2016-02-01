@@ -361,7 +361,7 @@ SpawnComputeWorker
     // ...
 
     // spawn the thread, and wait for it to report that it's ready.
-    if ((thread_handle = (HANDLE)_beginthreadex(NULL, 0, AsyncWorkerMain, worker_state, 0, &thread_id)) == 0)
+    if ((thread_handle = (HANDLE)_beginthreadex(NULL, 0, ComputeWorkerMain, worker_state, 0, &thread_id)) == 0)
     {   // unable to spawn the thread. let the caller decide if they want to exit.
         CloseHandle(worker_ready);
         return false;

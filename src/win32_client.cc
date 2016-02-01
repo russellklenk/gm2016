@@ -353,26 +353,30 @@ WinMain
     int        show_command
 )
 {
-    WIN32_COMMAND_LINE              argv;
-    WIN32_THREAD_ARGS        thread_args = {};
-    WIN32_MEMORY_ARENA     main_os_arena = {};
-    WIN32_INPUT_EVENTS      input_events = {};
-    WIN32_INPUT_SYSTEM      input_system = {};
-    WIN32_CPU_INFO              host_cpu = {};
-    MEMORY_ARENA              main_arena = {};
-    HANDLE                      ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
-    HANDLE                      ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
-    HANDLE                   thread_draw = NULL; // frame composition thread and main UI thread
-    HANDLE                   thread_disk = NULL; // asynchronous disk I/O thread
-    HANDLE                   thread_net  = NULL; // network I/O thread
-    uint64_t                   next_tick = 0;    // the ideal launch time of the next tick
-    uint64_t                current_tick = 0;    // the launch time of the current tick
-    uint64_t               previous_tick = 0;    // the launch time of the previous tick
-    uint64_t                   miss_time = 0;    // number of nanoseconds over the launch time
-    DWORD                      wait_time = 0;    // number of milliseconds the timer thread will sleep for
-    size_t const         main_arena_size = Megabytes(128);
-    HWND                  message_window = NULL; // for receiving input and notification from other threads
-    bool                    keep_running = true;
+    WIN32_COMMAND_LINE                       argv;
+    WIN32_THREAD_ARGS                 thread_args = {};
+    WIN32_MEMORY_ARENA              main_os_arena = {};
+    WIN32_INPUT_EVENTS               input_events = {};
+    WIN32_INPUT_SYSTEM               input_system = {};
+    WIN32_CPU_INFO                       host_cpu = {};
+    MEMORY_ARENA                       main_arena = {};
+    TASK_SCHEDULER_CONFIG            async_config = {};
+    TASK_SCHEDULER_CONFIG          compute_config = {};
+    HANDLE                               ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+    HANDLE                               ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+    HANDLE                            thread_draw = NULL; // frame composition thread and main UI thread
+    HANDLE                            thread_disk = NULL; // asynchronous disk I/O thread
+    HANDLE                            thread_net  = NULL; // network I/O thread
+    WIN32_ASYNC_TASK_SCHEDULER   *async_scheduler = NULL; // scheduler for long-running tasks
+    WIN32_COMPUTE_TASK_SCHEDULER  *task_scheduler = NULL; // scheduler for non-blocking, compute-oriented tasks
+    uint64_t                            next_tick = 0;    // the ideal launch time of the next tick
+    uint64_t                         current_tick = 0;    // the launch time of the current tick
+    uint64_t                        previous_tick = 0;    // the launch time of the previous tick
+    uint64_t                            miss_time = 0;    // number of nanoseconds over the launch time
+    DWORD                               wait_time = 0;    // number of milliseconds the timer thread will sleep for
+    HWND                           message_window = NULL; // for receiving input and notification from other threads
+    bool                             keep_running = true;
+    size_t const                  main_arena_size = Megabytes(128);
 
     UNUSED_ARG(prev_instance);
     UNUSED_ARG(command_line);
@@ -414,6 +418,8 @@ WinMain
     thread_args.HostCPUInfo    = &host_cpu;
     thread_args.CommandLine    = &argv;
     thread_args.InputSystem    = &input_system;
+    thread_args.AsyncScheduler = NULL;
+    thread_args.TaskScheduler  = NULL;
 
     // create the message window used to receive user input and messages from other threads.
     if ((message_window = CreateMessageWindow(this_instance, &thread_args)) == NULL)
@@ -431,6 +437,29 @@ WinMain
         goto cleanup_and_shutdown;
     }
 
+    // create the compute task scheduler first, and then the async scheduler.
+    // the async scheduler may depend on the compute task scheduler.
+    compute_config.MaxActiveTicks   = 2;
+    compute_config.MaxWorkerThreads = host_cpu.HardwareThreads;
+    compute_config.MaxTasksPerTick  = 4096;
+    compute_config.MaxTaskArenaSize = Megabytes(2);
+    if ((task_scheduler = CreateComputeScheduler(&compute_config, &thread_args, &main_arena)) == NULL)
+    {   // no compute task scheduler is available.
+        ConsoleError("ERROR: Unable to create the compute task scheduler.\n");
+        goto cleanup_and_shutdown;
+    }
+    thread_args.TaskScheduler      = task_scheduler;
+    async_config.MaxActiveTicks    = 1;
+    async_config.MaxWorkerThreads  = host_cpu.HardwareThreads * 2;
+    async_config.MaxTasksPerTick   = 512;
+    async_config.MaxTaskArenaSize  = Megabytes(2);
+    if ((async_scheduler = CreateAsyncScheduler(&async_config, &thread_args, &main_arena)) == NULL)
+    {   // no asynchronous task scheduler is available.
+        ConsoleError("ERROR: Unable to create the asynchronous task scheduler.\n");
+        goto cleanup_and_shutdown;
+    }
+    thread_args.AsyncScheduler = async_scheduler;
+
     // set up explicit threads for frame composition, network I/O and file I/O.
     if ((thread_draw = SpawnExplicitThread(DisplayThread, &thread_args)) == NULL)
     {
@@ -440,6 +469,10 @@ WinMain
 
     // start all of the explicit threads running:
     SetEvent(ev_start);
+
+    // start all of the worker threads running.
+    LaunchScheduler(task_scheduler);
+    LaunchScheduler(async_scheduler);
 
     // grab an initial absolute timestamp and initialize global time values.
     previous_tick = TimestampInNanoseconds();
@@ -512,11 +545,12 @@ WinMain
     ConsoleOutput("The main thread has exited.\n");
 
 cleanup_and_shutdown:
-    // TODO(rlk): cleanup for the task scheduler
-    if (ev_break    != NULL) SetEvent(ev_break);
-    if (thread_draw != NULL) WaitForSingleObject(thread_draw, INFINITE);
-    if (thread_disk != NULL) WaitForSingleObject(thread_disk, INFINITE);
-    if (thread_net  != NULL) WaitForSingleObject(thread_net , INFINITE);
+    if (ev_break        != NULL) SetEvent(ev_break);
+    if (task_scheduler  != NULL) HaltScheduler(task_scheduler);
+    if (async_scheduler != NULL) HaltScheduler(async_scheduler);
+    if (thread_draw     != NULL) WaitForSingleObject(thread_draw, INFINITE);
+    if (thread_disk     != NULL) WaitForSingleObject(thread_disk, INFINITE);
+    if (thread_net      != NULL) WaitForSingleObject(thread_net , INFINITE);
     if (argv.CreateConsole)
     {
         printf("\nApplication terminated. Press any key to exit.\n");
