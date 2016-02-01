@@ -72,6 +72,11 @@
 #define INVALID_TASK_ID                   ((task_id_t) 0x7FFFFFFFUL)
 #endif
 
+/// @summary Macro to select the lesser of two values.
+#ifndef SCHEDULER_MIN
+#define SCHEDULER_MIN(a, b)               (((a) <= (b)) ? (a) : (b))
+#endif
+
 /*//////////////////
 //   Data Types   //
 //////////////////*/
@@ -146,32 +151,237 @@ struct TASK_WORKER
     // TODO(rlk):  WTR list
 };
 
+/// @sumary Define the data associated with an async scheduler worker thread.
+struct ASYNC_WORKER
+{
+    WIN32_THREAD_ARGS *MainThreadArgs;   /// Global data managed by the main thread.
+    HANDLE             ReadySignal;      /// Signal set by the worker to indicate that its initialization is complete and it is ready to run.
+    HANDLE             StartSignal;      /// Signal set by the scheduler to allow the worker thread to begin polling for work.
+    HANDLE             ErrorSignal;      /// Signal set by any worker to indicate that a fatal error has occurred and the worker should die.
+    HANDLE             HaltSignal;       /// Signal set by any thread to stop all worker threads.
+    uint32_t           WorkerIndex;      /// The zero-based index of the worker thread within the scheduler.
+};
+
+/// @summary Define the data associated with a compute scheduler worker thread.
+struct COMPUTE_WORKER
+{
+    WIN32_THREAD_ARGS *MainThreadArgs;   /// Global data managed by the main thread.
+    HANDLE             ReadySignal;      /// Signal set by the worker to indicate that its initialization is complete and it is ready to run.
+    HANDLE             StartSignal;      /// Signal set by the scheduler to allow the worker thread to begin polling for work.
+    HANDLE             ErrorSignal;      /// Signal set by any worker to indicate that a fatal error has occurred and the worker should die.
+    HANDLE             HaltSignal;       /// Signal set by any thread to stop all worker threads.
+    uint32_t           WorkerIndex;      /// The zero-based index of the worker thread within the scheduler.
+};
+
 /// @summary Define the data associated with an asynchronous task scheduler.
 struct WIN32_ASYNC_TASK_SCHEDULER
 {
-    HANDLE         ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
-    HANDLE         LaunchSignal;     /// Manual-reset event signaled when worker threads should start running tasks.
+    HANDLE             ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
+    HANDLE             StartSignal;      /// Manual-reset event signaled when worker threads should start running tasks.
+    HANDLE             HaltSignal;       /// Manual-reset event signaled when the scheduler is being shut down.
 
-    size_t         ThreadCount;      /// The number of worker threads managed by the scheduler.
-    unsigned int  *OSThreadIds;      /// The operating system identifiers for each worker thread.
-    HANDLE        *OSThreadHandle;   /// The operating system thread handle for each worker thread.
+    size_t             MaxThreads;       /// The maximum number of worker threads the scheduler can spawn.
+    size_t             ThreadCount;      /// The number of worker threads managed by the scheduler.
+    unsigned int      *OSThreadIds;      /// The operating system identifiers for each worker thread.
+    HANDLE            *OSThreadHandle;   /// The operating system thread handle for each worker thread.
+    ASYNC_WORKER      *WorkerState;      /// The state data for each worker thread.
 };
 
 /// @summary Define the data associated with a compute-oriented task scheduler.
 struct WIN32_COMPUTE_TASK_SCHEDULER
 {
-    HANDLE         ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
-    HANDLE         LaunchSignal;     /// Manual-reset event signaled when worker threads should start running tasks.
+    HANDLE             ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
+    HANDLE             StartSignal;      /// Manual-reset event signaled when worker threads should start running tasks.
+    HANDLE             HaltSignal;       /// Manual-reset event signaled when the scheduler is being shut down.
 
-    size_t         ThreadCount;      /// The number of worker threads managed by the scheduler.
-    unsigned int  *OSThreadIds;      /// The operating system identifiers for each worker thread.
-    HANDLE        *OSThreadHandle;   /// The operating system thread handle for each worker thread.
-    TASK_WORKER   *WorkerThreads;    /// The state data for each worker thread.
+    size_t             ThreadCount;      /// The number of worker threads managed by the scheduler.
+    unsigned int      *OSThreadIds;      /// The operating system identifiers for each worker thread.
+    HANDLE            *OSThreadHandle;   /// The operating system thread handle for each worker thread.
+    COMPUTE_WORKER    *WorkerState;      /// The state data for each worker thread.
 };
+
+/*////////////////////////////
+//   Forward Declarations   //
+////////////////////////////*/
 
 /*//////////////////////////
 //   Internal Functions   //
 //////////////////////////*/
+/// @summary Implements the entry point of an asynchronous task worker thread.
+/// @param argp Pointer to the ASYNC_WORKER state associated with the thread.
+/// @return The thread exit code (unused).
+internal_function unsigned int __cdecl
+AsyncWorkerMain
+(
+    void *argp
+)
+{
+    ASYNC_WORKER        *thread_args = (ASYNC_WORKER*) argp;
+    WIN32_THREAD_ARGS     *main_args =  thread_args->MainThreadArgs;
+    HANDLE            init_signal[4] =
+    { 
+        thread_args->StartSignal ,
+        thread_args->ErrorSignal ,
+        thread_args->HaltSignal  ,
+        main_args->TerminateEvent 
+    };
+
+    // TODO(rlk): any thread-local initialization.
+
+    // signal to the scheduler that this worker thread is ready to go.
+    SetEvent(thread_args->ReadySignal);
+
+    // wait for a signal to start looking for work, or to terminate early.
+    if (WaitForMultipleObjects(4, init_signal, FALSE, INFINITE) != WAIT_OBJECT_0)
+    {   // either thread exit was signaled, or an error occurred while waiting.
+        goto terminate_worker;
+    }
+
+    // TODO(rlk): the main loop of the async worker thread.
+
+terminate_worker:
+    ConsoleOutput("Async worker thread %u terminated.\n", thread_args->WorkerIndex);
+    return 0;
+}
+
+/// @summary Implements the entry point of an asynchronous task worker thread.
+/// @param argp Pointer to the COMPUTE_WORKER state associated with the thread.
+/// @return The thread exit code (unused).
+internal_function unsigned int __cdecl
+ComputeWorkerMain
+(
+    void *argp
+)
+{
+    COMPUTE_WORKER      *thread_args = (COMPUTE_WORKER*) argp;
+    WIN32_THREAD_ARGS     *main_args =  thread_args->MainThreadArgs;
+    HANDLE            init_signal[4] =
+    { 
+        thread_args->StartSignal ,
+        thread_args->ErrorSignal ,
+        thread_args->HaltSignal  ,
+        main_args->TerminateEvent 
+    };
+
+    // TODO(rlk): any thread-local initialization.
+
+    // signal to the scheduler that this worker thread is ready to go.
+    SetEvent(thread_args->ReadySignal);
+
+    // wait for a signal to start looking for work, or to terminate early.
+    if (WaitForMultipleObjects(4, init_signal, FALSE, INFINITE) != WAIT_OBJECT_0)
+    {   // either thread exit was signaled, or an error occurred while waiting.
+        goto terminate_worker;
+    }
+
+    // TODO(rlk): the main loop of the compute worker thread.
+
+terminate_worker:
+    ConsoleOutput("Compute worker thread %u terminated.\n", thread_args->WorkerIndex);
+    return 0;
+}
+/// @summary Attempt to spawn a new asynchronous task worker thread.
+/// @param scheduler The scheduler instance that is spawning the worker thread.
+/// @param main_args Global state created and managed by main thread and available to all threads.
+/// @return true if the worker was spawned, or false if an error occurred.
+internal_function bool
+SpawnAsyncWorker
+(
+    WIN32_ASYNC_TASK_SCHEDULER *scheduler, 
+    WIN32_THREAD_ARGS          *main_args
+)
+{
+    if (scheduler->ThreadCount == scheduler->MaxThreads)
+    {   // no additional worker threads can be spawned.
+        return false;
+    }
+
+    unsigned int     thread_id = 0;
+    HANDLE       thread_handle = NULL;
+    uint32_t      worker_index =(uint32_t) scheduler->ThreadCount;
+    ASYNC_WORKER *worker_state =&scheduler->WorkerState[scheduler->ThreadCount];
+    HANDLE        worker_ready = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    // initialize the worker state:
+    worker_state->MainThreadArgs = main_args;
+    worker_state->ReadySignal    = worker_ready;
+    worker_state->StartSignal    = scheduler->StartSignal;
+    worker_state->ErrorSignal    = scheduler->ErrorSignal;
+    worker_state->HaltSignal     = scheduler->HaltSignal;
+    worker_state->WorkerIndex    = worker_index;
+    // ...
+
+    // spawn the thread, and wait for it to report that it's ready.
+    if ((thread_handle = (HANDLE)_beginthreadex(NULL, 0, AsyncWorkerMain, worker_state, 0, &thread_id)) == 0)
+    {   // unable to spawn the thread. let the caller decide if they want to exit.
+        CloseHandle(worker_ready);
+        return false;
+    }
+
+    // wait for the worker to report that it's ready to run.
+    HANDLE   ready_signals[3] = { worker_ready , scheduler->ErrorSignal, scheduler->HaltSignal };
+    if (WaitForMultipleObjects(3, ready_signals, FALSE, INFINITE) == WAIT_OBJECT_0)
+    {   // the worker thread reported that it's ready. save the data.
+        scheduler->OSThreadIds   [worker_index] = thread_id;
+        scheduler->OSThreadHandle[worker_index] = thread_handle;
+        scheduler->ThreadCount++;
+        return true;
+    }
+    else
+    {   // the worker thread reported an error and failed to initialize.
+        CloseHandle(worker_ready);
+        return false;
+    }
+}
+
+/// @summary Attempt to spawn a new compute task worker thread.
+/// @param scheduler The scheduler instance that is spawning the worker thread.
+/// @param main_args Global state created and managed by main thread and available to all threads.
+/// @return true if the worker was spawned, or false if an error occurred.
+internal_function bool
+SpawnComputeWorker
+(
+    WIN32_COMPUTE_TASK_SCHEDULER *scheduler, 
+    WIN32_THREAD_ARGS            *main_args
+)
+{
+    unsigned int       thread_id = 0;
+    HANDLE         thread_handle = NULL;
+    uint32_t        worker_index =(uint32_t) scheduler->ThreadCount;
+    COMPUTE_WORKER *worker_state =&scheduler->WorkerState[scheduler->ThreadCount];
+    HANDLE          worker_ready = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    // initialize the worker state:
+    worker_state->MainThreadArgs = main_args;
+    worker_state->ReadySignal    = worker_ready;
+    worker_state->StartSignal    = scheduler->StartSignal;
+    worker_state->ErrorSignal    = scheduler->ErrorSignal;
+    worker_state->HaltSignal     = scheduler->HaltSignal;
+    worker_state->WorkerIndex    = worker_index;
+    // ...
+
+    // spawn the thread, and wait for it to report that it's ready.
+    if ((thread_handle = (HANDLE)_beginthreadex(NULL, 0, AsyncWorkerMain, worker_state, 0, &thread_id)) == 0)
+    {   // unable to spawn the thread. let the caller decide if they want to exit.
+        CloseHandle(worker_ready);
+        return false;
+    }
+
+    // wait for the worker to report that it's ready to run.
+    HANDLE   ready_signals[3] = { worker_ready , scheduler->ErrorSignal, scheduler->HaltSignal };
+    if (WaitForMultipleObjects(3, ready_signals, FALSE, INFINITE) == WAIT_OBJECT_0)
+    {   // the worker thread reported that it's ready. save the data.
+        scheduler->OSThreadIds   [worker_index] = thread_id;
+        scheduler->OSThreadHandle[worker_index] = thread_handle;
+        scheduler->ThreadCount++;
+        return true;
+    }
+    else
+    {   // the worker thread reported an error and failed to initialize.
+        CloseHandle(worker_ready);
+        return false;
+    }
+}
 
 /*////////////////////////
 //   Public Functions   //
@@ -354,7 +564,7 @@ CheckSchedulerConfiguration
         }
     }
     // the maximum number of tasks per-tick should always be a power of two.
-    if ((dst_config->MaxTasksPerTick & (dst_config->MaxTasksPerTick-1) != 0)
+    if ((dst_config->MaxTasksPerTick & (dst_config->MaxTasksPerTick-1)) != 0)
     {   // round up to the next largest power-of-two.
         size_t n = 1;
         size_t m = dst_config->MaxTasksPerTick;
@@ -381,97 +591,234 @@ CheckSchedulerConfiguration
     {   // copy the value from the input configuration. this handles WORKER_THREAD_ARENA_NOT_NEEDED also.
         dst_config->MaxTaskArenaSize = src_config->MaxTaskArenaSize;
     }
-    // TODO(rlk): Use GlobalMemoryStatusEx to query physical memory.
-    // report an error if the requested memory is too high.
+
+    MEMORYSTATUSEX mem_info = {};
+    mem_info.dwLength       = sizeof(MEMORYSTATUSEX);
+    if (GlobalMemoryStatusEx(&mem_info) && (dst_config->MaxTaskArenaSize  != WORKER_THREAD_ARENA_NOT_NEEDED))
+    {   // if the total amount of memory requested exceeds the amount of available physical memory, issue a warning.
+        if (((DWORDLONG) dst_config->MaxWorkerThreads * (DWORDLONG) dst_config->MaxTaskArenaSize) >= mem_info.ullTotalPhys)
+        {
+            ConsoleOutput("WARNING: Total amount of task memory exceeds total physical memory.\n");
+            performance_ok = false;
+        }
+    }
 
     return performance_ok;
 }
 
 /// @summary Calculate the amount of memory required for a given scheduler configuration.
-/// @param config The scheduler configuration.
+/// @param config The scheduler configuration returned from the CheckSchedulerConfiguration function.
 /// @param scheduler_type The type of scheduler, one of SCHEDULER_TYPE.
 /// @return The number of bytes required to create a scheduler of the specified type with the given configuration, or 0 if the configuration or scheduler type is invalid.
 public_function size_t
 CalculateMemoryForScheduler
 (
     TASK_SCHEDULER_CONFIG        *config,
-    uint32_t              scheduler_type, 
-    size_t                    &alignment
+    uint32_t              scheduler_type
 )
 {
     if (scheduler_type == SCHEDULER_TYPE_ASYNC)
     {
-        size_t   align  = std::alignment_of<HANDLE>::value;
-        size_t    size  = sizeof(HANDLE) * 2; // ErrorSignal, LaunchSignal
+        size_t  size = sizeof(WIN32_ASYNC_TASK_SCHEDULER);
+        // account for the size of the variable-length data arrays.
+        size += sizeof(unsigned int) * config->MaxWorkerThreads;
+        size += sizeof(HANDLE)       * config->MaxWorkerThreads;
+        size += sizeof(ASYNC_WORKER) * config->MaxWorkerThreads;
+        // ...
+        return size;
     }
     if (scheduler_type == SCHEDULER_TYPE_COMPUTE)
     {
+        size_t  size = sizeof(WIN32_COMPUTE_TASK_SCHEDULER);
+        // account for the size of the variable-length data arrays.
+        size += sizeof(unsigned int)   * config->MaxWorkerThreads;
+        size += sizeof(HANDLE)         * config->MaxWorkerThreads;
+        size += sizeof(COMPUTE_WORKER) * config->MaxWorkerThreads;
+        // ... 
+        return size;
     }
     // else, unknown scheduler type.
     return 0;
 }
 
-/*
-struct TASK_SCHEDULER_CONFIG
-{
-    size_t         MaxActiveTicks;   /// The maximum number of application ticks in-flight at any given time.
-    size_t         MaxWorkerThreads; /// The maximum number of worker threads that can be spawned.
-    size_t         MaxTasksPerTick;  /// The maximum number of tasks that can be created during a single application tick.
-    size_t         MaxTaskArenaSize; /// The number of bytes to allocate for each thread-local arena.
-};
-    HANDLE         ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
-    HANDLE         LaunchSignal;     /// Manual-reset event signaled when worker threads should start running tasks.
-
-    size_t         ThreadCount;      /// The number of worker threads managed by the scheduler.
-    unsigned int  *OSThreadIds;      /// The operating system identifiers for each worker thread.
-    HANDLE        *OSThreadHandle;   /// The operating system thread handle for each worker thread.
-*/
-
+/// @summary Create a new asynchronous task scheduler instance. The scheduler worker threads are launched separately.
+/// @param config The scheduler configuration.
+/// @param main_args The global data managed by the main thread and passed to all worker threads.
+/// @param arena The memory arena used to allocate scheduler memory. Per-worker memory is allocated directly from the OS.
+/// @return A pointer to the new scheduler instance, or NULL.
 public_function WIN32_ASYNC_TASK_SCHEDULER*
 CreateAsyncScheduler
 (
-    TASK_SCHEDULER_CONFIG *config, 
-    MEMORY_ARENA           *arena
+    TASK_SCHEDULER_CONFIG    *config, 
+    WIN32_THREAD_ARGS     *main_args,
+    MEMORY_ARENA              *arena
 )
-{   // TODO(rlk): validate the configuration.
-    HANDLE                       ev_error = CreateEvent(NULL, TRUE, FALSE, NULL);
-    HANDLE                       ev_start = CreateEvent(NULL, TRUE, FALSE, NULL);
-    WIN32_ASYNC_TASK_SCHEDULER *scheduler = PushStruct<WIN32_ASYNC_TASK_SCHEDULER>(arena);
-    if (scheduler == NULL) return NULL;
+{
+    TASK_SCHEDULER_CONFIG valid_config = {};
+    WIN32_CPU_INFO           *cpu_info = main_args->HostCPUInfo;
+    CheckSchedulerConfiguration(&valid_config, config, cpu_info, SCHEDULER_TYPE_ASYNC);
+    size_t expected_size = CalculateMemoryForScheduler(&valid_config, SCHEDULER_TYPE_ASYNC);
+    if (!ArenaCanAllocate(arena, expected_size, std::alignment_of<WIN32_ASYNC_TASK_SCHEDULER>::value))
+    {   // there's not enough memory for the core scheduler and worker data.
+        return NULL;
+    }
 
-    //!ArenaCanAllocate(arena, alignment)
+    size_t mem_mark = ArenaMarker(arena);
+    HANDLE ev_error = CreateEvent(NULL, TRUE, FALSE, NULL);
+    HANDLE ev_start = CreateEvent(NULL, TRUE, FALSE, NULL);
+    HANDLE ev_halt  = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    WIN32_ASYNC_TASK_SCHEDULER *scheduler = PushStruct<WIN32_ASYNC_TASK_SCHEDULER>(arena);
+    scheduler->ErrorSignal    = ev_error;
+    scheduler->StartSignal    = ev_start;
+    scheduler->HaltSignal     = ev_halt;
+    scheduler->MaxThreads     = valid_config.MaxWorkerThreads;
+    scheduler->ThreadCount    = 0;
+    scheduler->OSThreadIds    = PushArray<unsigned int>(arena, valid_config.MaxWorkerThreads);
+    scheduler->OSThreadHandle = PushArray<HANDLE>      (arena, valid_config.MaxWorkerThreads);
+    scheduler->WorkerState    = PushArray<ASYNC_WORKER>(arena, valid_config.MaxWorkerThreads);
+    ZeroMemory(scheduler->OSThreadIds   , valid_config.MaxWorkerThreads * sizeof(unsigned int));
+    ZeroMemory(scheduler->OSThreadHandle, valid_config.MaxWorkerThreads * sizeof(HANDLE));
+    ZeroMemory(scheduler->WorkerState   , valid_config.MaxWorkerThreads * sizeof(ASYNC_WORKER));
+
+    size_t spawn_count = SCHEDULER_MIN(valid_config.MaxWorkerThreads, cpu_info->HardwareThreads);
+    for (size_t i = 0; i < spawn_count; ++i)
+    {
+        if (!SpawnAsyncWorker(scheduler, main_args))
+        {   // the worker thread could not be started, or failed to initialize.
+            // there's no point in continuing.
+            goto cleanup_and_fail;
+        }
+    }
+
+    return scheduler;
 
 cleanup_and_fail:
+    if (scheduler != NULL && scheduler->ThreadCount > 0)
+    {   // signal workers to die.
+        SetEvent(ev_error); // all worker threads are waiting on this event.
+        WaitForMultipleObjects((DWORD) scheduler->ThreadCount, scheduler->OSThreadHandle, TRUE, INFINITE);
+    }
+    if (ev_halt  != NULL) CloseHandle(ev_halt);
     if (ev_start != NULL) CloseHandle(ev_start);
     if (ev_error != NULL) CloseHandle(ev_error);
+    ArenaResetToMarker(arena, mem_mark);
+    return NULL;
 }
 
+/// @summary Notify all asynchronous task scheduler worker threads to start monitoring work queues.
+/// @param scheduler The task scheduler to launch.
+public_function void
+LaunchScheduler
+(
+    WIN32_ASYNC_TASK_SCHEDULER *scheduler
+)
+{
+    SetEvent(scheduler->StartSignal);
+}
+
+/// @summary Notify all asynchronous task scheduler worker threads to shutdown.
+/// @param scheduler The task scheduler to halt.
+public_function void
+HaltScheduler
+(
+    WIN32_ASYNC_TASK_SCHEDULER *scheduler
+)
+{
+    if (scheduler->ThreadCount > 0)
+    {   // signal all worker threads to exit, and wait for them.
+        SetEvent(scheduler->HaltSignal);
+        WaitForMultipleObjects((DWORD) scheduler->ThreadCount, scheduler->OSThreadHandle, TRUE, INFINITE);
+    }
+}
+
+/// @summary Create a new asynchronous task scheduler instance. The scheduler worker threads are launched separately.
+/// @param config The scheduler configuration.
+/// @param main_args The global data managed by the main thread and passed to all worker threads.
+/// @param arena The memory arena used to allocate scheduler memory. Per-worker memory is allocated directly from the OS.
+/// @return A pointer to the new scheduler instance, or NULL.
 public_function WIN32_COMPUTE_TASK_SCHEDULER*
 CreateComputeScheduler
 (
-    TASK_SCHEDULER_CONFIG *config, 
-    MEMORY_ARENA           *arena
+    TASK_SCHEDULER_CONFIG    *config, 
+    WIN32_THREAD_ARGS     *main_args,
+    MEMORY_ARENA              *arena
 )
 {
+    TASK_SCHEDULER_CONFIG valid_config = {};
+    WIN32_CPU_INFO           *cpu_info = main_args->HostCPUInfo;
+    CheckSchedulerConfiguration(&valid_config, config, cpu_info, SCHEDULER_TYPE_COMPUTE);
+    size_t expected_size = CalculateMemoryForScheduler(&valid_config, SCHEDULER_TYPE_COMPUTE);
+    if (!ArenaCanAllocate(arena, expected_size, std::alignment_of<WIN32_COMPUTE_TASK_SCHEDULER>::value))
+    {   // there's not enough memory for the core scheduler and worker data.
+        return NULL;
+    }
+
+    size_t mem_mark = ArenaMarker(arena);
+    HANDLE ev_error = CreateEvent(NULL, TRUE, FALSE, NULL);
+    HANDLE ev_start = CreateEvent(NULL, TRUE, FALSE, NULL);
+    HANDLE ev_halt  = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    WIN32_COMPUTE_TASK_SCHEDULER *scheduler = PushStruct<WIN32_COMPUTE_TASK_SCHEDULER>(arena);
+    scheduler->ErrorSignal      = ev_error;
+    scheduler->StartSignal      = ev_start;
+    scheduler->HaltSignal       = ev_halt;
+    scheduler->ThreadCount      = 0;
+    scheduler->OSThreadIds      = PushArray<unsigned int>  (arena, valid_config.MaxWorkerThreads);
+    scheduler->OSThreadHandle   = PushArray<HANDLE>        (arena, valid_config.MaxWorkerThreads);
+    scheduler->WorkerState      = PushArray<COMPUTE_WORKER>(arena, valid_config.MaxWorkerThreads);
+    ZeroMemory(scheduler->OSThreadIds   , valid_config.MaxWorkerThreads * sizeof(unsigned int));
+    ZeroMemory(scheduler->OSThreadHandle, valid_config.MaxWorkerThreads * sizeof(HANDLE));
+    ZeroMemory(scheduler->WorkerState   , valid_config.MaxWorkerThreads * sizeof(COMPUTE_WORKER));
+
+    size_t spawn_count = SCHEDULER_MIN(valid_config.MaxWorkerThreads, cpu_info->HardwareThreads);
+    for (size_t i = 0; i < spawn_count; ++i)
+    {
+        if (!SpawnComputeWorker(scheduler, main_args))
+        {   // the worker thread could not be started, or failed to initialize.
+            // there's no point in continuing.
+            goto cleanup_and_fail;
+        }
+    }
+
+    return scheduler;
+
+cleanup_and_fail:
+    if (scheduler != NULL && scheduler->ThreadCount > 0)
+    {   // signal workers to die.
+        SetEvent(ev_error); // all worker threads are waiting on this event.
+        WaitForMultipleObjects((DWORD) scheduler->ThreadCount, scheduler->OSThreadHandle, TRUE, INFINITE);
+    }
+    if (ev_halt  != NULL) CloseHandle(ev_halt);
+    if (ev_start != NULL) CloseHandle(ev_start);
+    if (ev_error != NULL) CloseHandle(ev_error);
+    ArenaResetToMarker(arena, mem_mark);
+    return NULL;
 }
 
-public_function task_id_t
-CreateComputeTask
-(
-    WIN32_COMPUTE_TASK_SCHEDULER  *scheduler, 
-    TASK_ENTRY                   entry_point, 
-    task_id_t                         parent,
-    task_id_t                     dependency
-)
-{
-}
-
+/// @summary Notify all compute task scheduler worker threads to start monitoring work queues.
+/// @param scheduler The task scheduler to launch.
 public_function void
-ReadyComputeTask
+LaunchScheduler
 (
-    WIN32_COMPUTE_TASK_SCHEDULER *scheduler,
-    task_id_t                          task
+    WIN32_COMPUTE_TASK_SCHEDULER *scheduler
 )
 {
+    SetEvent(scheduler->StartSignal);
+}
+
+/// @summary Notify all compute task scheduler worker threads to shutdown.
+/// @param scheduler The task scheduler to halt.
+public_function void
+HaltScheduler
+(
+    WIN32_COMPUTE_TASK_SCHEDULER *scheduler
+)
+{
+    if (scheduler->ThreadCount > 0)
+    {   // signal all worker threads to exit, and wait for them.
+        SetEvent(scheduler->HaltSignal);
+        WaitForMultipleObjects((DWORD) scheduler->ThreadCount, scheduler->OSThreadHandle, TRUE, INFINITE);
+    }
 }
 

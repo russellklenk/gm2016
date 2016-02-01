@@ -33,6 +33,7 @@
 #include "win32_runtime.cc"
 #include "win32_memarena.cc"
 #include "win32_timestamp.cc"
+#include "win32_scheduler.cc"
 #include "win32_parse.cc"
 #include "win32_display.cc"
 #include "win32_input.cc"
