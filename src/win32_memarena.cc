@@ -359,6 +359,19 @@ ArenaCanAllocate
     return true;
 }
 
+/// @summary Calculate the worst-case requirement for allocating an instance of a structure, including padding.
+/// @typeparam T The type being allocated. This type is used to determine the required alignment.
+/// @return The number of bytes required to allocate an instance, including worst-case padding.
+template <typename T>
+public_function inline size_t
+AllocationSizeForStruct
+(
+    void
+)
+{
+    return sizeof(T) + (std::alignment_of<T>::value - 1);
+}
+
 /// @summary Determine whether a memory allocation request can be satisfied.
 /// @typeparam T The type being allocated. This type is used to determine the required alignment.
 /// @param arena The memory arena to query.
@@ -371,6 +384,20 @@ ArenaCanAllocateStruct
 )
 {
     return ArenaCanAllocate(arena, sizeof(T), std::alignment_of<T>::value);
+}
+
+/// @summary Calculate the worst-case requirement for allocating an array, including padding.
+/// @typeparam T The type being allocated. This type is used to determine the required alignment.
+/// @param count The number of items of type T in the array.
+/// @return The number of bytes required to allocate an array of count items, including worst-case padding.
+template <typename T>
+public_function inline size_t
+AllocationSizeForArray
+(
+    size_t count
+)
+{
+    return (sizeof(T) * count) + (std::alignment_of<T>::value - 1);
 }
 
 /// @summary Determine whether a memory allocation request for an array can be satisfied.
