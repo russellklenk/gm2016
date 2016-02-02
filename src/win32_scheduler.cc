@@ -119,6 +119,17 @@ struct TASK_SCHEDULER_CONFIG
     size_t              MaxTaskArenaSize; /// The number of bytes to allocate for each thread-local arena.
 };
 
+/// @sumary Define the data associated with an async scheduler worker thread.
+struct ASYNC_WORKER
+{
+    WIN32_THREAD_ARGS  *MainThreadArgs;   /// Global data managed by the main thread.
+    HANDLE              ReadySignal;      /// Signal set by the worker to indicate that its initialization is complete and it is ready to run.
+    HANDLE              StartSignal;      /// Signal set by the scheduler to allow the worker thread to begin polling for work.
+    HANDLE              ErrorSignal;      /// Signal set by any worker to indicate that a fatal error has occurred and the worker should die.
+    HANDLE              HaltSignal;       /// Signal set by any thread to stop all worker threads.
+    uint32_t            WorkerIndex;      /// The zero-based index of the worker thread within the scheduler.
+};
+
 /// @summary Define the data representing a work-stealing deque of task identifiers. Each compute worker thread maintains its own queue.
 /// The worker thread can perform push and take operations. Other worker threads can perform concurrent steal operations.
 struct TASK_QUEUE
@@ -136,57 +147,44 @@ struct TASK_QUEUE
 /// @summary Define the data associated with a work item.
 struct WORK_ITEM
 {
-    TASK_ENTRY          TaskMain;         /// The task entry point.
+    uint32_t            LaunchTick;       /// The global tick on which the task was launched.
     task_id_t           ParentTask;       /// The identifier of the parent task, or INVALID_TASK_ID.
-};
-
-/// @summary Define the data associated with the list of tasks that are waiting to run.
-struct WTR_TASK_LIST
-{
-    size_t              TaskCount;        /// The number of tasks in the waiting-to-run list.
-    task_id_t          *DependencyList;   /// The task ID of the task that must be completed before the waiting task can be launched.
-    task_id_t          *DependentList;    /// The task ID of the task to launch when the dependency has been completed.
-};
-
-/// @summary Define the data associated with task definitions for a single in-flight tick.
-struct TASK_BUFFER
-{
-    size_t              TaskCount;        /// The number of tasks allocated from the buffer.
-    WORK_ITEM          *WorkItems;        /// Fixed-length storage for storing data associated with each task.
-    int32_t            *WorkRemaining;    /// Fixed-length storage for counters tracking the outstanding work for each task.
-};
-
-/// @summary Define the data associated with a single worker thread.
-struct TASK_WORKER
-{
-    MEMORY_ARENA        ThreadArena;      /// The thread-local memory arena.
-    TASK_BUFFER         TaskList[4];      /// The per-tick data used to track tasks created on that tick. COMPUTE_WORKER::MaxTicksInFlight are valid.
-    WTR_TASK_LIST       WaitToRunList;    /// The list of tasks waiting for a dependency to be completed.
-    TASK_QUEUE          WorkQueue;        /// The work queue for the task.
-};
-
-/// @sumary Define the data associated with an async scheduler worker thread.
-struct ASYNC_WORKER
-{
-    WIN32_THREAD_ARGS  *MainThreadArgs;   /// Global data managed by the main thread.
-    HANDLE              ReadySignal;      /// Signal set by the worker to indicate that its initialization is complete and it is ready to run.
-    HANDLE              StartSignal;      /// Signal set by the scheduler to allow the worker thread to begin polling for work.
-    HANDLE              ErrorSignal;      /// Signal set by any worker to indicate that a fatal error has occurred and the worker should die.
-    HANDLE              HaltSignal;       /// Signal set by any thread to stop all worker threads.
-    uint32_t            WorkerIndex;      /// The zero-based index of the worker thread within the scheduler.
+    TASK_ENTRY          TaskMain;         /// The task entry point.
 };
 
 /// @summary Define the data associated with a compute scheduler worker thread.
 struct COMPUTE_WORKER
 {
     WIN32_THREAD_ARGS  *MainThreadArgs;   /// Global data managed by the main thread.
+    MEMORY_ARENA        ThreadArena;      /// The user-facing thread-local memory arena.
     HANDLE              ReadySignal;      /// Signal set by the worker to indicate that its initialization is complete and it is ready to run.
     HANDLE              StartSignal;      /// Signal set by the scheduler to allow the worker thread to begin polling for work.
     HANDLE              ErrorSignal;      /// Signal set by any worker to indicate that a fatal error has occurred and the worker should die.
     HANDLE              HaltSignal;       /// Signal set by any thread to stop all worker threads.
+
     size_t              MaxTicksInFlight; /// The maximum number of ticks in-flight at any given time,
     size_t              MaxTasksPerTick;  /// The maximum number of tasks that can be created in a given tick.
+    size_t              TaskCounts[4];    /// The number of tasks defined for each in-flight tick.
+    WORK_ITEM          *WorkItems [4];    /// The work item definitions for each task, for each in-flight tick.
+    int32_t            *WorkCounts[4];    /// The outstanding work counter for each task, for each in-flight tick.
+
+    size_t              WTRTaskCount;     /// The number of tasks in the wait-to-run list.
+    task_id_t          *WTRDepsList;      /// The task ID of the unsatisfied dependency for each task in the wait-to-run list.
+    task_id_t          *WTRTaskList;      /// The task ID of each task holding in the wait-to-run list.
+
     uint32_t            WorkerIndex;      /// The zero-based index of the worker thread within the scheduler.
+    uint32_t            WorkGroupSize;    /// The total number of workers in the work group.
+
+    WIN32_MEMORY_ARENA  OSThreadArena;    /// The underlying OS thread-local memory arena.
+
+    size_t              WorkerCount;      /// The total number of worker threads managed by the scheduler.
+    COMPUTE_WORKER     *WorkerState;      /// The list of per-worker state for each worker thread. This value is managed by the scheduler.
+
+#pragma warning(push)
+#pragma warning(disable:4324)             /// COMPUTE_WORKER: structure was padded due to __declspec(align())
+    cacheline_align
+    TASK_QUEUE          WorkQueue;        /// The queue of ready-to-run work items for the worker thread.
+#pragma warning(pop)
 };
 
 /// @summary Define the data associated with an asynchronous task scheduler.
@@ -482,36 +480,83 @@ SpawnAsyncWorker
 }
 
 /// @summary Attempt to spawn a new compute task worker thread.
+/// @param config The scheduler configuration returned by CheckSchedulerConfiguration.
 /// @param scheduler The scheduler instance that is spawning the worker thread.
+/// @param total_threads The total number of threads managed by the scheduler, including not-yet-spawned threads.
 /// @param main_args Global state created and managed by main thread and available to all threads.
+/// @param arena The arena from which scheduler memory is allocated.
 /// @return true if the worker was spawned, or false if an error occurred.
 internal_function bool
 SpawnComputeWorker
 (
-    WIN32_COMPUTE_TASK_SCHEDULER *scheduler, 
-    WIN32_THREAD_ARGS            *main_args
+    TASK_SCHEDULER_CONFIG const        *config,
+    WIN32_COMPUTE_TASK_SCHEDULER    *scheduler, 
+    size_t                       total_threads, 
+    WIN32_THREAD_ARGS               *main_args,
+    MEMORY_ARENA                        *arena
 )
 {
-    unsigned int       thread_id = 0;
-    HANDLE         thread_handle = NULL;
-    uint32_t        worker_index =(uint32_t) scheduler->ThreadCount;
     COMPUTE_WORKER *worker_state =&scheduler->WorkerState[scheduler->ThreadCount];
     HANDLE          worker_ready = CreateEvent(NULL, TRUE, FALSE, NULL);
+    HANDLE         thread_handle = NULL;
+    unsigned int       thread_id = 0;
+    uint32_t        worker_index =(uint32_t) scheduler->ThreadCount;
+    uint32_t        worker_group =(uint32_t) scheduler->ThreadCount / 64;
+    uint32_t                   n =(uint32_t)(total_threads - (worker_group * 64));
+
+    // calculate the amount of memory required from the global arena.
+    size_t mem_marker   = ArenaMarker(arena);
+    size_t bytes_needed = (sizeof(task_id_t)  * config->MaxTasksPerTick) * 2;                      // WTRDepsList and WTRTaskList
+    bytes_needed       += (sizeof(WORK_ITEM)  * config->MaxTasksPerTick) * config->MaxActiveTicks; // WorkItems
+    bytes_needed       += (sizeof(int32_t  )  * config->MaxTasksPerTick) * config->MaxActiveTicks; // WorkCounts
+    bytes_needed       +=  CalculateMemoryForTaskQueue(config->MaxTasksPerTick);                   // WorkQueue
+    bytes_needed       += (CACHELINE_SIZE     *(config->MaxActiveTicks   + 6));                    // Padding
+    if (!ArenaCanAllocate (arena, bytes_needed, CACHELINE_SIZE))
+    {   // not enough memory available in the global arena.
+        CloseHandle(worker_ready);
+        return false;
+    }
+
+    // allocate OS memory for the thread-local memory arena.
+    // this arena will be cleared after each task finishes execution.
+    size_t arena_size      = config->MaxTaskArenaSize;
+    size_t arena_alignment = std::alignment_of<void*>::value;
+    ZeroMemory(worker_state, sizeof(COMPUTE_WORKER));
+    if (CreateMemoryArena(&worker_state->OSThreadArena, arena_size) < 0)
+    {   // unable to reserve the required process address space.
+        CloseHandle(worker_ready);
+        return false;
+    }
+    if (CreateArena(&worker_state->ThreadArena, arena_size, arena_alignment, &worker_state->OSThreadArena) < 0)
+    {   // unable to commit the required process address space.
+        goto cleanup_and_fail;
+    }
 
     // initialize the worker state:
-    worker_state->MainThreadArgs = main_args;
-    worker_state->ReadySignal    = worker_ready;
-    worker_state->StartSignal    = scheduler->StartSignal;
-    worker_state->ErrorSignal    = scheduler->ErrorSignal;
-    worker_state->HaltSignal     = scheduler->HaltSignal;
-    worker_state->WorkerIndex    = worker_index;
-    // ...
+    worker_state->MainThreadArgs   = main_args;
+    worker_state->ReadySignal      = worker_ready;
+    worker_state->StartSignal      = scheduler->StartSignal;
+    worker_state->ErrorSignal      = scheduler->ErrorSignal;
+    worker_state->HaltSignal       = scheduler->HaltSignal;
+    worker_state->MaxTicksInFlight = config->MaxActiveTicks;  // constant
+    worker_state->MaxTasksPerTick  = config->MaxTasksPerTick; // constant
+    worker_state->WTRDepsList      = PushArray<task_id_t>(arena, config->MaxTasksPerTick);
+    worker_state->WTRTaskList      = PushArray<task_id_t>(arena, config->MaxTasksPerTick);
+    worker_state->WorkerIndex      = worker_index;            // constant
+    worker_state->WorkGroupSize    = n >= 64 ? 64 : n;        // constant
+    worker_state->WorkerCount      = total_threads;           // constant
+    worker_state->WorkerState      = scheduler->WorkerState;  // constant
+    CreateTaskQueue(&worker_state->WorkQueue, config->MaxTasksPerTick, arena);
+    for (size_t i = 0, n = config->MaxActiveTicks; i < n; ++i)
+    {
+        worker_state->WorkItems [i] = PushArray<WORK_ITEM>(arena, config->MaxTasksPerTick);
+        worker_state->WorkCounts[i] = PushArray<int32_t  >(arena, config->MaxTasksPerTick);
+    }
 
     // spawn the thread, and wait for it to report that it's ready.
     if ((thread_handle = (HANDLE)_beginthreadex(NULL, 0, ComputeWorkerMain, worker_state, 0, &thread_id)) == 0)
     {   // unable to spawn the thread. let the caller decide if they want to exit.
-        CloseHandle(worker_ready);
-        return false;
+        goto cleanup_and_fail;
     }
 
     // wait for the worker to report that it's ready to run.
@@ -525,9 +570,14 @@ SpawnComputeWorker
     }
     else
     {   // the worker thread reported an error and failed to initialize.
-        CloseHandle(worker_ready);
-        return false;
+        goto cleanup_and_fail;
     }
+
+cleanup_and_fail:
+    DeleteMemoryArena(&worker_state->OSThreadArena);
+    ArenaResetToMarker(arena, mem_marker);
+    CloseHandle(worker_ready);
+    return false;
 }
 
 /*////////////////////////
@@ -769,7 +819,7 @@ CalculateMemoryForScheduler
         size_t  size = sizeof(WIN32_ASYNC_TASK_SCHEDULER);
         // account for the size of the variable-length data arrays.
         size += sizeof(unsigned int) * config->MaxWorkerThreads;
-        size += sizeof(HANDLE)       * config->MaxWorkerThreads;
+        size += sizeof(HANDLE      ) * config->MaxWorkerThreads;
         size += sizeof(ASYNC_WORKER) * config->MaxWorkerThreads;
         // ...
         return size;
@@ -778,9 +828,18 @@ CalculateMemoryForScheduler
     {
         size_t  size = sizeof(WIN32_COMPUTE_TASK_SCHEDULER);
         // account for the size of the variable-length data arrays.
-        size += sizeof(unsigned int)   * config->MaxWorkerThreads;
-        size += sizeof(HANDLE)         * config->MaxWorkerThreads;
+        size += sizeof(unsigned int  ) * config->MaxWorkerThreads;
+        size += sizeof(HANDLE        ) * config->MaxWorkerThreads;
         size += sizeof(COMPUTE_WORKER) * config->MaxWorkerThreads;
+        // account for the size of per-thread variable-length data arrays.
+        for (size_t i = 0, n = config->MaxWorkerThreads; i < n; ++i)
+        {
+            size += (sizeof(task_id_t) * config->MaxTasksPerTick) * 2;                        // WTRDepsList and WTRTaskList
+            size += (sizeof(WORK_ITEM) * config->MaxTasksPerTick) * config->MaxActiveTicks;   // WorkItems
+            size += (sizeof(int32_t  ) * config->MaxTasksPerTick) * config->MaxActiveTicks;   // WorkCounts
+            size +=  CalculateMemoryForTaskQueue(config->MaxTasksPerTick);                    // WorkQueue
+            size += (CACHELINE_SIZE    *(config->MaxActiveTicks   + 6));                      // Padding
+        }
         // ... 
         return size;
     }
@@ -921,7 +980,7 @@ CreateComputeScheduler
     size_t spawn_count = SCHEDULER_MIN(valid_config.MaxWorkerThreads, cpu_info->HardwareThreads);
     for (size_t i = 0; i < spawn_count; ++i)
     {
-        if (!SpawnComputeWorker(scheduler, main_args))
+        if (!SpawnComputeWorker(&valid_config, scheduler, spawn_count, main_args, arena))
         {   // the worker thread could not be started, or failed to initialize.
             // there's no point in continuing.
             goto cleanup_and_fail;
