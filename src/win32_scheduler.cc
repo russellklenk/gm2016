@@ -103,101 +103,117 @@ enum SCHEDULER_TYPE : uint32_t
 /// @summary Define a structure specifying the constituent parts of a task ID.
 struct TASK_ID_PARTS
 {
-    uint32_t       ValidTask;        /// One of TASK_ID_TYPE specifying whether the task is valid.
-    uint32_t       SchedulerType;    /// One of SCHEDULER_TYPE specifying the scheduler that owns the task.
-    uint32_t       ThreadIndex;      /// The zero-based index of the thread that defines the task.
-    uint32_t       BufferIndex;      /// The zero-based index of the thread-local buffer that defines the task.
-    uint32_t       TaskIndex;        /// The zero-based index of the task within the thread-local buffer.
+    uint32_t            ValidTask;        /// One of TASK_ID_TYPE specifying whether the task is valid.
+    uint32_t            SchedulerType;    /// One of SCHEDULER_TYPE specifying the scheduler that owns the task.
+    uint32_t            ThreadIndex;      /// The zero-based index of the thread that defines the task.
+    uint32_t            BufferIndex;      /// The zero-based index of the thread-local buffer that defines the task.
+    uint32_t            TaskIndex;        /// The zero-based index of the task within the thread-local buffer.
 };
 
 /// @summary Define a structure used to specify data used to configure a task scheduler instance at creation time.
 struct TASK_SCHEDULER_CONFIG
 {
-    size_t         MaxActiveTicks;   /// The maximum number of application ticks in-flight at any given time.
-    size_t         MaxWorkerThreads; /// The maximum number of worker threads that can be spawned.
-    size_t         MaxTasksPerTick;  /// The maximum number of tasks that can be created during a single application tick.
-    size_t         MaxTaskArenaSize; /// The number of bytes to allocate for each thread-local arena.
+    size_t              MaxActiveTicks;   /// The maximum number of application ticks in-flight at any given time.
+    size_t              MaxWorkerThreads; /// The maximum number of worker threads that can be spawned.
+    size_t              MaxTasksPerTick;  /// The maximum number of tasks that can be created during a single application tick.
+    size_t              MaxTaskArenaSize; /// The number of bytes to allocate for each thread-local arena.
+};
+
+/// @summary Define the data representing a work-stealing deque of task identifiers. Each compute worker thread maintains its own queue.
+/// The worker thread can perform push and take operations. Other worker threads can perform concurrent steal operations.
+struct TASK_QUEUE
+{   static size_t const ALIGNMENT           = CACHELINE_SIZE;
+    static size_t const PAD                 = CACHELINE_SIZE - sizeof(std::atomic<uint32_t>);
+    typedef std::atomic<uint32_t> index_t;/// An atomic index used to represent the ends of the queue.
+    index_t             Pub;              /// The public end of the deque, updated by steal operations (Top).
+    uint8_t             Pad0[PAD];        /// Padding separating the public data from the private data.
+    index_t             Prv;              /// The private end of the deque, updated by push and take operations (Bottom).
+    uint8_t             Pad1[PAD];        /// Padding separating the private data from the storage data.
+    uint32_t            Mask;             /// The bitmask used to map the Top and Bottom indices into the storage array.
+    task_id_t          *Tasks;            /// The identifiers for the tasks in the queue.
 };
 
 /// @summary Define the data associated with a work item.
 struct WORK_ITEM
 {
-    TASK_ENTRY     TaskMain;         /// The task entry point.
+    TASK_ENTRY          TaskMain;         /// The task entry point.
+    task_id_t           ParentTask;       /// The identifier of the parent task, or INVALID_TASK_ID.
 };
 
 /// @summary Define the data associated with the list of tasks that are waiting to run.
 struct WTR_TASK_LIST
 {
-    size_t         TaskCount;        /// The number of tasks in the waiting-to-run list.
-    task_id_t     *DependencyList;   /// The task ID of the task that must be completed before the waiting task can be launched.
-    uint16_t      *TaskIndexList;    /// The zero-based index of the task WORK_ITEM within the task buffer.
+    size_t              TaskCount;        /// The number of tasks in the waiting-to-run list.
+    task_id_t          *DependencyList;   /// The task ID of the task that must be completed before the waiting task can be launched.
+    task_id_t          *DependentList;    /// The task ID of the task to launch when the dependency has been completed.
 };
 
 /// @summary Define the data associated with task definitions for a single in-flight tick.
 struct TASK_BUFFER
 {
-    size_t         TaskCount;        /// The number of tasks allocated from the buffer.
-    WORK_ITEM     *WorkItems;        /// Fixed-length storage for storing data associated with each task.
-    int32_t       *WorkRemaining;    /// Fixed-length storage for counters tracking the outstanding work for each task.
+    size_t              TaskCount;        /// The number of tasks allocated from the buffer.
+    WORK_ITEM          *WorkItems;        /// Fixed-length storage for storing data associated with each task.
+    int32_t            *WorkRemaining;    /// Fixed-length storage for counters tracking the outstanding work for each task.
 };
 
 /// @summary Define the data associated with a single worker thread.
 struct TASK_WORKER
 {
-    size_t         MaxTasksPerTick;  /// The maximum number of tasks that can be created in a given tick.
-    MEMORY_ARENA   ThreadArena;      /// The thread-local memory arena.
-    TASK_BUFFER    TaskList[4];      /// The per-tick data used to track tasks created on that tick.
-    // TODO(rlk):  WorkQueue
-    // TODO(rlk):  WTR list
+    MEMORY_ARENA        ThreadArena;      /// The thread-local memory arena.
+    TASK_BUFFER         TaskList[4];      /// The per-tick data used to track tasks created on that tick. COMPUTE_WORKER::MaxTicksInFlight are valid.
+    WTR_TASK_LIST       WaitToRunList;    /// The list of tasks waiting for a dependency to be completed.
+    TASK_QUEUE          WorkQueue;        /// The work queue for the task.
 };
 
 /// @sumary Define the data associated with an async scheduler worker thread.
 struct ASYNC_WORKER
 {
-    WIN32_THREAD_ARGS *MainThreadArgs;   /// Global data managed by the main thread.
-    HANDLE             ReadySignal;      /// Signal set by the worker to indicate that its initialization is complete and it is ready to run.
-    HANDLE             StartSignal;      /// Signal set by the scheduler to allow the worker thread to begin polling for work.
-    HANDLE             ErrorSignal;      /// Signal set by any worker to indicate that a fatal error has occurred and the worker should die.
-    HANDLE             HaltSignal;       /// Signal set by any thread to stop all worker threads.
-    uint32_t           WorkerIndex;      /// The zero-based index of the worker thread within the scheduler.
+    WIN32_THREAD_ARGS  *MainThreadArgs;   /// Global data managed by the main thread.
+    HANDLE              ReadySignal;      /// Signal set by the worker to indicate that its initialization is complete and it is ready to run.
+    HANDLE              StartSignal;      /// Signal set by the scheduler to allow the worker thread to begin polling for work.
+    HANDLE              ErrorSignal;      /// Signal set by any worker to indicate that a fatal error has occurred and the worker should die.
+    HANDLE              HaltSignal;       /// Signal set by any thread to stop all worker threads.
+    uint32_t            WorkerIndex;      /// The zero-based index of the worker thread within the scheduler.
 };
 
 /// @summary Define the data associated with a compute scheduler worker thread.
 struct COMPUTE_WORKER
 {
-    WIN32_THREAD_ARGS *MainThreadArgs;   /// Global data managed by the main thread.
-    HANDLE             ReadySignal;      /// Signal set by the worker to indicate that its initialization is complete and it is ready to run.
-    HANDLE             StartSignal;      /// Signal set by the scheduler to allow the worker thread to begin polling for work.
-    HANDLE             ErrorSignal;      /// Signal set by any worker to indicate that a fatal error has occurred and the worker should die.
-    HANDLE             HaltSignal;       /// Signal set by any thread to stop all worker threads.
-    uint32_t           WorkerIndex;      /// The zero-based index of the worker thread within the scheduler.
+    WIN32_THREAD_ARGS  *MainThreadArgs;   /// Global data managed by the main thread.
+    HANDLE              ReadySignal;      /// Signal set by the worker to indicate that its initialization is complete and it is ready to run.
+    HANDLE              StartSignal;      /// Signal set by the scheduler to allow the worker thread to begin polling for work.
+    HANDLE              ErrorSignal;      /// Signal set by any worker to indicate that a fatal error has occurred and the worker should die.
+    HANDLE              HaltSignal;       /// Signal set by any thread to stop all worker threads.
+    size_t              MaxTicksInFlight; /// The maximum number of ticks in-flight at any given time,
+    size_t              MaxTasksPerTick;  /// The maximum number of tasks that can be created in a given tick.
+    uint32_t            WorkerIndex;      /// The zero-based index of the worker thread within the scheduler.
 };
 
 /// @summary Define the data associated with an asynchronous task scheduler.
 struct WIN32_ASYNC_TASK_SCHEDULER
 {
-    HANDLE             ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
-    HANDLE             StartSignal;      /// Manual-reset event signaled when worker threads should start running tasks.
-    HANDLE             HaltSignal;       /// Manual-reset event signaled when the scheduler is being shut down.
+    HANDLE              ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
+    HANDLE              StartSignal;      /// Manual-reset event signaled when worker threads should start running tasks.
+    HANDLE              HaltSignal;       /// Manual-reset event signaled when the scheduler is being shut down.
 
-    size_t             MaxThreads;       /// The maximum number of worker threads the scheduler can spawn.
-    size_t             ThreadCount;      /// The number of worker threads managed by the scheduler.
-    unsigned int      *OSThreadIds;      /// The operating system identifiers for each worker thread.
-    HANDLE            *OSThreadHandle;   /// The operating system thread handle for each worker thread.
-    ASYNC_WORKER      *WorkerState;      /// The state data for each worker thread.
+    size_t              MaxThreads;       /// The maximum number of worker threads the scheduler can spawn.
+    size_t              ThreadCount;      /// The number of worker threads managed by the scheduler.
+    unsigned int       *OSThreadIds;      /// The operating system identifiers for each worker thread.
+    HANDLE             *OSThreadHandle;   /// The operating system thread handle for each worker thread.
+    ASYNC_WORKER       *WorkerState;      /// The state data for each worker thread.
 };
 
 /// @summary Define the data associated with a compute-oriented task scheduler.
 struct WIN32_COMPUTE_TASK_SCHEDULER
 {
-    HANDLE             ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
-    HANDLE             StartSignal;      /// Manual-reset event signaled when worker threads should start running tasks.
-    HANDLE             HaltSignal;       /// Manual-reset event signaled when the scheduler is being shut down.
+    HANDLE              ErrorSignal;      /// Manual-reset event used by worker threads to signal a fatal error.
+    HANDLE              StartSignal;      /// Manual-reset event signaled when worker threads should start running tasks.
+    HANDLE              HaltSignal;       /// Manual-reset event signaled when the scheduler is being shut down.
 
-    size_t             ThreadCount;      /// The number of worker threads managed by the scheduler.
-    unsigned int      *OSThreadIds;      /// The operating system identifiers for each worker thread.
-    HANDLE            *OSThreadHandle;   /// The operating system thread handle for each worker thread.
-    COMPUTE_WORKER    *WorkerState;      /// The state data for each worker thread.
+    size_t              ThreadCount;      /// The number of worker threads managed by the scheduler.
+    unsigned int       *OSThreadIds;      /// The operating system identifiers for each worker thread.
+    HANDLE             *OSThreadHandle;   /// The operating system thread handle for each worker thread.
+    COMPUTE_WORKER     *WorkerState;      /// The state data for each worker thread.
 };
 
 /*////////////////////////////
@@ -207,6 +223,137 @@ struct WIN32_COMPUTE_TASK_SCHEDULER
 /*//////////////////////////
 //   Internal Functions   //
 //////////////////////////*/
+/// @summary Push an item onto the private end of a task queue. This function can only be called by the thread that owns the queue, and may execute concurrently with one or more steal operations.
+/// @param queue The queue to receive the item.
+/// @param task The identifier of the task that is ready to run.
+/// @return true if the task was written to the queue.
+internal_function bool
+TaskQueuePush
+(
+    TASK_QUEUE *queue, 
+    task_id_t    task
+)
+{   // Pub = Top (Steal), Prv = Bottom (Push/Take)
+    uint32_t b   = queue->Prv.load(std::memory_order_relaxed);
+    uint32_t t   = queue->Pub.load(std::memory_order_acquire);
+    if ((b - t) <= queue->Mask)
+    {   // the queue is not full, so enqueue the item at the private end.
+        queue->Tasks[b & queue->Mask] = task;
+        // ensure that the task ID is written before bumping the index.
+        std::atomic_thread_fence(std::memory_order_release);
+        // make the item visible to other threads.
+        queue->Prv.store(b + 1, std::memory_order_relaxed);
+        return true;
+    }
+    else return false; // the queue is currently full.
+}
+
+/// @summary Take an item from the private end of a task queue. This function can only be called by the thread that owns the queue, and may execute concurrently with one or more steal operations.
+/// @param queue The queue from which the item will be removed.
+/// @return The task identifier, or INVALID_TASK_ID if the queue is empty.
+internal_function task_id_t
+TaskQueueTake
+(
+    TASK_QUEUE *queue
+)
+{
+    uint32_t b = queue->Prv.load(std::memory_order_relaxed) - 1;
+    queue->Prv.store(b, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+
+    uint32_t t = queue->Pub.load(std::memory_order_relaxed);
+    if (t <= b)
+    {   // the task queue is non-empty.
+        task_id_t task = queue->Tasks[b & queue->Mask];
+
+        if (t != b)
+        {   // there's at least one more item in the queue; no need to race.
+            return task;
+        }
+        // this was the last item in the queue. race to claim it.
+        if (!queue->Pub.compare_exchange_strong(t, t+1, std::memory_order_seq_cst, std::memory_order_relaxed))
+        {   // this thread lost the race.
+            task = INVALID_TASK_ID;
+        }
+        queue->Prv.store(b+1, std::memory_order_relaxed);
+        return task;
+    }
+    else return INVALID_TASK_ID; // the queue is currently empty.
+}
+
+/// @summary Attempt to steal an item from the public end of the queue. This function can be called by any thread EXCEPT the thread that owns the queue, and may execute concurrently with a push or take operation, and one or more steal operations.
+/// @param queue The queue from which the item will be removed.
+/// @return The task identifier, or INVALID_TASK_ID if the queue is empty or the calling thread lost the race for the last item.
+internal_function task_id_t
+TaskQueueSteal
+(
+    TASK_QUEUE *queue
+)
+{
+    uint32_t t = queue->Pub.load(std::memory_order_acquire);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    uint32_t b = queue->Prv.load(std::memory_order_acquire);
+
+    if (t < b)
+    {   // the task queue is non-empty. save the task ID.
+        task_id_t task = queue->Tasks[t & queue->Mask];
+        // race with other threads to claim the item.
+        if (queue->Pub.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst, std::memory_order_relaxed))
+        {   // the calling thread won the race and claimed the item.
+            return task;
+        }
+        else
+        {   // the calling thread lost the race and should try again.
+            return INVALID_TASK_ID;
+        }
+    }
+    else return INVALID_TASK_ID; // the queue is currently empty.
+}
+
+/// @summary Reset a task queue to empty.
+/// @param queue The queue to clear.
+internal_function void
+TaskQueueClear
+(
+    TASK_QUEUE *queue
+)
+{
+    queue->Pub.store(0, std::memory_order_relaxed);
+    queue->Prv.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+/// @summary Allocate the memory for a task queue and initialize the queue to empty.
+/// @param queue The task queue to initialize.
+/// @param capacity The capacity of the queue. This value must be a power of two greater than zero.
+/// @param arena The memory arena to allocate from. The caller should ensure that sufficient memory is available.
+internal_function void
+CreateTaskQueue
+(
+    TASK_QUEUE   *queue, 
+    size_t     capacity, 
+    MEMORY_ARENA *arena
+)
+{   // the capacity must be a power of two.
+    assert((capacity & (capacity - 1)) == 0);
+    queue->Pub.store(0, std::memory_order_relaxed);
+    queue->Prv.store(0, std::memory_order_relaxed);
+    queue->Mask  = uint32_t(capacity) - 1;
+    queue->Tasks = PushArray<task_id_t>(arena, capacity);
+}
+
+/// @summary Calculate the amount of memory required to store a task queue.
+/// @param capacity The capacity of the queue.
+/// @return The minimum number of bytes required to store the queue items, not including the size of the TASK_QUEUE instance.
+internal_function size_t
+CalculateMemoryForTaskQueue
+(
+    size_t capacity
+)
+{
+    return sizeof(task_id_t) * capacity;
+}
+
 /// @summary Implements the entry point of an asynchronous task worker thread.
 /// @param argp Pointer to the ASYNC_WORKER state associated with the thread.
 /// @return The thread exit code (unused).
