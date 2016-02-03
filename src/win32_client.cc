@@ -7,6 +7,8 @@
 /*////////////////////
 //   Preprocessor   //
 ////////////////////*/
+#define _STDC_FORMAT_MACROS
+
 #define Kilobytes(x)     (size_t((x)) * size_t(1024))
 #define Megabytes(x)     (size_t((x)) * size_t(1024) * size_t(1024))
 #define Gigabytes(x)     (size_t((x)) * size_t(1024) * size_t(1024) * size_t(1024))
@@ -21,6 +23,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <assert.h>
+#include <inttypes.h>
 
 #include <process.h>
 #include <conio.h>
@@ -362,13 +365,13 @@ WinMain
     MEMORY_ARENA                       main_arena = {};
     TASK_SCHEDULER_CONFIG            async_config = {};
     TASK_SCHEDULER_CONFIG          compute_config = {};
+    WIN32_ASYNC_TASK_SCHEDULER    async_scheduler = {};   // scheduler for long-running, blocking tasks
+    WIN32_COMPUTE_TASK_SCHEDULER   task_scheduler = {};   // scheduler for non-blocking, compute-oriented tasks
     HANDLE                               ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                            thread_draw = NULL; // frame composition thread and main UI thread
     HANDLE                            thread_disk = NULL; // asynchronous disk I/O thread
     HANDLE                            thread_net  = NULL; // network I/O thread
-    WIN32_ASYNC_TASK_SCHEDULER   *async_scheduler = NULL; // scheduler for long-running tasks
-    WIN32_COMPUTE_TASK_SCHEDULER  *task_scheduler = NULL; // scheduler for non-blocking, compute-oriented tasks
     uint64_t                            next_tick = 0;    // the ideal launch time of the next tick
     uint64_t                         current_tick = 0;    // the launch time of the current tick
     uint64_t                        previous_tick = 0;    // the launch time of the previous tick
@@ -377,6 +380,7 @@ WinMain
     HWND                           message_window = NULL; // for receiving input and notification from other threads
     bool                             keep_running = true;
     size_t const                  main_arena_size = Megabytes(128);
+    size_t const                default_alignment = std::alignment_of<void*>::value;
 
     UNUSED_ARG(prev_instance);
     UNUSED_ARG(command_line);
@@ -399,7 +403,7 @@ WinMain
         DebugPrintf(_T("ERROR: Unable to allocate the required global memory.\n"));
         goto cleanup_and_shutdown;
     }
-    if (CreateArena(&main_arena, main_arena_size, std::alignment_of<void*>::value, &main_os_arena) < 0)
+    if (CreateArena(&main_arena, main_arena_size, default_alignment, &main_os_arena) < 0)
     {
         DebugPrintf(_T("ERROR: Unable to initialize the global memory arena.\n"));
         goto cleanup_and_shutdown;
@@ -418,8 +422,8 @@ WinMain
     thread_args.HostCPUInfo    = &host_cpu;
     thread_args.CommandLine    = &argv;
     thread_args.InputSystem    = &input_system;
-    thread_args.AsyncScheduler = NULL;
-    thread_args.TaskScheduler  = NULL;
+    thread_args.AsyncScheduler = &async_scheduler;
+    thread_args.TaskScheduler  = &task_scheduler;
 
     // create the message window used to receive user input and messages from other threads.
     if ((message_window = CreateMessageWindow(this_instance, &thread_args)) == NULL)
@@ -443,22 +447,20 @@ WinMain
     compute_config.MaxWorkerThreads = host_cpu.HardwareThreads;
     compute_config.MaxTasksPerTick  = 4096;
     compute_config.MaxTaskArenaSize = Megabytes(2);
-    if ((task_scheduler = CreateComputeScheduler(&compute_config, &thread_args, &main_arena)) == NULL)
+    if (CreateComputeScheduler(&task_scheduler, &compute_config, &thread_args, &main_arena, 0) < 0)
     {   // no compute task scheduler is available.
         ConsoleError("ERROR: Unable to create the compute task scheduler.\n");
         goto cleanup_and_shutdown;
     }
-    thread_args.TaskScheduler      = task_scheduler;
     async_config.MaxActiveTicks    = 1;
     async_config.MaxWorkerThreads  = host_cpu.HardwareThreads * 2;
     async_config.MaxTasksPerTick   = 512;
     async_config.MaxTaskArenaSize  = Megabytes(2);
-    if ((async_scheduler = CreateAsyncScheduler(&async_config, &thread_args, &main_arena)) == NULL)
+    if (CreateAsyncScheduler(&async_scheduler, &async_config, &thread_args, &main_arena) < 0)
     {   // no asynchronous task scheduler is available.
         ConsoleError("ERROR: Unable to create the asynchronous task scheduler.\n");
         goto cleanup_and_shutdown;
     }
-    thread_args.AsyncScheduler = async_scheduler;
 
     // set up explicit threads for frame composition, network I/O and file I/O.
     if ((thread_draw = SpawnExplicitThread(DisplayThread, &thread_args)) == NULL)
@@ -471,8 +473,8 @@ WinMain
     SetEvent(ev_start);
 
     // start all of the worker threads running.
-    LaunchScheduler(task_scheduler);
-    LaunchScheduler(async_scheduler);
+    LaunchScheduler(&task_scheduler);
+    LaunchScheduler(&async_scheduler);
 
     // grab an initial absolute timestamp and initialize global time values.
     previous_tick = TimestampInNanoseconds();
@@ -545,9 +547,9 @@ WinMain
     ConsoleOutput("The main thread has exited.\n");
 
 cleanup_and_shutdown:
+    HaltScheduler(&task_scheduler);
+    HaltScheduler(&async_scheduler);
     if (ev_break        != NULL) SetEvent(ev_break);
-    if (task_scheduler  != NULL) HaltScheduler(task_scheduler);
-    if (async_scheduler != NULL) HaltScheduler(async_scheduler);
     if (thread_draw     != NULL) WaitForSingleObject(thread_draw, INFINITE);
     if (thread_disk     != NULL) WaitForSingleObject(thread_disk, INFINITE);
     if (thread_net      != NULL) WaitForSingleObject(thread_net , INFINITE);
