@@ -132,10 +132,14 @@ struct ASYNC_WORKER
 
 /// @summary Define the data associated with a work item.
 struct WORK_ITEM
-{
-    uint32_t            LaunchTick;       /// The global tick on which the task was launched.
+{   static size_t const MAX_DATA = 48;    /// The maximum amount of data that can be passed to the task.
+    uint32_t            BufferIndex;      /// The zero-based index of the tick buffer containing the task.
     task_id_t           ParentTask;       /// The identifier of the parent task, or INVALID_TASK_ID.
     TASK_ENTRY          TaskMain;         /// The task entry point.
+#if TARGET_ARCHITECTURE == ARCHITECTURE_X86_32 || TARGET_ARCHITECTURE == ARCHITECTURE_ARM_32
+    uint32_t            Reserved;         /// Padding; unused.
+#endif
+    uint8_t             TaskArgs[MAX_DATA]; /// User-supplied argument data associated with the work item.
 };
 
 /// @summary Define the data representing a work-stealing deque of task identifiers. Each compute worker thread maintains its own queue.
@@ -165,8 +169,8 @@ struct TASK_SOURCE
 #pragma warning(pop)
 
     size_t              GroupIndex;       /// The zero-based index of the source group.
-    size_t              SourceIndex;      /// The zero-based index of the source within the source list. Constant.
-    size_t              SourceGroupSize;  /// The number of sources in the source group. Each source group may contain up to 64 sources. Constant.
+    uint32_t            SourceGroupSize;  /// The number of sources in the source group. Each source group may contain up to 64 sources. Constant.
+    uint32_t            SourceIndex;      /// The zero-based index of the source within the source list. Constant.
 
     size_t              MaxTicksInFlight; /// The maximum number of ticks in-flight at any given time. Constant.
     size_t              MaxTasksPerTick;  /// The maximum number of tasks that can be created in a given tick. Constant.
@@ -177,7 +181,7 @@ struct TASK_SOURCE
     task_id_t          *WTRDepsList;      /// The task ID of the unsatisfied dependency for each task in the waiting-to-run list.
     task_id_t          *WTRTaskList;      /// The task ID of each task holding in the waiting-to-run list.
 
-    size_t              TaskCounts[4];    /// The number of tasks defined for each in-flight tick.
+    uint32_t            TaskCounts[4];    /// The number of tasks defined for each in-flight tick.
     WORK_ITEM          *WorkItems [4];    /// The work item definitions for each task, for each in-flight tick.
     int32_t            *WorkCounts[4];    /// The outstanding work counter for each task, for each in-flight tick.
 };
@@ -237,6 +241,42 @@ public_function TASK_SOURCE* NewTaskSource(WIN32_COMPUTE_TASK_SCHEDULER*, MEMORY
 /*//////////////////////////
 //   Internal Functions   //
 //////////////////////////*/
+/// @summary Create a task ID from its constituient parts.
+/// @param tick_index The zero-based index of the in-flight tick.
+/// @param scheduler_type The type of scheduler that owns the task. One of SCHEDULER_TYPE.
+/// @param task_index The zero-based index of the task within the task list for this tick in the thread that created the task.
+/// @param thread_index The zero-based index of the thread that created the task.
+/// @param task_id_type Indicates whether the task ID is valid. One of TASK_ID_TYPE.
+/// @return The task identifier.
+internal_function inline task_id_t
+MakeTaskId
+(
+    uint32_t     tick_index, 
+    uint32_t scheduler_type, 
+    uint32_t     task_index, 
+    uint32_t   thread_index, 
+    uint32_t   task_id_type = TASK_ID_TYPE_VALID
+)
+{
+    return ((tick_index     & TASK_ID_MASK_TICK_U  ) << TASK_ID_SHIFT_TICK  ) | 
+           ((scheduler_type & TASK_ID_MASK_TYPE_U  ) << TASK_ID_SHIFT_TYPE  ) | 
+           ((task_index     & TASK_ID_MASK_INDEX_U ) << TASK_ID_SHIFT_INDEX ) |
+           ((thread_index   & TASK_ID_MASK_THREAD_U) << TASK_ID_SHIFT_THREAD) | 
+           ((task_id_type   & TASK_ID_MASK_VALID_U ) << TASK_ID_SHIFT_VALID );
+}
+
+/// @summary Determine whether an ID identifies a valid task.
+/// @param id The task identifier to check.
+/// @return true if the identifier specifies a valid task.
+internal_function inline bool
+IsValidTask
+(
+    task_id_t id
+)
+{
+    return (((id & TASK_ID_MASK_VALID_P) >> TASK_ID_SHIFT_VALID) != 0);
+}
+
 /// @summary Retrieve the work item for a given task ID.
 /// @param task The task identifier. This function does not validate the task ID.
 /// @param source_list The list of state data associated with each task source; either WIN32_COMPUTE_TASK_SCHEDULER::SourceList or COMPUTE_WORKER::ThreadSource->TaskSources.
@@ -273,7 +313,7 @@ GetTaskWorkItem
 /// @param source_list The list of state data associated with each task source; either WIN32_COMPUTE_TASK_SCHEDULER::SourceList or COMPUTE_WORKER::ThreadSource->TaskSources.
 /// @return A pointer to the work counter associated with the task.
 internal_function inline int32_t*
-GetTaskWorkCounts
+GetTaskWorkCount
 (
     task_id_t           task,
     TASK_SOURCE *source_list
@@ -689,44 +729,79 @@ CalculateMemoryForComputeScheduler
     return size;
 }
 
+/// @summary Define a new task within a task source.
+/// @param source The task source that will store the task definition.
+/// @param task_main The entry point of the task.
+/// @param task_args User-supplied argument data for the task instance. This data is copied into the task.
+/// @param args_size The number of bytes of argument data to copy into the task.
+/// @param buffer_id The zero-based index of the task definition buffer where the task definition will be stored.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID.
+/// @param wait_task The identifier of the task that must complete prior to executing this new task, or INVALID_TASK_ID.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+internal_function task_id_t
+DefineTask
+(
+    TASK_SOURCE     *source,
+    TASK_ENTRY    task_main, 
+    void   const *task_args, 
+    size_t const  args_size, 
+    uint32_t      buffer_id, 
+    task_id_t     parent_id, 
+    task_id_t     wait_task
+)
+{
+    if (args_size > WORK_ITEM::MAX_DATA)
+    {   // there's too much data being passed. the caller should allocate storage elsewhere and pass us the pointer.
+        return INVALID_TASK_ID;
+    }
+    if (source->TaskCounts[buffer_id] < source->MaxTasksPerTick)
+    {   // there's room to define a new task, so proceed.
+        int32_t   *dep_wcount;
+        uint32_t   task_index = source->TaskCounts[buffer_id]++;
+        task_id_t     task_id = MakeTaskId(buffer_id, SCHEDULER_TYPE_COMPUTE, task_index, source->SourceIndex);
+        int32_t   &work_count = source->WorkCounts[buffer_id][task_index];
+        WORK_ITEM &work_item  = source->WorkItems [buffer_id][task_index];
+
+        work_item.BufferIndex = buffer_id;
+        work_item.ParentTask  = parent_id;
+        work_item.TaskMain    = task_main;
+        if (task_args != NULL && args_size > 0)
+        {
+            CopyMemory( work_item.TaskArgs, task_args, args_size);
+            ZeroMemory(&work_item.TaskArgs[args_size], WORK_ITEM::MAX_DATA - args_size);
+        }
+        work_count = 2; // decremented in FinishTask.
+
+        if (IsValidTask(wait_task) && (dep_wcount = GetTaskWorkCount(wait_task, source->TaskSources)) != NULL)
+        {   // determine whether the dependency task has been completed.
+            if (InterlockedAdd((volatile LONG*) dep_wcount, 0) > 0)
+            {   // the dependency has not been completed, so this task goes on the waiting-to-run list.
+                source->WTRDepsList[source->WTRTaskCount] = wait_task;
+                source->WTRTaskList[source->WTRTaskCount] = task_id;
+                source->WTRTaskCount++;
+                return task_id;
+            }
+        }
+
+        // this task is ready-to-run, so add it directly to the work queue.
+        // it may be executed before LaunchTask is called, but that's ok - 
+        // the work_count value is 2, so it cannot complete until LaunchTask.
+        // this allows child tasks to be safely spawned from the main task.
+        if (!TaskQueuePush(&source->WorkQueue, task_id))
+        {   // TODO(rlk): this should never happen, but the task queue is full.
+            // execute the task immediately so it doesn't get "lost".
+        }
+        return task_id;
+    }
+    else
+    {   // no additional tasks can be defined in the current tick.
+        return INVALID_TASK_ID;
+    }
+}
+
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
-/// @summary Create a task ID from its constituient parts.
-/// @param tick_index The zero-based index of the in-flight tick.
-/// @param scheduler_type The type of scheduler that owns the task. One of SCHEDULER_TYPE.
-/// @param task_index The zero-based index of the task within the task list for this tick in the thread that created the task.
-/// @param thread_index The zero-based index of the thread that created the task.
-/// @param task_id_type Indicates whether the task ID is valid. One of TASK_ID_TYPE.
-/// @return The task identifier.
-public_function inline task_id_t
-MakeTaskId
-(
-    uint32_t     tick_index, 
-    uint32_t scheduler_type, 
-    uint32_t     task_index, 
-    uint32_t   thread_index, 
-    uint32_t   task_id_type = TASK_ID_TYPE_VALID
-)
-{
-    return ((tick_index     & TASK_ID_MASK_TICK_U  ) << TASK_ID_SHIFT_TICK  ) | 
-           ((scheduler_type & TASK_ID_MASK_TYPE_U  ) << TASK_ID_SHIFT_TYPE  ) | 
-           ((task_index     & TASK_ID_MASK_INDEX_U ) << TASK_ID_SHIFT_INDEX ) |
-           ((thread_index   & TASK_ID_MASK_THREAD_U) << TASK_ID_SHIFT_THREAD) | 
-           ((task_id_type   & TASK_ID_MASK_VALID_U ) << TASK_ID_SHIFT_VALID );
-}
-
-/// @summary Determine whether an ID identifies a valid task.
-/// @param id The task identifier to check.
-/// @return true if the identifier specifies a valid task.
-public_function inline bool
-IsValidTask
-(
-    task_id_t id
-)
-{
-    return (((id & TASK_ID_MASK_VALID_P) >> TASK_ID_SHIFT_VALID) != 0);
-}
 
 /// @summary Retrieve the zero-based index of the thread that created a task.
 /// @param id The task identifier.
@@ -969,8 +1044,8 @@ NewTaskSource
     TASK_SOURCE     *source  = &scheduler->SourceList[scheduler->SourceCount];
     CreateTaskQueue(&source->WorkQueue, max_tasks_per_tick, arena);
     source->GroupIndex       = scheduler->SourceCount / PER_GROUP;
-    source->SourceIndex      = scheduler->SourceCount;
-    source->SourceGroupSize  = remaining < PER_GROUP ? remaining : PER_GROUP;
+    source->SourceIndex      =(uint32_t)  scheduler->SourceCount;
+    source->SourceGroupSize  =(uint32_t) (remaining < PER_GROUP ? remaining : PER_GROUP);
     source->MaxTicksInFlight = max_active_ticks;
     source->MaxTasksPerTick  = max_tasks_per_tick;
     source->TaskSourceCount  = scheduler->MaxSourceCount;
@@ -1213,32 +1288,82 @@ GetRootTaskSource
     return &scheduler->SourceList[0];
 }
 
-/*
-public_function task_id_t
+/// @summary Spawn a new task. After spawning any child tasks, call FinishTask to complete the task definition.
+/// @param source The TASK_SOURCE for the calling thread. 
+/// @param task_main The entry point of the task.
+/// @param task_args User-supplied argument data for the task instance. This data is copied into the task.
+/// @param args_size The number of bytes of argument data to copy into the task.
+/// @param task_tick The application tick counter specifying the current tick index.
+/// @param wait_task The identifier of the task that must complete prior to executing this new task, or INVALID_TASK_ID.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function inline task_id_t
 NewTask
 (
-    COMPUTE_WORKER    *worker, 
+    TASK_SOURCE       *source, 
     TASK_ENTRY      task_main, 
     void   const   *task_args, 
     size_t const    args_size,
+    uint32_t        task_tick,
     task_id_t       wait_task = INVALID_TASK_ID
 )
 {
+    return DefineTask(source, task_main, task_args, args_size, task_tick % source->MaxTicksInFlight, INVALID_TASK_ID, wait_task);
 }
 
+/// @summary Spawn a new child task. Call FinishTask to complete the task definition.
+/// @param source The TASK_SOURCE for the calling thread. 
+/// @param task_main The entry point of the task.
+/// @param task_args User-supplied argument data for the task instance. This data is copied into the task.
+/// @param args_size The number of bytes of argument data to copy into the task.
+/// @param parent_id The task ID of the parent task, as returned by the NewTask function used to create the parent task.
+/// @param wait_task The identifier of the task that must complete prior to executing this new task, or INVALID_TASK_ID.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
 public_function task_id_t
 NewChildTask
 (
+    TASK_SOURCE     *source, 
+    TASK_ENTRY    task_main, 
+    void   const *task_args, 
+    size_t const  args_size, 
+    task_id_t     parent_id, 
+    task_id_t     wait_task = INVALID_TASK_ID
 )
 {
+    WORK_ITEM *parent_task;  // read-only
+    int32_t   *parent_count; // write-only
+    if (IsValidTask(parent_id))
+    {   // retrieve the information we need about the parent task.
+        parent_task  = GetTaskWorkItem (parent_id, source->TaskSources);
+        parent_count = GetTaskWorkCount(parent_id, source->TaskSources);
+        // increment the outstanding work counter on the parent.
+        InterlockedIncrement((volatile LONG*) parent_count);
+    }
+    else
+    {   // the parent ID isn't valid, so fail the child creation.
+        return INVALID_TASK_ID;
+    }
+
+    return DefineTask(source, task_main, task_args, args_size, parent_task->BufferIndex, parent_id, wait_task);
 }
 
+/// @summary Indicate that a task (including any children) has been completely defined and allow it to finish execution.
+/// @param source The source that defined the task. This should be the same source that was passed to NewTask.
+/// @param task The task ID returned by the NewTask call.
 public_function void
-LaunchTask
+FinishTask
 (
-    task_id_t task
+    TASK_SOURCE *source,
+    task_id_t      task
 )
 {
+    int32_t *work_count;
+    if (IsValidTask(task) && (work_count = GetTaskWorkCount(task, source->TaskSources)) != NULL)
+    {
+        WORK_ITEM *work_item = GetTaskWorkItem(task, source->TaskSources);
+        if (InterlockedDecrement((volatile LONG*) work_count) <= 0)
+        {   // the work item has finished executing. complete any parent task.
+            FinishTask(source, work_item->ParentTask);
+        }
+    }
 }
-*/
 
