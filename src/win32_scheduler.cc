@@ -84,7 +84,7 @@
 typedef uint32_t task_id_t;
 
 /// @summary Define the function signature for a task entrypoint.
-typedef int (*TASK_ENTRY)(struct TASK_ARGS*);
+typedef int (*TASK_ENTRY)(struct TASK_SOURCE*, struct WORK_ITEM*, MEMORY_ARENA*, WIN32_THREAD_ARGS*);
 
 /// @summary Define identifiers for task ID validity. An ID can only be valid or invalid.
 enum TASK_ID_TYPE : uint32_t
@@ -168,6 +168,7 @@ struct TASK_SOURCE
     TASK_QUEUE          WorkQueue;        /// The queue of ready-to-run task IDs.
 #pragma warning(pop)
 
+    HANDLE              StealSignal;      /// An auto-reset event used to wake a single thread when work can be stolen.
     size_t              GroupIndex;       /// The zero-based index of the source group.
     uint32_t            SourceGroupSize;  /// The number of sources in the source group. Each source group may contain up to 64 sources. Constant.
     uint32_t            SourceIndex;      /// The zero-based index of the source within the source list. Constant.
@@ -237,6 +238,7 @@ struct WIN32_COMPUTE_TASK_SCHEDULER
 //   Forward Declarations   //
 ////////////////////////////*/
 public_function TASK_SOURCE* NewTaskSource(WIN32_COMPUTE_TASK_SCHEDULER*, MEMORY_ARENA*, size_t, size_t);
+public_function void         FinishTask(TASK_SOURCE*, task_id_t);
 
 /*//////////////////////////
 //   Internal Functions   //
@@ -476,6 +478,113 @@ CalculateMemoryForTaskSource
     return bytes_needed;
 }
 
+/// @summary Execute a compute task on the calling thread.
+/// @param task The identifier of the task to execute.
+/// @param worker_source The TASK_SOURCE owned by the calling thread.
+/// @param task_arena The memory arena to use for task-local memory allocations. The arena is reset prior to task execution.
+/// @param thread_args Global data and state managed by the main thread.
+/// @return The task exit code.
+internal_function int
+ExecuteComputeTask
+(
+    task_id_t                 task,
+    TASK_SOURCE     *worker_source, 
+    MEMORY_ARENA       *task_arena, 
+    WIN32_THREAD_ARGS *thread_args
+)
+{   
+    int        rcode = 0;
+    WORK_ITEM *work_item;
+    if (IsValidTask(task) && (work_item = GetTaskWorkItem(task, worker_source->TaskSources)) != NULL)
+    {   // TODO(rlk): do something with the return value? or not?
+        ArenaReset(task_arena);
+        rcode = work_item->TaskMain(worker_source, work_item, task_arena, thread_args);
+        FinishTask(worker_source, task);
+    }
+    return rcode;
+}
+
+/// @summary Update the status of each task in a TASK_SOURCE waiting-to-run list, and launch any tasks that are now ready-to-run.
+/// @param source The TASK_SOURCE of the worker thread.
+internal_function void 
+TransitionWaitingToRunTasks
+(
+    TASK_SOURCE *source
+)
+{
+    if (source->WTRTaskCount == 0)
+    {   // there is no waiting-to-run list; avoid the fence.
+        return;
+    }
+
+    size_t wtr_index = 0;
+    // make sure we are reading the "latest" values.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    // go through the WTR list and look for any tasks whose dependency has a work count of 0.
+    while (wtr_index < source->WTRTaskCount && source->WTRTaskCount > 0)
+    {
+        task_id_t dep_task  = source->WTRDepsList[wtr_index];
+        uint32_t  dep_valid = dep_task & TASK_ID_MASK_VALID_P;
+        int32_t  *dep_work;
+
+        if (dep_valid)
+        {
+            if ((dep_work = GetTaskWorkCount(dep_task, source->TaskSources)) != NULL)
+            {   // has the task we're waiting for finished?
+                if (*dep_work <= 0)
+                {   // yes, so place this task on the work queue.
+                    TaskQueuePush(&source->WorkQueue, source->WTRTaskList[wtr_index]);
+                    // and then remove the task from the waiting-to-run list.
+                    source->WTRDepsList[wtr_index] = source->WTRDepsList[source->WTRTaskCount-1];
+                    source->WTRTaskList[wtr_index] = source->WTRTaskList[source->WTRTaskCount-1];
+                    source->WTRTaskCount--;
+                    continue;
+                }
+            }
+            // check the next task in the waiting-to-run list.
+            wtr_index++;
+        }
+        else
+        {   // remove the task, which is no longer valid, from the waiting-to-run list.
+            source->WTRDepsList[wtr_index] = source->WTRDepsList[source->WTRTaskCount-1];
+            source->WTRTaskList[wtr_index] = source->WTRTaskList[source->WTRTaskCount-1];
+            source->WTRTaskCount--;
+            continue;
+        }
+    }
+}
+
+/// @summary Construct a list of waitable event handles that can be used to sleep a thread until termination time or a steal signal.
+/// @param wait_list The list of waitable event handles to populate.
+/// @param wait_source The list of TASK_SOURCE pointers associated with the waitable events in wait_list.
+/// @param max_wait_handles The maximum number of handles to write to the wait_list.
+/// @param source The TASK_SOURCE associated with the worker.
+/// @return The number of waitable event handles written to the wait_list.
+internal_function uint32_t
+BuildWorkerWaitList
+(
+    HANDLE             *wait_list, 
+    TASK_SOURCE     **wait_source,
+    uint32_t     max_wait_handles, 
+    TASK_SOURCE           *source
+)
+{   // only include handles in the source group.
+    uint32_t written    =  0;
+    uint32_t base_index = (uint32_t) source->GroupIndex * 64;
+    uint32_t group_size = (uint32_t) source->SourceGroupSize;
+    for (uint32_t i = base_index, last = base_index + group_size; i < last && written < max_wait_handles; ++i)
+    {   // don't include the source in the list of waitable items.
+        if (source != &source->TaskSources[i])
+        {
+            wait_source[written] =&source->TaskSources[i];
+            wait_list  [written] = source->TaskSources[i].StealSignal;
+            written++;
+        }
+    }
+    // TODO(rlk): probably want to limit to nodes in the same NUMA group or something.
+    return written;
+}
+
 /// @summary Implements the entry point of an asynchronous task worker thread.
 /// @param argp Pointer to the ASYNC_WORKER state associated with the thread.
 /// @return The thread exit code (unused).
@@ -522,9 +631,12 @@ ComputeWorkerMain
     void *argp
 )
 {
-    COMPUTE_WORKER      *thread_args = (COMPUTE_WORKER*) argp;
-    WIN32_THREAD_ARGS     *main_args =  thread_args->MainThreadArgs;
-    HANDLE            init_signal[4] =
+    COMPUTE_WORKER      *thread_args  = (COMPUTE_WORKER*) argp;
+    WIN32_THREAD_ARGS     *main_args  =  thread_args->MainThreadArgs;
+    TASK_SOURCE       *worker_source  =  thread_args->ThreadSource;
+    TASK_SOURCE      *wait_source[64] = {};
+    HANDLE            wait_signal[64] = {};
+    HANDLE            init_signal[4]  =
     { 
         thread_args->StartSignal ,
         thread_args->ErrorSignal ,
@@ -543,7 +655,42 @@ ComputeWorkerMain
         goto terminate_worker;
     }
 
-    // TODO(rlk): the main loop of the compute worker thread.
+    // perform any initialization that must wait until all sources are prepared.
+    wait_source[0]   = NULL;
+    wait_signal[0]   = thread_args->HaltSignal;
+    DWORD wait_count = BuildWorkerWaitList(&wait_signal[1], &wait_source[1], 63, worker_source);
+
+    // this thread is the only thread that can put things into its work queue.
+    // everything else is stolen work from other threads.
+    for ( ; ; )
+    {   // put the thread to sleep until there's potentially some work to steal.
+        DWORD result  = WaitForMultipleObjects(wait_count, wait_signal, FALSE, INFINITE);
+        if   (result >= WAIT_OBJECT_0 && result < (WAIT_OBJECT_0 + wait_count))
+        {   // one of the events we were waiting on was signaled.
+            if (result == WAIT_OBJECT_0)
+            {   // the scheduler HALT signal woke us up. terminate the thread.
+                goto terminate_worker;
+            }
+            // otherwise, this thread was woken because there's work to steal.
+            task_id_t task = TaskQueueSteal(&wait_source[result - WAIT_OBJECT_0]->WorkQueue);
+            while (task != INVALID_TASK_ID)
+            {   // execute the task this thread just took or stole.
+                ExecuteComputeTask(task, worker_source, &thread_args->ThreadArena, main_args);
+                // that task may have generated additional work.
+                // keep working as long as we can grab work to do.
+                if ((task = TaskQueueTake(&worker_source->WorkQueue)) == INVALID_TASK_ID)
+                {   // if no task was retrieved, see if anything is now ready-to-run.
+                    TransitionWaitingToRunTasks(worker_source);
+                    task = TaskQueueTake(&worker_source->WorkQueue);
+                }
+            }
+            TransitionWaitingToRunTasks(worker_source);
+        }
+        else
+        {   // some kind of error occurred while waiting. terminate the thread.
+            goto terminate_worker;
+        }
+    }
 
 terminate_worker:
     ConsoleOutput("Compute worker thread %u terminated.\n", thread_args->ThreadIndex);
@@ -766,9 +913,8 @@ DefineTask
         work_item.ParentTask  = parent_id;
         work_item.TaskMain    = task_main;
         if (task_args != NULL && args_size > 0)
-        {
-            CopyMemory( work_item.TaskArgs, task_args, args_size);
-            ZeroMemory(&work_item.TaskArgs[args_size], WORK_ITEM::MAX_DATA - args_size);
+        {   // we could first zero the work_item.TaskArgs memory.
+            CopyMemory(work_item.TaskArgs, task_args, args_size);
         }
         work_count = 2; // decremented in FinishTask.
 
@@ -787,10 +933,7 @@ DefineTask
         // it may be executed before LaunchTask is called, but that's ok - 
         // the work_count value is 2, so it cannot complete until LaunchTask.
         // this allows child tasks to be safely spawned from the main task.
-        if (!TaskQueuePush(&source->WorkQueue, task_id))
-        {   // TODO(rlk): this should never happen, but the task queue is full.
-            // execute the task immediately so it doesn't get "lost".
-        }
+        TaskQueuePush(&source->WorkQueue, task_id);
         return task_id;
     }
     else
@@ -802,7 +945,6 @@ DefineTask
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
-
 /// @summary Retrieve the zero-based index of the thread that created a task.
 /// @param id The task identifier.
 /// @return The zero-based index of the thread that created the task.
@@ -944,6 +1086,10 @@ CheckSchedulerConfiguration
             performance_ok = false;
         }
     }
+    else
+    {   // copy the value from the input configuration.
+        dst_config->MaxTasksPerTick = src_config->MaxTasksPerTick;
+    }
     // the maximum number of tasks per-tick should always be a power of two.
     if ((dst_config->MaxTasksPerTick & (dst_config->MaxTasksPerTick-1)) != 0)
     {   // round up to the next largest power-of-two.
@@ -1043,6 +1189,7 @@ NewTaskSource
     size_t        remaining  = scheduler->MaxSourceCount - scheduler->SourceCount;
     TASK_SOURCE     *source  = &scheduler->SourceList[scheduler->SourceCount];
     CreateTaskQueue(&source->WorkQueue, max_tasks_per_tick, arena);
+    source->StealSignal      = CreateEvent(NULL, FALSE, FALSE, NULL); // auto-reset
     source->GroupIndex       = scheduler->SourceCount / PER_GROUP;
     source->SourceIndex      =(uint32_t)  scheduler->SourceCount;
     source->SourceGroupSize  =(uint32_t) (remaining < PER_GROUP ? remaining : PER_GROUP);
@@ -1365,5 +1512,16 @@ FinishTask
             FinishTask(source, work_item->ParentTask);
         }
     }
+}
+
+/// @summary Wake exactly one waiting worker thread if there's work it could steal. Call this if several items are added to a work queue.
+/// @param source The TASK_SOURCE owned by the calling thread.
+public_function void
+SignalWaitingWorkers
+(
+    TASK_SOURCE *source
+)
+{
+    SetEvent(source->StealSignal);
 }
 

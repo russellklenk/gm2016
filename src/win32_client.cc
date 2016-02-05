@@ -59,6 +59,55 @@
 /*//////////////////////////
 //   Internal Functions   //
 //////////////////////////*/
+internal_function int
+TaskEntryA
+(
+    TASK_SOURCE            *source, 
+    WORK_ITEM                *task, 
+    MEMORY_ARENA            *arena, 
+    WIN32_THREAD_ARGS *thread_args
+)
+{
+    UNUSED_ARG(source);
+    UNUSED_ARG(task);
+    UNUSED_ARG(arena);
+    UNUSED_ARG(thread_args);
+    ConsoleOutput("Executed task A.\n");
+    return 0;
+}
+internal_function int
+TaskEntryB
+(
+    TASK_SOURCE            *source, 
+    WORK_ITEM                *task, 
+    MEMORY_ARENA            *arena, 
+    WIN32_THREAD_ARGS *thread_args
+)
+{
+    UNUSED_ARG(source);
+    UNUSED_ARG(task);
+    UNUSED_ARG(arena);
+    UNUSED_ARG(thread_args);
+    ConsoleOutput("Executed task B.\n");
+    return 0;
+}
+internal_function int
+TaskEntryC
+(
+    TASK_SOURCE            *source, 
+    WORK_ITEM                *task, 
+    MEMORY_ARENA            *arena, 
+    WIN32_THREAD_ARGS *thread_args
+)
+{
+    UNUSED_ARG(source);
+    UNUSED_ARG(task);
+    UNUSED_ARG(arena);
+    UNUSED_ARG(thread_args);
+    ConsoleOutput("Executed task C.\n");
+    return 0;
+}
+
 /// @summary Initializes a command line arguments definition with the default program configuration.
 /// @param args The command line arguments definition to populate.
 /// @return true if the input command line arguments structure is valid.
@@ -530,6 +579,14 @@ WinMain
             miss_time = current_tick - next_tick;
             next_tick =(current_tick - miss_time) + SliceOfSecond(60);
         }
+        // work work work
+        task_id_t a = NewTask(GetRootTaskSource(&task_scheduler), TaskEntryA, NULL, 0, 0);
+        task_id_t b = NewChildTask(GetRootTaskSource(&task_scheduler), TaskEntryB, NULL, 0, a);
+        FinishTask(GetRootTaskSource(&task_scheduler), b);
+        FinishTask(GetRootTaskSource(&task_scheduler), a);
+        task_id_t c = NewTask(GetRootTaskSource(&task_scheduler), TaskEntryC, NULL, 0, 0, a);
+        FinishTask(GetRootTaskSource(&task_scheduler), c);
+        SignalWaitingWorkers(GetRootTaskSource(&task_scheduler));
         ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(current_tick) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
 
         // all work for the current tick has completed.
