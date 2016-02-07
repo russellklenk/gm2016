@@ -142,6 +142,14 @@ struct WORK_ITEM
     uint8_t             TaskArgs[MAX_DATA]; /// User-supplied argument data associated with the work item.
 };
 
+/// @summary Defines the data associated with a set of tasks waiting on another task to complete.
+struct WAITER_BLOCK
+{   static size_t const ALIGNMENT = CACHELINE_SIZE;
+    static size_t const MAX_TASKS = 15;   /// The maximum number of task IDs that can be stored in a single block.
+    int32_t             CountAndNext;     /// The number of items in the block and the index of the next block, packed into a single value.
+    task_id_t           Tasks[15];        /// The IDs of tasks waiting on the owner task to complete.
+};
+
 /// @summary Define the data representing a work-stealing deque of task identifiers. Each compute worker thread maintains its own queue.
 /// The worker thread can perform push and take operations. Other worker threads can perform concurrent steal operations.
 struct TASK_QUEUE
@@ -178,7 +186,7 @@ struct TASK_SOURCE
     size_t              TaskSourceCount;  /// The total number of task sources defined in the scheduler. Constant.
     TASK_SOURCE        *TaskSources;      /// The list of per-source state for each task source. Managed by the scheduler.
 
-    // TODO(rlk): Replace the WTR list with a pool of dependency blocks.
+    // TODO(rlk): Replace the WTR list with a pool of WAITER_BLOCK.
     // In addition to WorkItems, WorkCounts there is also an index or pointer to the dependency block (or some value representing NONE.)
     // During FinishTask, if there's a dependency block associated with the just-completed task, the worker that called FinishTssk can steal/
     // make RTR (add to WorkQueue) all of the tasks listed in the dependency block.
