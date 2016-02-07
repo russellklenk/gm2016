@@ -178,6 +178,10 @@ struct TASK_SOURCE
     size_t              TaskSourceCount;  /// The total number of task sources defined in the scheduler. Constant.
     TASK_SOURCE        *TaskSources;      /// The list of per-source state for each task source. Managed by the scheduler.
 
+    // TODO(rlk): Replace the WTR list with a pool of dependency blocks.
+    // In addition to WorkItems, WorkCounts there is also an index or pointer to the dependency block (or some value representing NONE.)
+    // During FinishTask, if there's a dependency block associated with the just-completed task, the worker that called FinishTssk can steal/
+    // make RTR (add to WorkQueue) all of the tasks listed in the dependency block.
     size_t              WTRTaskCount;     /// The number of tasks in the waiting-to-run list.
     task_id_t          *WTRDepsList;      /// The task ID of the unsatisfied dependency for each task in the waiting-to-run list.
     task_id_t          *WTRTaskList;      /// The task ID of each task holding in the waiting-to-run list.
