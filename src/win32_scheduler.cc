@@ -143,11 +143,11 @@ struct WORK_ITEM
 };
 
 /// @summary Defines the data associated with a set of tasks waiting on another task to complete.
-struct WAITER_BLOCK
+struct PERMITS_LIST
 {   static size_t const ALIGNMENT = CACHELINE_SIZE;
-    static size_t const MAX_TASKS = 15;   /// The maximum number of task IDs that can be stored in a single block.
-    int32_t             CountAndNext;     /// The number of items in the block and the index of the next block, packed into a single value.
-    task_id_t           Tasks[15];        /// The IDs of tasks waiting on the owner task to complete.
+    static size_t const MAX_TASKS = 15;   /// The maximum number of task IDs that can be stored in a permits list.
+    int32_t             Count;            /// The number of items in the permits list.
+    task_id_t           Tasks[MAX_TASKS]; /// The task IDs in the permits list. This is the set of tasks to launch when the owning task completes.
 };
 
 /// @summary Define the data representing a work-stealing deque of task identifiers. Each compute worker thread maintains its own queue.
@@ -186,17 +186,10 @@ struct TASK_SOURCE
     size_t              TaskSourceCount;  /// The total number of task sources defined in the scheduler. Constant.
     TASK_SOURCE        *TaskSources;      /// The list of per-source state for each task source. Managed by the scheduler.
 
-    // TODO(rlk): Replace the WTR list with a pool of WAITER_BLOCK.
-    // In addition to WorkItems, WorkCounts there is also an index or pointer to the dependency block (or some value representing NONE.)
-    // During FinishTask, if there's a dependency block associated with the just-completed task, the worker that called FinishTssk can steal/
-    // make RTR (add to WorkQueue) all of the tasks listed in the dependency block.
-    size_t              WTRTaskCount;     /// The number of tasks in the waiting-to-run list.
-    task_id_t          *WTRDepsList;      /// The task ID of the unsatisfied dependency for each task in the waiting-to-run list.
-    task_id_t          *WTRTaskList;      /// The task ID of each task holding in the waiting-to-run list.
-
     uint32_t            TaskCounts[4];    /// The number of tasks defined for each in-flight tick.
     WORK_ITEM          *WorkItems [4];    /// The work item definitions for each task, for each in-flight tick.
     int32_t            *WorkCounts[4];    /// The outstanding work counter for each task, for each in-flight tick.
+    PERMITS_LIST       *PermitList[4];    /// The permits list for each task, for each in-flight tick.
 };
 
 /// @summary Define the data associated with a compute scheduler worker thread.
@@ -250,7 +243,7 @@ struct WIN32_COMPUTE_TASK_SCHEDULER
 //   Forward Declarations   //
 ////////////////////////////*/
 public_function TASK_SOURCE* NewTaskSource(WIN32_COMPUTE_TASK_SCHEDULER*, MEMORY_ARENA*, size_t, size_t);
-public_function void         FinishTask(TASK_SOURCE*, task_id_t);
+public_function int32_t      FinishTask(TASK_SOURCE*, task_id_t);
 
 /*//////////////////////////
 //   Internal Functions   //
@@ -337,6 +330,23 @@ GetTaskWorkCount
     uint32_t const   tick_index = (task & TASK_ID_MASK_TICK_P  ) >> TASK_ID_SHIFT_TICK;
     uint32_t const   task_index = (task & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
     return &source_list[thread_index].WorkCounts[tick_index][task_index];
+}
+
+/// @summary Retrieve the list of permits for a given task ID.
+/// @param task The task identifier. This function does not validate the task ID.
+/// @param source_list The list of state data associated with each task source; either WIN32_COMPUTE_TASK_SCHEDULER::SourceList or COMPUTE_WORKER::ThreadSource->TaskSources.
+/// @return A pointer to the permits list associated with the task.
+internal_function inline PERMITS_LIST*
+GetTaskPermitsList
+(
+    task_id_t           task, 
+    TASK_SOURCE *source_list
+)
+{   // NOTE: this function does not check the validity of the task ID.
+    uint32_t const thread_index = (task & TASK_ID_MASK_THREAD_P) >> TASK_ID_SHIFT_THREAD;
+    uint32_t const   tick_index = (task & TASK_ID_MASK_TICK_P  ) >> TASK_ID_SHIFT_TICK;
+    uint32_t const   task_index = (task & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
+    return &source_list[thread_index].PermitList[tick_index][task_index];
 }
 
 /// @summary Push an item onto the private end of a task queue. This function can only be called by the thread that owns the queue, and may execute concurrently with one or more steal operations.
@@ -482,11 +492,10 @@ CalculateMemoryForTaskSource
 )
 {
     size_t bytes_needed = 0;
-    bytes_needed += CalculateMemoryForTaskQueue(max_tasks_per_tick);                          // WorkQueue
-    bytes_needed += AllocationSizeForArray<task_id_t>(max_tasks_per_tick);                    // WTRDepsList
-    bytes_needed += AllocationSizeForArray<task_id_t>(max_tasks_per_tick);                    // WTRTaskList
-    bytes_needed += AllocationSizeForArray<WORK_ITEM>(max_tasks_per_tick) * max_active_ticks; // WorkItems
-    bytes_needed += AllocationSizeForArray<int32_t  >(max_tasks_per_tick) * max_active_ticks; // WorkCounts
+    bytes_needed += CalculateMemoryForTaskQueue(max_tasks_per_tick);                             // WorkQueue
+    bytes_needed += AllocationSizeForArray<WORK_ITEM   >(max_tasks_per_tick) * max_active_ticks; // WorkItems
+    bytes_needed += AllocationSizeForArray<int32_t     >(max_tasks_per_tick) * max_active_ticks; // WorkCounts
+    bytes_needed += AllocationSizeForArray<PERMITS_LIST>(max_tasks_per_tick) * max_active_ticks; // PermitList
     return bytes_needed;
 }
 
@@ -514,56 +523,6 @@ ExecuteComputeTask
         FinishTask(worker_source, task);
     }
     return rcode;
-}
-
-/// @summary Update the status of each task in a TASK_SOURCE waiting-to-run list, and launch any tasks that are now ready-to-run.
-/// @param source The TASK_SOURCE of the worker thread.
-internal_function void 
-TransitionWaitingToRunTasks
-(
-    TASK_SOURCE *source
-)
-{
-    if (source->WTRTaskCount == 0)
-    {   // there is no waiting-to-run list; avoid the fence.
-        return;
-    }
-
-    size_t wtr_index = 0;
-    // make sure we are reading the "latest" values.
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    // go through the WTR list and look for any tasks whose dependency has a work count of 0.
-    while (wtr_index < source->WTRTaskCount && source->WTRTaskCount > 0)
-    {
-        task_id_t dep_task  = source->WTRDepsList[wtr_index];
-        uint32_t  dep_valid = dep_task & TASK_ID_MASK_VALID_P;
-        int32_t  *dep_work;
-
-        if (dep_valid)
-        {
-            if ((dep_work = GetTaskWorkCount(dep_task, source->TaskSources)) != NULL)
-            {   // has the task we're waiting for finished?
-                if (*dep_work <= 0)
-                {   // yes, so place this task on the work queue.
-                    TaskQueuePush(&source->WorkQueue, source->WTRTaskList[wtr_index]);
-                    // and then remove the task from the waiting-to-run list.
-                    source->WTRDepsList[wtr_index] = source->WTRDepsList[source->WTRTaskCount-1];
-                    source->WTRTaskList[wtr_index] = source->WTRTaskList[source->WTRTaskCount-1];
-                    source->WTRTaskCount--;
-                    continue;
-                }
-            }
-            // check the next task in the waiting-to-run list.
-            wtr_index++;
-        }
-        else
-        {   // remove the task, which is no longer valid, from the waiting-to-run list.
-            source->WTRDepsList[wtr_index] = source->WTRDepsList[source->WTRTaskCount-1];
-            source->WTRTaskList[wtr_index] = source->WTRTaskList[source->WTRTaskCount-1];
-            source->WTRTaskCount--;
-            continue;
-        }
-    }
 }
 
 /// @summary Construct a list of waitable event handles that can be used to sleep a thread until termination time or a steal signal.
@@ -691,12 +650,11 @@ ComputeWorkerMain
                 // that task may have generated additional work.
                 // keep working as long as we can grab work to do.
                 if ((task = TaskQueueTake(&worker_source->WorkQueue)) == INVALID_TASK_ID)
-                {   // if no task was retrieved, see if anything is now ready-to-run.
-                    TransitionWaitingToRunTasks(worker_source);
-                    task = TaskQueueTake(&worker_source->WorkQueue);
+                {   // nothing left in the local queue, try to steal from the source that woke us.
+                    task = TaskQueueSteal(&wait_source[result - WAIT_OBJECT_0]->WorkQueue);
+                    // if task is INVALID_TASK_ID, this worker will go back to sleep.
                 }
             }
-            TransitionWaitingToRunTasks(worker_source);
         }
         else
         {   // some kind of error occurred while waiting. terminate the thread.
@@ -920,6 +878,7 @@ DefineTask
         task_id_t     task_id = MakeTaskId(buffer_id, SCHEDULER_TYPE_COMPUTE, task_index, source->SourceIndex);
         int32_t   &work_count = source->WorkCounts[buffer_id][task_index];
         WORK_ITEM &work_item  = source->WorkItems [buffer_id][task_index];
+        PERMITS_LIST &permit  = source->PermitList[buffer_id][task_index];
 
         work_item.BufferIndex = buffer_id;
         work_item.ParentTask  = parent_id;
@@ -928,15 +887,36 @@ DefineTask
         {   // we could first zero the work_item.TaskArgs memory.
             CopyMemory(work_item.TaskArgs, task_args, args_size);
         }
-        work_count = 2; // decremented in FinishTask.
+        permit.Count = 0;
+        work_count   = 2; // decremented in FinishTask.
 
         if (IsValidTask(wait_task) && (dep_wcount = GetTaskWorkCount(wait_task, source->TaskSources)) != NULL)
         {   // determine whether the dependency task has been completed.
+            PERMITS_LIST *p = GetTaskPermitsList(wait_task, source->TaskSources);
             if (InterlockedAdd((volatile LONG*) dep_wcount, 0) > 0)
-            {   // the dependency has not been completed, so this task goes on the waiting-to-run list.
-                source->WTRDepsList[source->WTRTaskCount] = wait_task;
-                source->WTRTaskList[source->WTRTaskCount] = task_id;
-                source->WTRTaskCount++;
+            {   // the dependency has not been completed, so update the permits list of the dependency.
+                // the permits list for wait_task could be accessed concurrently by other threads:
+                // - another thread could be executing DefineTask with the same wait_task.
+                // - another thread could be executing FinishTask for wait_task.
+                int32_t n;
+                do
+                {   // attempt to append the ID of the new task to the permits list of wait_task.
+                    if ((n = p->Count) == PERMITS_LIST::MAX_TASKS)
+                    {   // the best thing to do in this case is re-think your task breakdown.
+                        ConsoleError("ERROR: Exceeded max permits on task %08X when defining task %08X (parent %08X).\n", wait_task, task_id, parent_id);
+                        return task_id;
+                    }
+                    if (n < 0)
+                    {   // the wait_task completed during update of the permits list.
+                        // this new task can be added to the ready-to-run queue.
+                        TaskQueuePush(&source->WorkQueue, task_id);
+                        return task_id;
+                    }
+                    // append the task ID to the permit list of wait_task.
+                    p->Tasks[n] = task_id;
+                    // and then try to update the number of permits.
+                } while (InterlockedCompareExchange((volatile LONG*) &p->Count, n + 1, n) != n);
+
                 return task_id;
             }
         }
@@ -1209,14 +1189,12 @@ NewTaskSource
     source->MaxTasksPerTick  = max_tasks_per_tick;
     source->TaskSourceCount  = scheduler->MaxSourceCount;
     source->TaskSources      = scheduler->SourceList;
-    source->WTRTaskCount     = 0;
-    source->WTRDepsList      = PushArray<task_id_t>(arena, max_tasks_per_tick);
-    source->WTRTaskList      = PushArray<task_id_t>(arena, max_tasks_per_tick);
     for (size_t i = 0, n = max_active_ticks; i < n; ++i)
     {
         source->TaskCounts[i] = 0;
-        source->WorkItems [i] = PushArray<WORK_ITEM>(arena, max_tasks_per_tick);
-        source->WorkCounts[i] = PushArray<int32_t  >(arena, max_tasks_per_tick);
+        source->WorkItems [i] = PushArray<WORK_ITEM   >(arena, max_tasks_per_tick);
+        source->WorkCounts[i] = PushArray<int32_t     >(arena, max_tasks_per_tick);
+        source->PermitList[i] = PushArray<PERMITS_LIST>(arena, max_tasks_per_tick);
     }
     scheduler->SourceCount++;
     return source;
@@ -1435,6 +1413,17 @@ HaltScheduler
     }
 }
 
+/// @summary Wake exactly one waiting worker thread if there's work it could steal. Call this if several items are added to a work queue.
+/// @param source The TASK_SOURCE owned by the calling thread.
+public_function void
+SignalWaitingWorkers
+(
+    TASK_SOURCE *source
+)
+{
+    SetEvent(source->StealSignal);
+}
+
 /// @summary Retrieve the task source for the root thread. This function should only ever be called from the root thread (the thread that submits the root tasks.)
 /// @param scheduler The scheduler instance to query.
 /// @return A pointer to the worker state for the root thread, which can be used to spawn root tasks.
@@ -1508,7 +1497,8 @@ NewChildTask
 /// @summary Indicate that a task (including any children) has been completely defined and allow it to finish execution.
 /// @param source The source that defined the task. This should be the same source that was passed to NewTask.
 /// @param task The task ID returned by the NewTask call.
-public_function void
+/// @return The number of tasks added to the work queue of the calling thread.
+public_function int32_t
 FinishTask
 (
     TASK_SOURCE *source,
@@ -1520,20 +1510,25 @@ FinishTask
     {
         WORK_ITEM *work_item = GetTaskWorkItem(task, source->TaskSources);
         if (InterlockedDecrement((volatile LONG*) work_count) <= 0)
-        {   // the work item has finished executing. complete any parent task.
-            FinishTask(source, work_item->ParentTask);
+        {   // the work item has finished executing. this may permit other tasks to run.
+            PERMITS_LIST  *p = GetTaskPermitsList(task, source->TaskSources);
+            int32_t n = InterlockedExchange((volatile LONG*) &p->Count, -1);
+            if (n > 0)
+            {   // add the now-permitted tasks to the work queue of the calling thread.
+                for (int32_t i = 0; i < n; ++i)
+                {
+                    TaskQueuePush(&source->WorkQueue, p->Tasks[i]);
+                }
+            }
+            // decrement the work counter on any parent task.
+            n += FinishTask(source, work_item->ParentTask);
+            if (n > 0)
+            {   // wake up idle threads to help work.
+                SignalWaitingWorkers(source);
+            }
+            return n;
         }
     }
-}
-
-/// @summary Wake exactly one waiting worker thread if there's work it could steal. Call this if several items are added to a work queue.
-/// @param source The TASK_SOURCE owned by the calling thread.
-public_function void
-SignalWaitingWorkers
-(
-    TASK_SOURCE *source
-)
-{
-    SetEvent(source->StealSignal);
+    return 0;
 }
 
