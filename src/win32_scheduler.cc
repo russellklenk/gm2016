@@ -154,13 +154,13 @@ struct PERMITS_LIST
 /// The worker thread can perform push and take operations. Other worker threads can perform concurrent steal operations.
 struct TASK_QUEUE
 {   static size_t const ALIGNMENT           = CACHELINE_SIZE;
-    static size_t const PAD                 = CACHELINE_SIZE - sizeof(std::atomic<uint32_t>);
-    typedef std::atomic<uint32_t> index_t;/// An atomic index used to represent the ends of the queue.
+    static size_t const PAD                 = CACHELINE_SIZE - sizeof(std::atomic<int64_t>);
+    typedef std::atomic<int64_t> index_t; /// An atomic index used to represent the ends of the queue.
     index_t             Pub;              /// The public end of the deque, updated by steal operations (Top).
     uint8_t             Pad0[PAD];        /// Padding separating the public data from the private data.
     index_t             Prv;              /// The private end of the deque, updated by push and take operations (Bottom).
     uint8_t             Pad1[PAD];        /// Padding separating the private data from the storage data.
-    uint32_t            Mask;             /// The bitmask used to map the Top and Bottom indices into the storage array.
+    int64_t             Mask;             /// The bitmask used to map the Top and Bottom indices into the storage array.
     task_id_t          *Tasks;            /// The identifiers for the tasks in the queue.
 };
 
@@ -360,18 +360,14 @@ TaskQueuePush
     task_id_t    task
 )
 {   // Pub = Top (Steal), Prv = Bottom (Push/Take)
-    uint32_t b   = queue->Prv.load(std::memory_order_relaxed);
-    uint32_t t   = queue->Pub.load(std::memory_order_acquire);
-    if ((b - t) <= queue->Mask)
-    {   // the queue is not full, so enqueue the item at the private end.
-        queue->Tasks[b & queue->Mask] = task;
-        // ensure that the task ID is written before bumping the index.
-        std::atomic_thread_fence(std::memory_order_release);
-        // make the item visible to other threads.
-        queue->Prv.store(b + 1, std::memory_order_relaxed);
-        return true;
-    }
-    else return false; // the queue is currently full.
+    int64_t  b   = queue->Prv.load(std::memory_order_relaxed);
+    // enqueue the new task at the private end of the queue.
+    queue->Tasks[b & queue->Mask] = task;
+    // ensure that the task ID is written to the Tasks array.
+    std::atomic_thread_fence(std::memory_order_release);
+    // make the new task visible to other threads.
+    queue->Prv.store(b + 1, std::memory_order_relaxed);
+    return true;
 }
 
 /// @summary Take an item from the private end of a task queue. This function can only be called by the thread that owns the queue, and may execute concurrently with one or more steal operations.
@@ -383,11 +379,11 @@ TaskQueueTake
     TASK_QUEUE *queue
 )
 {
-    uint32_t b = queue->Prv.load(std::memory_order_relaxed) - 1;
+    int64_t  b = queue->Prv.load(std::memory_order_relaxed) - 1;
     queue->Prv.store(b, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
-    uint32_t t = queue->Pub.load(std::memory_order_relaxed);
+    int64_t  t = queue->Pub.load(std::memory_order_relaxed);
     if (t <= b)
     {   // the task queue is non-empty.
         task_id_t task = queue->Tasks[b & queue->Mask];
@@ -401,10 +397,14 @@ TaskQueueTake
         {   // this thread lost the race.
             task = INVALID_TASK_ID;
         }
-        queue->Prv.store(b+1, std::memory_order_relaxed);
+        queue->Prv.store(t + 1, std::memory_order_relaxed); // WAS: b + 1
         return task;
     }
-    else return INVALID_TASK_ID; // the queue is currently empty.
+    else
+    {
+        queue->Prv.store(t, std::memory_order_relaxed);
+        return INVALID_TASK_ID; // the queue is currently empty.
+    }
 }
 
 /// @summary Attempt to steal an item from the public end of the queue. This function can be called by any thread EXCEPT the thread that owns the queue, and may execute concurrently with a push or take operation, and one or more steal operations.
@@ -416,9 +416,9 @@ TaskQueueSteal
     TASK_QUEUE *queue
 )
 {
-    uint32_t t = queue->Pub.load(std::memory_order_acquire);
+    int64_t t = queue->Pub.load(std::memory_order_acquire);
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    uint32_t b = queue->Prv.load(std::memory_order_acquire);
+    int64_t b = queue->Prv.load(std::memory_order_acquire);
 
     if (t < b)
     {   // the task queue is non-empty. save the task ID.
@@ -464,7 +464,7 @@ CreateTaskQueue
     assert((capacity & (capacity - 1)) == 0);
     queue->Pub.store(0, std::memory_order_relaxed);
     queue->Prv.store(0, std::memory_order_relaxed);
-    queue->Mask  = uint32_t(capacity) - 1;
+    queue->Mask  = int64_t(capacity) - 1;
     queue->Tasks = PushArray<task_id_t>(arena, capacity);
 }
 
