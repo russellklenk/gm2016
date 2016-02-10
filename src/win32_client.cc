@@ -634,6 +634,9 @@ WinMain
             next_tick =(current_tick - miss_time) + SliceOfSecond(60);
         }
         // work work work
+        // TODO(rlk): Need to have a SchedulerTickBegin and SourceTickBegin to reset the TASK_SOURCE::TaskCounts[next_buffer_index] to 0.
+        // We're running out of space in the task buffers because the count is never being reset.
+        // Also need to wait until the next buffer is 'available' for use (all tasks have completed.)
         ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(current_tick) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
         LAUNCH_TASK_DATA launch_data = { workspace, workspace_size };
         FENCE_TASK_DATA  fence_data  = { workspace, workspace_size, ev_fence };
