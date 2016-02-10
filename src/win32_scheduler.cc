@@ -84,7 +84,7 @@
 typedef uint32_t task_id_t;
 
 /// @summary Define the function signature for a task entrypoint.
-typedef int (*TASK_ENTRY)(struct TASK_SOURCE*, struct WORK_ITEM*, MEMORY_ARENA*, WIN32_THREAD_ARGS*);
+typedef int (*TASK_ENTRY)(task_id_t, struct TASK_SOURCE*, struct WORK_ITEM*, MEMORY_ARENA*, WIN32_THREAD_ARGS*);
 
 /// @summary Define identifiers for task ID validity. An ID can only be valid or invalid.
 enum TASK_ID_TYPE : uint32_t
@@ -519,7 +519,7 @@ ExecuteComputeTask
     if (IsValidTask(task) && (work_item = GetTaskWorkItem(task, worker_source->TaskSources)) != NULL)
     {   // TODO(rlk): do something with the return value? or not?
         ArenaReset(task_arena);
-        rcode = work_item->TaskMain(worker_source, work_item, task_arena, thread_args);
+        rcode = work_item->TaskMain(task, worker_source, work_item, task_arena, thread_args);
         FinishTask(worker_source, task);
     }
     return rcode;
