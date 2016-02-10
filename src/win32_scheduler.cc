@@ -1177,14 +1177,17 @@ NewTaskSource
         return NULL;
     }
 
-    size_t const  PER_GROUP  = 64;
-    size_t        remaining  = scheduler->MaxSourceCount - scheduler->SourceCount;
+    size_t const  PER_GROUP  =  64;
+    size_t       num_groups  =((scheduler->MaxSourceCount - 1) / PER_GROUP) + 1;
+    size_t        remaining  =  scheduler->MaxSourceCount - (PER_GROUP * (num_groups - 1));
+    size_t       last_group  =  num_groups - 1;
+    size_t       this_group  =  scheduler->SourceCount / PER_GROUP;
     TASK_SOURCE     *source  = &scheduler->SourceList[scheduler->SourceCount];
     CreateTaskQueue(&source->WorkQueue, max_tasks_per_tick, arena);
     source->StealSignal      = CreateEvent(NULL, FALSE, FALSE, NULL); // auto-reset
-    source->GroupIndex       = scheduler->SourceCount / PER_GROUP;
+    source->GroupIndex       = this_group;
     source->SourceIndex      =(uint32_t)  scheduler->SourceCount;
-    source->SourceGroupSize  =(uint32_t) (remaining < PER_GROUP ? remaining : PER_GROUP);
+    source->SourceGroupSize  =(uint32_t)((this_group == last_group) ? remaining : PER_GROUP);
     source->MaxTicksInFlight = max_active_ticks;
     source->MaxTasksPerTick  = max_tasks_per_tick;
     source->TaskSourceCount  = scheduler->MaxSourceCount;
