@@ -51,6 +51,25 @@
 /*//////////////////
 //   Data Types   //
 //////////////////*/
+struct LAUNCH_TASK_DATA
+{
+    uint8_t *Array;
+    size_t   Count;
+};
+
+struct TEST_TASK_DATA
+{
+    uint8_t *Array;
+    size_t   Index;
+    size_t   Count;
+};
+
+struct FENCE_TASK_DATA
+{
+    uint8_t *Array;
+    size_t   Count;
+    HANDLE   Signal;
+};
 
 /*///////////////
 //   Globals   //
@@ -60,51 +79,81 @@
 //   Internal Functions   //
 //////////////////////////*/
 internal_function int
-TaskEntryA
+TestTaskMain
 (
+    task_id_t                   id,
     TASK_SOURCE            *source, 
     WORK_ITEM                *task, 
     MEMORY_ARENA            *arena, 
     WIN32_THREAD_ARGS *thread_args
 )
 {
+    UNUSED_ARG(id);
     UNUSED_ARG(source);
-    UNUSED_ARG(task);
     UNUSED_ARG(arena);
     UNUSED_ARG(thread_args);
-    ConsoleOutput("Executed task A.\n");
+
+    TEST_TASK_DATA *args = (TEST_TASK_DATA*) task->TaskArgs;
+    for (size_t i = args->Index, e = args->Index + args->Count; i < e; ++i)
+    {
+        args->Array[i] = 1;
+    }
     return 0;
 }
+
 internal_function int
-TaskEntryB
+LaunchTaskMain
 (
+    task_id_t                   id,
     TASK_SOURCE            *source, 
     WORK_ITEM                *task, 
     MEMORY_ARENA            *arena, 
     WIN32_THREAD_ARGS *thread_args
 )
 {
-    UNUSED_ARG(source);
-    UNUSED_ARG(task);
     UNUSED_ARG(arena);
     UNUSED_ARG(thread_args);
-    ConsoleOutput("Executed task B.\n");
+    
+    LAUNCH_TASK_DATA *args = (LAUNCH_TASK_DATA*) task->TaskArgs;
+    ZeroMemory(args->Array,args->Count * sizeof(uint8_t));
+    for (size_t i = 0; i < args->Count; /* empty */)
+    {   // each child task will set up to 64 consecutive values to 1.
+        // this should prevent cache contention between tasks.
+        size_t         n = (args->Count- i) >= 64 ? 64 : (args->Count - i);
+        TEST_TASK_DATA a = {args->Array, i, n};
+        task_id_t  child =  NewChildTask(source, TestTaskMain, &a, sizeof(TEST_TASK_DATA), id);
+        FinishTask(source,  child);
+        SignalWaitingWorkers(source);
+        i += n;
+    }
     return 0;
 }
+
 internal_function int
-TaskEntryC
+FenceTaskMain
 (
+    task_id_t                   id,
     TASK_SOURCE            *source, 
     WORK_ITEM                *task, 
     MEMORY_ARENA            *arena, 
     WIN32_THREAD_ARGS *thread_args
 )
 {
+    UNUSED_ARG(id);
     UNUSED_ARG(source);
-    UNUSED_ARG(task);
     UNUSED_ARG(arena);
     UNUSED_ARG(thread_args);
-    ConsoleOutput("Executed task C.\n");
+    
+    FENCE_TASK_DATA *args = (FENCE_TASK_DATA*) task->TaskArgs;
+    bool               ok =  true;
+    for (size_t i = 0,  n =  args->Count; i < n; ++i)
+    {
+        if (args->Array[i] != 1)
+            ok = false;
+    }
+    if (ok) ConsoleOutput("All tasks completed successfully!\n");
+    else ConsoleOutput("One or more tasks failed.\n");
+    SetEvent(args->Signal);
     return 0;
 }
 
@@ -418,6 +467,7 @@ WinMain
     WIN32_COMPUTE_TASK_SCHEDULER   task_scheduler = {};   // scheduler for non-blocking, compute-oriented tasks
     HANDLE                               ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+    HANDLE                               ev_fence = CreateEvent(NULL, FALSE,FALSE, NULL); // auto-reset
     HANDLE                            thread_draw = NULL; // frame composition thread and main UI thread
     HANDLE                            thread_disk = NULL; // asynchronous disk I/O thread
     HANDLE                            thread_net  = NULL; // network I/O thread
@@ -426,10 +476,14 @@ WinMain
     uint64_t                        previous_tick = 0;    // the launch time of the previous tick
     uint64_t                            miss_time = 0;    // number of nanoseconds over the launch time
     DWORD                               wait_time = 0;    // number of milliseconds the timer thread will sleep for
+    uint32_t                           tick_index = 0;
     HWND                           message_window = NULL; // for receiving input and notification from other threads
     bool                             keep_running = true;
     size_t const                  main_arena_size = Megabytes(128);
     size_t const                default_alignment = std::alignment_of<void*>::value;
+
+    size_t const                   workspace_size = 65535;
+    uint8_t             workspace[workspace_size] = {};
 
     UNUSED_ARG(prev_instance);
     UNUSED_ARG(command_line);
@@ -580,14 +634,15 @@ WinMain
             next_tick =(current_tick - miss_time) + SliceOfSecond(60);
         }
         // work work work
-        task_id_t a = NewTask(GetRootTaskSource(&task_scheduler), TaskEntryA, NULL, 0, 0);
-        task_id_t b = NewChildTask(GetRootTaskSource(&task_scheduler), TaskEntryB, NULL, 0, a);
-        FinishTask(GetRootTaskSource(&task_scheduler), b);
-        FinishTask(GetRootTaskSource(&task_scheduler), a);
-        task_id_t c = NewTask(GetRootTaskSource(&task_scheduler), TaskEntryC, NULL, 0, 0, a);
-        FinishTask(GetRootTaskSource(&task_scheduler), c);
-        SignalWaitingWorkers(GetRootTaskSource(&task_scheduler));
         ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(current_tick) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
+        LAUNCH_TASK_DATA launch_data = { workspace, workspace_size };
+        FENCE_TASK_DATA  fence_data  = { workspace, workspace_size, ev_fence };
+        task_id_t        launch_task = NewTask(GetRootTaskSource(&task_scheduler), LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA), tick_index);
+        task_id_t        fence_task  = NewTask(GetRootTaskSource(&task_scheduler), FenceTaskMain , &fence_data , sizeof(FENCE_TASK_DATA ), tick_index, launch_task);
+        FinishTask(GetRootTaskSource(&task_scheduler), fence_task);
+        FinishTask(GetRootTaskSource(&task_scheduler), launch_task);
+        SignalWaitingWorkers(GetRootTaskSource(&task_scheduler));
+        WaitForSingleObject(ev_fence, INFINITE);
 
         // all work for the current tick has completed.
         if ((previous_tick = TimestampInNanoseconds()) < next_tick)
@@ -598,6 +653,7 @@ WinMain
                 Sleep(wait_time);
             }
         }
+        tick_index++;
         UNUSED_LOCAL(input_events);
     }
 
