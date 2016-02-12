@@ -1,0 +1,7 @@
+Scheduler clear source TaskCounts[next_tick] to 0 for all workers.
+Continue to test scheduler and fix functional issues.
+Profile scheduler and ensure expected behavior is observed.
+Basic renderer (software for now?)
+Be able to move a simple colored box on the screen.
+Figure out networking.
+
