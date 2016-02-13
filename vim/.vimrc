@@ -3,10 +3,18 @@ syntax on
 set laststatus=2
 set statusline=%F%m%r%h%w\ [FORMAT=%{&ff}]\ [TYPE=%Y]\ [POS=%l,%v][%p%%]\ %{strftime(\"%m/%d/%y\ -\ %H:%M\")}
 
-set term=xterm
-set t_Co=256
-let &t_AB="\e[48;5;%dm"
-let &t_AF="\e[38;5;%dm"
+set background=dark
+
+if !has("gui_running")
+    set term=xterm
+    set t_Co=256
+    let &t_AB="\e[48;5;%dm"
+    let &t_AF="\e[38;5;%dm"
+else
+    set visualbell t_vb=
+    set guifont=PragmataPro:h12:cANSI
+    au GuiEnter * set visualbell t_vb=
+endif
 
 set nu
 set nocompatible
