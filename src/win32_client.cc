@@ -116,16 +116,21 @@ LaunchTaskMain
     
     LAUNCH_TASK_DATA *args = (LAUNCH_TASK_DATA*) task->TaskArgs;
     ZeroMemory(args->Array,args->Count * sizeof(uint8_t));
-    for (size_t i = 0; i < args->Count; /* empty */)
+    for (size_t i = 0, x = 0; i < args->Count; ++x)
     {   // each child task will set up to 64 consecutive values to 1.
         // this should prevent cache contention between tasks.
         size_t         n = (args->Count- i) >= 64 ? 64 : (args->Count - i);
         TEST_TASK_DATA a = {args->Array, i, n};
         task_id_t  child =  NewChildTask(source, TestTaskMain, &a, sizeof(TEST_TASK_DATA), id);
         FinishTask(source,  child);
-        SignalWaitingWorkers(source);
         i += n;
+
+        // wake someone up to help after a few tasks have been added.
+        // this helps to distribute the workload between worker threads
+        // while avoiding constantly pinging the event, which is expensive.
+        if (x & 7) SignalWaitingWorkers(source);
     }
+    SignalWaitingWorkers(source);
     return 0;
 }
 
@@ -151,8 +156,8 @@ FenceTaskMain
         if (args->Array[i] != 1)
             ok = false;
     }
-    if (ok) ConsoleOutput("All tasks completed successfully!\n");
-    else ConsoleOutput("One or more tasks failed.\n");
+    //if (ok) ConsoleOutput("All tasks completed successfully!\n");
+    //else ConsoleOutput("One or more tasks failed.\n");
     SetEvent(args->Signal);
     return 0;
 }
