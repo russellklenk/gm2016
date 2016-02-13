@@ -476,7 +476,6 @@ WinMain
     uint64_t                        previous_tick = 0;    // the launch time of the previous tick
     uint64_t                            miss_time = 0;    // number of nanoseconds over the launch time
     DWORD                               wait_time = 0;    // number of milliseconds the timer thread will sleep for
-    uint32_t                           tick_index = 0;
     HWND                           message_window = NULL; // for receiving input and notification from other threads
     bool                             keep_running = true;
     size_t const                  main_arena_size = Megabytes(128);
@@ -640,8 +639,8 @@ WinMain
         ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(current_tick) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
         LAUNCH_TASK_DATA launch_data = { workspace, workspace_size };
         FENCE_TASK_DATA  fence_data  = { workspace, workspace_size, ev_fence };
-        task_id_t        launch_task = NewTask(GetRootTaskSource(&task_scheduler), LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA), tick_index);
-        task_id_t        fence_task  = NewTask(GetRootTaskSource(&task_scheduler), FenceTaskMain , &fence_data , sizeof(FENCE_TASK_DATA ), tick_index, launch_task);
+        task_id_t        launch_task = NewTask(GetRootTaskSource(&task_scheduler), LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA));
+        task_id_t        fence_task  = NewTask(GetRootTaskSource(&task_scheduler), FenceTaskMain , &fence_data , sizeof(FENCE_TASK_DATA ) , launch_task);
         FinishTask(GetRootTaskSource(&task_scheduler), fence_task);
         FinishTask(GetRootTaskSource(&task_scheduler), launch_task);
         SignalWaitingWorkers(GetRootTaskSource(&task_scheduler));
@@ -656,7 +655,6 @@ WinMain
                 Sleep(wait_time);
             }
         }
-        tick_index++;
         UNUSED_LOCAL(input_events);
     }
 

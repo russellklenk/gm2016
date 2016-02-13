@@ -15,13 +15,13 @@
 /// Where the letters mean the following:
 /// V: Set if the ID is valid, clear if the ID is not valid.
 /// W: The zero-based index of the worker thread. The system supports up to 4095 worker threads, plus 1 to represent the thread that submits the root tasks.
-/// I: The zero-based index of the task data within the worker thread's tick buffer.
+/// I: The zero-based index of the task data within the worker thread's task buffer.
 /// C: Set if the task is a compute-oriented task, clear if the task is a more traditional async task.
 /// B: The zero-based index of the task buffer. The system supports up to 4 ticks in-flight simultaneously.
 #ifndef TASK_ID_LAYOUT_DEFINED
 #define TASK_ID_LAYOUT_DEFINED
-#define TASK_ID_MASK_TICK_P               (0x00000003UL)
-#define TASK_ID_MASK_TICK_U               (0x00000003UL)
+#define TASK_ID_MASK_BUFFER_P             (0x00000003UL)
+#define TASK_ID_MASK_BUFFER_U             (0x00000003UL)
 #define TASK_ID_MASK_TYPE_P               (0x00000004UL)
 #define TASK_ID_MASK_TYPE_U               (0x00000001UL)
 #define TASK_ID_MASK_INDEX_P              (0x0007FFF8UL)
@@ -30,7 +30,7 @@
 #define TASK_ID_MASK_THREAD_U             (0x00000FFFUL)
 #define TASK_ID_MASK_VALID_P              (0x80000000UL)
 #define TASK_ID_MASK_VALID_U              (0x00000001UL)
-#define TASK_ID_SHIFT_TICK                (0)
+#define TASK_ID_SHIFT_BUFFER              (0)
 #define TASK_ID_SHIFT_TYPE                (2)
 #define TASK_ID_SHIFT_INDEX               (3)
 #define TASK_ID_SHIFT_THREAD              (19)
@@ -133,11 +133,11 @@ struct ASYNC_WORKER
 /// @summary Define the data associated with a work item.
 struct WORK_ITEM
 {   static size_t const MAX_DATA = 48;    /// The maximum amount of data that can be passed to the task.
-    uint32_t            BufferIndex;      /// The zero-based index of the tick buffer containing the task.
+    uint32_t            Reserved0;        /// This value is reserved for future use.
     task_id_t           ParentTask;       /// The identifier of the parent task, or INVALID_TASK_ID.
     TASK_ENTRY          TaskMain;         /// The task entry point.
 #if TARGET_ARCHITECTURE == ARCHITECTURE_X86_32 || TARGET_ARCHITECTURE == ARCHITECTURE_ARM_32
-    uint32_t            Reserved;         /// Padding; unused.
+    uint32_t            Reserved1;        /// Padding; unused.
 #endif
     uint8_t             TaskArgs[MAX_DATA]; /// User-supplied argument data associated with the work item.
 };
@@ -185,8 +185,10 @@ struct TASK_SOURCE
     size_t              MaxTasksPerTick;  /// The maximum number of tasks that can be created in a given tick. Constant.
     size_t              TaskSourceCount;  /// The total number of task sources defined in the scheduler. Constant.
     TASK_SOURCE        *TaskSources;      /// The list of per-source state for each task source. Managed by the scheduler.
+    
+    uint32_t            BufferIndex;      /// The zero-based index of the task buffer being written to.
+    uint32_t            TaskCount;        /// The zero-based index of the next available task in the current buffer.
 
-    uint32_t            TaskCounts[4];    /// The number of tasks defined for each in-flight tick.
     WORK_ITEM          *WorkItems [4];    /// The work item definitions for each task, for each in-flight tick.
     int32_t            *WorkCounts[4];    /// The outstanding work counter for each task, for each in-flight tick.
     PERMITS_LIST       *PermitList[4];    /// The permits list for each task, for each in-flight tick.
@@ -249,7 +251,7 @@ public_function int32_t      FinishTask(TASK_SOURCE*, task_id_t);
 //   Internal Functions   //
 //////////////////////////*/
 /// @summary Create a task ID from its constituient parts.
-/// @param tick_index The zero-based index of the in-flight tick.
+/// @param buffer_index The zero-based index of the task buffer.
 /// @param scheduler_type The type of scheduler that owns the task. One of SCHEDULER_TYPE.
 /// @param task_index The zero-based index of the task within the task list for this tick in the thread that created the task.
 /// @param thread_index The zero-based index of the thread that created the task.
@@ -258,14 +260,14 @@ public_function int32_t      FinishTask(TASK_SOURCE*, task_id_t);
 internal_function inline task_id_t
 MakeTaskId
 (
-    uint32_t     tick_index, 
+    uint32_t   buffer_index, 
     uint32_t scheduler_type, 
     uint32_t     task_index, 
     uint32_t   thread_index, 
     uint32_t   task_id_type = TASK_ID_TYPE_VALID
 )
 {
-    return ((tick_index     & TASK_ID_MASK_TICK_U  ) << TASK_ID_SHIFT_TICK  ) | 
+    return ((buffer_index   & TASK_ID_MASK_BUFFER_U) << TASK_ID_SHIFT_BUFFER) | 
            ((scheduler_type & TASK_ID_MASK_TYPE_U  ) << TASK_ID_SHIFT_TYPE  ) | 
            ((task_index     & TASK_ID_MASK_INDEX_U ) << TASK_ID_SHIFT_INDEX ) |
            ((thread_index   & TASK_ID_MASK_THREAD_U) << TASK_ID_SHIFT_THREAD) | 
@@ -296,9 +298,9 @@ GetTaskWorkItem
 )
 {   // NOTE: this function does not check the validity of the task ID.
     uint32_t const thread_index = (task & TASK_ID_MASK_THREAD_P) >> TASK_ID_SHIFT_THREAD;
-    uint32_t const   tick_index = (task & TASK_ID_MASK_TICK_P  ) >> TASK_ID_SHIFT_TICK;
+    uint32_t const buffer_index = (task & TASK_ID_MASK_BUFFER_P) >> TASK_ID_SHIFT_BUFFER;
     uint32_t const   task_index = (task & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
-    return &source_list[thread_index].WorkItems[tick_index][task_index];
+    return &source_list[thread_index].WorkItems[buffer_index][task_index];
 }
 
 /// @summary Retrieve the work item for a given task ID.
@@ -327,9 +329,9 @@ GetTaskWorkCount
 )
 {   // NOTE: this function does not check the validity of the task ID.
     uint32_t const thread_index = (task & TASK_ID_MASK_THREAD_P) >> TASK_ID_SHIFT_THREAD;
-    uint32_t const   tick_index = (task & TASK_ID_MASK_TICK_P  ) >> TASK_ID_SHIFT_TICK;
+    uint32_t const buffer_index = (task & TASK_ID_MASK_BUFFER_P) >> TASK_ID_SHIFT_BUFFER;
     uint32_t const   task_index = (task & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
-    return &source_list[thread_index].WorkCounts[tick_index][task_index];
+    return &source_list[thread_index].WorkCounts[buffer_index][task_index];
 }
 
 /// @summary Retrieve the list of permits for a given task ID.
@@ -344,9 +346,9 @@ GetTaskPermitsList
 )
 {   // NOTE: this function does not check the validity of the task ID.
     uint32_t const thread_index = (task & TASK_ID_MASK_THREAD_P) >> TASK_ID_SHIFT_THREAD;
-    uint32_t const   tick_index = (task & TASK_ID_MASK_TICK_P  ) >> TASK_ID_SHIFT_TICK;
+    uint32_t const buffer_index = (task & TASK_ID_MASK_BUFFER_P) >> TASK_ID_SHIFT_BUFFER;
     uint32_t const   task_index = (task & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
-    return &source_list[thread_index].PermitList[tick_index][task_index];
+    return &source_list[thread_index].PermitList[buffer_index][task_index];
 }
 
 /// @summary Push an item onto the private end of a task queue. This function can only be called by the thread that owns the queue, and may execute concurrently with one or more steal operations.
@@ -517,7 +519,7 @@ ExecuteComputeTask
     int        rcode = 0;
     WORK_ITEM *work_item;
     if (IsValidTask(task) && (work_item = GetTaskWorkItem(task, worker_source->TaskSources)) != NULL)
-    {   // TODO(rlk): do something with the return value? or not?
+    {
         ArenaReset(task_arena);
         rcode = work_item->TaskMain(task, worker_source, work_item, task_arena, thread_args);
         FinishTask(worker_source, task);
@@ -663,7 +665,7 @@ ComputeWorkerMain
     }
 
 terminate_worker:
-    ConsoleOutput("Compute worker thread %u terminated.\n", thread_args->ThreadIndex);
+    ConsoleOutput("Compute worker thread %zu terminated.\n", thread_args->ThreadIndex);
     return 0;
 }
 /// @summary Attempt to spawn a new asynchronous task worker thread.
@@ -851,7 +853,6 @@ CalculateMemoryForComputeScheduler
 /// @param task_main The entry point of the task.
 /// @param task_args User-supplied argument data for the task instance. This data is copied into the task.
 /// @param args_size The number of bytes of argument data to copy into the task.
-/// @param buffer_id The zero-based index of the task definition buffer where the task definition will be stored.
 /// @param parent_id The identifier of the parent task, or INVALID_TASK_ID.
 /// @param wait_task The identifier of the task that must complete prior to executing this new task, or INVALID_TASK_ID.
 /// @return The identifier of the new task, or INVALID_TASK_ID.
@@ -862,76 +863,82 @@ DefineTask
     TASK_ENTRY    task_main, 
     void   const *task_args, 
     size_t const  args_size, 
-    uint32_t      buffer_id, 
     task_id_t     parent_id, 
     task_id_t     wait_task
 )
 {
     if (args_size > WORK_ITEM::MAX_DATA)
     {   // there's too much data being passed. the caller should allocate storage elsewhere and pass us the pointer.
+        ConsoleError("ERROR: Argument data too large when defining task (parent %08X). Passing %zu bytes, max is %zu bytes.\n", parent_id, args_size, WORK_ITEM::MAX_DATA); 
         return INVALID_TASK_ID;
     }
-    if (source->TaskCounts[buffer_id] < source->MaxTasksPerTick)
-    {   // there's room to define a new task, so proceed.
-        int32_t   *dep_wcount;
-        uint32_t   task_index = source->TaskCounts[buffer_id]++;
-        task_id_t     task_id = MakeTaskId(buffer_id, SCHEDULER_TYPE_COMPUTE, task_index, source->SourceIndex);
-        int32_t   &work_count = source->WorkCounts[buffer_id][task_index];
-        WORK_ITEM &work_item  = source->WorkItems [buffer_id][task_index];
-        PERMITS_LIST &permit  = source->PermitList[buffer_id][task_index];
-
-        work_item.BufferIndex = buffer_id;
-        work_item.ParentTask  = parent_id;
-        work_item.TaskMain    = task_main;
-        if (task_args != NULL && args_size > 0)
-        {   // we could first zero the work_item.TaskArgs memory.
-            CopyMemory(work_item.TaskArgs, task_args, args_size);
+    if (source->TaskCount  == source->MaxTasksPerTick)
+    {   // Bump the buffer index to the next buffer.
+        source->TaskCount   = 0; // reset the task counter for the new "current" buffer.
+        source->BufferIndex =(source->BufferIndex + 1) % source->MaxTicksInFlight;
+        int32_t *work_count =&source->WorkCounts[source->BufferIndex][0];
+        if (InterlockedAdd((volatile LONG*) work_count, 0) > 0)
+        {   // Defining a new task would overwrite an active task. This check isn't thorough, but it's quick.
+            ConsoleError("ERROR: Active task overwrite when defining task (parent %08X). Increase TASK_SOURCE MaxTasksPerTick.\n", parent_id);
+            return INVALID_TASK_ID;
         }
-        permit.Count = 0;
-        work_count   = 2; // decremented in FinishTask.
+    }
 
-        if (IsValidTask(wait_task) && (dep_wcount = GetTaskWorkCount(wait_task, source->TaskSources)) != NULL)
-        {   // determine whether the dependency task has been completed.
-            PERMITS_LIST *p = GetTaskPermitsList(wait_task, source->TaskSources);
-            if (InterlockedAdd((volatile LONG*) dep_wcount, 0) > 0)
-            {   // the dependency has not been completed, so update the permits list of the dependency.
-                // the permits list for wait_task could be accessed concurrently by other threads:
-                // - another thread could be executing DefineTask with the same wait_task.
-                // - another thread could be executing FinishTask for wait_task.
-                int32_t n;
-                do
-                {   // attempt to append the ID of the new task to the permits list of wait_task.
-                    if ((n = p->Count) == PERMITS_LIST::MAX_TASKS)
-                    {   // the best thing to do in this case is re-think your task breakdown.
-                        ConsoleError("ERROR: Exceeded max permits on task %08X when defining task %08X (parent %08X).\n", wait_task, task_id, parent_id);
-                        return task_id;
-                    }
-                    if (n < 0)
-                    {   // the wait_task completed during update of the permits list.
-                        // this new task can be added to the ready-to-run queue.
-                        TaskQueuePush(&source->WorkQueue, task_id);
-                        return task_id;
-                    }
-                    // append the task ID to the permit list of wait_task.
-                    p->Tasks[n] = task_id;
-                    // and then try to update the number of permits.
-                } while (InterlockedCompareExchange((volatile LONG*) &p->Count, n + 1, n) != n);
+    int32_t   *dep_wcount;
+    uint32_t buffer_index = source->BufferIndex;
+    uint32_t   task_index = source->TaskCount++;
+    task_id_t     task_id = MakeTaskId(buffer_index, SCHEDULER_TYPE_COMPUTE, task_index, source->SourceIndex);
+    int32_t   &work_count = source->WorkCounts[buffer_index][task_index];
+    WORK_ITEM &work_item  = source->WorkItems [buffer_index][task_index];
+    PERMITS_LIST &permit  = source->PermitList[buffer_index][task_index];
 
-                return task_id;
-            }
+    work_item.Reserved0   = 0;
+    work_item.ParentTask  = parent_id;
+    work_item.TaskMain    = task_main;
+    if (task_args != NULL && args_size > 0)
+    {   // we could first zero the work_item.TaskArgs memory.
+        CopyMemory(work_item.TaskArgs, task_args, args_size);
+    }
+    permit.Count = 0;
+    work_count   = 2; // decremented in FinishTask.
+
+    if (IsValidTask(wait_task) && (dep_wcount = GetTaskWorkCount(wait_task, source->TaskSources)) != NULL)
+    {   // determine whether the dependency task has been completed.
+        PERMITS_LIST *p = GetTaskPermitsList(wait_task, source->TaskSources);
+        if (InterlockedAdd((volatile LONG*) dep_wcount, 0) > 0)
+        {   // the dependency has not been completed, so update the permits list of the dependency.
+            // the permits list for wait_task could be accessed concurrently by other threads:
+            // - another thread could be executing DefineTask with the same wait_task.
+            // - another thread could be executing FinishTask for wait_task.
+            int32_t n;
+            do
+            {   // attempt to append the ID of the new task to the permits list of wait_task.
+                if ((n = p->Count) == PERMITS_LIST::MAX_TASKS)
+                {   // the best thing to do in this case is re-think your task breakdown.
+                    ConsoleError("ERROR: Exceeded max permits on task %08X when defining task %08X (parent %08X).\n", wait_task, task_id, parent_id);
+                    return task_id;
+                }
+                if (n < 0)
+                {   // the wait_task completed during update of the permits list.
+                    // this new task can be added to the ready-to-run queue.
+                    TaskQueuePush(&source->WorkQueue, task_id);
+                    return task_id;
+                }
+                // append the task ID to the permit list of wait_task.
+                p->Tasks[n] = task_id;
+                // and then try to update the number of permits.
+            } while (InterlockedCompareExchange((volatile LONG*) &p->Count, n + 1, n) != n);
+
+            return task_id;
         }
+    }
 
-        // this task is ready-to-run, so add it directly to the work queue.
-        // it may be executed before LaunchTask is called, but that's ok - 
-        // the work_count value is 2, so it cannot complete until LaunchTask.
-        // this allows child tasks to be safely spawned from the main task.
-        TaskQueuePush(&source->WorkQueue, task_id);
-        return task_id;
-    }
-    else
-    {   // no additional tasks can be defined in the current tick.
-        return INVALID_TASK_ID;
-    }
+    // this task is ready-to-run, so add it directly to the work queue.
+    // it may be executed before LaunchTask is called, but that's ok - 
+    // the work_count value is 2, so it cannot complete until LaunchTask.
+    // this allows child tasks to be safely spawned from the main task.
+    TaskQueuePush(&source->WorkQueue, task_id);
+    return task_id;
 }
 
 /*////////////////////////
@@ -962,7 +969,7 @@ GetTaskIdParts
     parts->ValidTask     = (id & TASK_ID_MASK_VALID_P ) >> TASK_ID_SHIFT_VALID;
     parts->SchedulerType = (id & TASK_ID_MASK_TYPE_P  ) >> TASK_ID_SHIFT_TYPE;
     parts->ThreadIndex   = (id & TASK_ID_MASK_THREAD_P) >> TASK_ID_SHIFT_THREAD;
-    parts->BufferIndex   = (id & TASK_ID_MASK_TICK_P  ) >> TASK_ID_SHIFT_TICK;
+    parts->BufferIndex   = (id & TASK_ID_MASK_BUFFER_P) >> TASK_ID_SHIFT_BUFFER;
     parts->TaskIndex     = (id & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
 }
 
@@ -1192,9 +1199,10 @@ NewTaskSource
     source->MaxTasksPerTick  = max_tasks_per_tick;
     source->TaskSourceCount  = scheduler->MaxSourceCount;
     source->TaskSources      = scheduler->SourceList;
+    source->BufferIndex      = 0;
+    source->TaskCount        = 0;
     for (size_t i = 0, n = max_active_ticks; i < n; ++i)
     {
-        source->TaskCounts[i] = 0;
         source->WorkItems [i] = PushArray<WORK_ITEM   >(arena, max_tasks_per_tick);
         source->WorkCounts[i] = PushArray<int32_t     >(arena, max_tasks_per_tick);
         source->PermitList[i] = PushArray<PERMITS_LIST>(arena, max_tasks_per_tick);
@@ -1240,7 +1248,7 @@ CreateAsyncScheduler
     scheduler->MaxThreads     = valid_config.MaxWorkerThreads;
     scheduler->ThreadCount    = 0;
     scheduler->OSThreadIds    = PushArray<unsigned int>(arena, valid_config.MaxWorkerThreads);
-    scheduler->OSThreadHandle = PushArray<HANDLE>      (arena, valid_config.MaxWorkerThreads);
+    scheduler->OSThreadHandle = PushArray<HANDLE      >(arena, valid_config.MaxWorkerThreads);
     scheduler->WorkerState    = PushArray<ASYNC_WORKER>(arena, valid_config.MaxWorkerThreads);
     ZeroMemory(scheduler->OSThreadIds   , valid_config.MaxWorkerThreads * sizeof(unsigned int));
     ZeroMemory(scheduler->OSThreadHandle, valid_config.MaxWorkerThreads * sizeof(HANDLE));
@@ -1335,7 +1343,7 @@ CreateComputeScheduler
     size_t expected_size = CalculateMemoryForComputeScheduler(&valid_config, max_sources);
     if (!ArenaCanAllocate(arena, expected_size, alignment))
     {   // there's not enough memory for the core scheduler and worker data.
-        ConsoleError("ERROR: Insufficient memory in arena for task scheduler; need at least %Iu bytes.\n", expected_size);
+        ConsoleError("ERROR: Insufficient memory in arena for task scheduler; need at least %zu bytes.\n", expected_size);
         return -1;
     }
 
@@ -1348,8 +1356,8 @@ CreateComputeScheduler
     scheduler->StartSignal      = ev_start;
     scheduler->HaltSignal       = ev_halt;
     scheduler->ThreadCount      = 0;
-    scheduler->OSThreadIds      = PushArray<unsigned int>  (arena, valid_config.MaxWorkerThreads);
-    scheduler->OSThreadHandle   = PushArray<HANDLE>        (arena, valid_config.MaxWorkerThreads);
+    scheduler->OSThreadIds      = PushArray<unsigned int  >(arena, valid_config.MaxWorkerThreads);
+    scheduler->OSThreadHandle   = PushArray<HANDLE        >(arena, valid_config.MaxWorkerThreads);
     scheduler->WorkerState      = PushArray<COMPUTE_WORKER>(arena, valid_config.MaxWorkerThreads);
     scheduler->MaxTicksInFlight = valid_config.MaxActiveTicks;
     scheduler->MaxTasksPerTick  = valid_config.MaxTasksPerTick;
@@ -1444,7 +1452,6 @@ GetRootTaskSource
 /// @param task_main The entry point of the task.
 /// @param task_args User-supplied argument data for the task instance. This data is copied into the task.
 /// @param args_size The number of bytes of argument data to copy into the task.
-/// @param task_tick The application tick counter specifying the current tick index.
 /// @param wait_task The identifier of the task that must complete prior to executing this new task, or INVALID_TASK_ID.
 /// @return The identifier of the new task, or INVALID_TASK_ID.
 public_function inline task_id_t
@@ -1454,11 +1461,10 @@ NewTask
     TASK_ENTRY      task_main, 
     void   const   *task_args, 
     size_t const    args_size,
-    uint32_t        task_tick,
     task_id_t       wait_task = INVALID_TASK_ID
 )
 {
-    return DefineTask(source, task_main, task_args, args_size, task_tick % source->MaxTicksInFlight, INVALID_TASK_ID, wait_task);
+    return DefineTask(source, task_main, task_args, args_size, INVALID_TASK_ID, wait_task);
 }
 
 /// @summary Spawn a new child task. Call FinishTask to complete the task definition.
@@ -1494,7 +1500,7 @@ NewChildTask
         return INVALID_TASK_ID;
     }
 
-    return DefineTask(source, task_main, task_args, args_size, parent_task->BufferIndex, parent_id, wait_task);
+    return DefineTask(source, task_main, task_args, args_size, parent_id, wait_task);
 }
 
 /// @summary Indicate that a task (including any children) has been completely defined and allow it to finish execution.
