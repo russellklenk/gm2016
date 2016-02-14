@@ -48,6 +48,8 @@ struct WELL512_PRNG_STATE
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
+/// @summary Retrieve the size of the seed data for the WELL512 PRNG.
+/// @return The number of bytes of seed data required for a WELL512 PRNG.
 public_function inline size_t
 Well512SeedSize
 (
@@ -57,6 +59,8 @@ Well512SeedSize
     return WELL512_SEED_SIZE;
 }
 
+/// @summary Retrieve the size of the state data for the WELL512 PRNG.
+/// @return The number of bytes required to represent the state of a WELL512 PRNG.
 public_function inline size_t
 Well512StateSize
 (
@@ -66,6 +70,8 @@ Well512StateSize
     return WELL512_STATE_SIZE;
 }
 
+/// @summary Initialize the state of a WELL512 PRNG instance.
+/// @param rng The PRNG state to initialize.
 public_function void
 InitWell512PRNG
 (
@@ -75,7 +81,12 @@ InitWell512PRNG
     ZeroMemory(rng, sizeof(WELL512_PRNG_STATE));
 }
 
-public_function bool
+/// @summary Seed a WELL512 PRNG instance using externally-generated data.
+/// @param rng The PRNG state to seed.
+/// @param seed_data The externally-generated seed data.
+/// @param seed_size The number of bytes of seed data. This must be at least the value returned by Well512SeedSize.
+/// @return Zero if the seed data was used to initialize the PRNG, or -1 if an error occurred.
+public_function int
 SeedWell512PRNG
 (
     WELL512_PRNG_STATE      *rng, 
@@ -85,14 +96,19 @@ SeedWell512PRNG
 {
     if (seed_size < WELL512_SEED_SIZE)
     {   // insufficient seed data supplied.
-        return false;
+        return -1;
     }
     rng->Index = 0;
     CopyMemory(rng->State, seed_data, WELL512_SEED_SIZE);
-    return true;
+    return 0;
 }
 
-public_function bool
+/// @summary Initialize a WELL512 PRNG using previously saved state.
+/// @param rng The PRNG state to initialize.
+/// @param state_data The previously saved state data.
+/// @param state_size The size of the saved state data, in bytes. This must be at least the value returned by Well512StateSize.
+/// @return Zero if the PRNG state data was successfully loaded, or -1 if an error occurred.
+public_function int
 LoadWell512PRNG
 (
     WELL512_PRNG_STATE       *rng, 
@@ -102,12 +118,17 @@ LoadWell512PRNG
 {
     if (state_size < WELL512_STATE_SIZE)
     {   // the supplied data has an incorrect size.
-        return false;
+        return -1;
     }
     CopyMemory(rng, state_data, WELL512_STATE_SIZE);
-    return true;
+    return 0;
 }
 
+/// @summary Save the state of a WELL512 PRNG instance.
+/// @param dst THe destination buffer where the state will be copied.
+/// @param src The WELL512 PRNG whose state will be saved.
+/// @param size The size of the destination buffer, in bytes. This must be at least the value returned by Well512StateSize.
+/// @return The number of bytes copied to the destination buffer, or 0 if an error occurred.
 public_function size_t
 CopyWell512PRNG
 (
@@ -124,6 +145,9 @@ CopyWell512PRNG
     return WELL512_STATE_SIZE;
 }
 
+/// @summary Draws a single double-precision IEEE-754 floating point value from a PRNG. Values are uniformly distributed over the range [0, 1).
+/// @param rng The WELL512 PRNG instance to draw from.
+/// @return A value selected from the range [0, 1).
 public_function double
 RandomUniformReal
 (
@@ -149,6 +173,9 @@ RandomUniformReal
     return s[n] * WELL512_RAND_SCALE;
 }
 
+/// @summary Retrieves 32 random bits from a PRNG. The bits are returned without any transformation performed and the full range [0, UINT32_MAX] is possible.
+/// @param rng The PRNG instance to draw from.
+/// @return A value selected from the range [0, 4294967295].
 public_function uint32_t
 RandomU32
 (
@@ -174,6 +201,11 @@ RandomU32
     return s[n];
 }
 
+/// @summary Draws a 32-bit unsigned integer value from a PRNG. Values are uniformly distributed over the range [min_value, max_value). The caller must ensure that @a min_value is less than @a max_value, and that the min and max values are within the defined range, or the function may return invalid results.
+/// @param min_value The inclusive lower-bound of the range. The maximum allowable value is UINT32_MAX + 1 (4294967296).
+/// @param max_value The exclusive upper-bound of the range. The maximum allowable value is UINT32_MAX + 1 (4294967296).
+/// @param rng The PRNG instance to draw from.
+/// @return A value selected from the range [min_value, max_value).
 public_function uint32_t
 RandomU32InRange
 (
@@ -188,7 +220,7 @@ RandomU32InRange
     // remove the bias that can result when the range 'r'
     // does not divide evenly into the PRNG range 'n'.
     uint64_t r = max_value - min_value; // size of request range [min, max)
-    uint64_t u = RNG_RAND_MAX;          // PRNG inclusive upper bound
+    uint64_t u = WELL512_RAND_MAX;      // PRNG inclusive upper bound
     uint64_t n = u + 1;                 // size of PRNG range [0, UINT32_MAX]
     uint64_t i = n / r;                 // # times whole of 'r' fits in 'n'
     uint64_t m = r * i;                 // largest integer multiple of 'r'<='n'
@@ -201,16 +233,29 @@ RandomU32InRange
     return uint32_t(x + min_value);     // x -> [min, max)
 }
 
+/// @summary Draw and discard a random number of values from a PRNG to randomize the PRNG state.
+/// @param rng The PRNG to cycle.
+/// @return The sum of the drawn values.
 #pragma optimize("", off)
-public_function void
+public_function uint64_t
 CyclePRNG
 (
     WELL512_PRNG_STATE *rng
 )
 {
+    uint64_t      V = 0;
+    for (uint32_t i = 0, n = RandomU32InRange(1, WELL512_SEED_UNITS * 2, rng); i < n; ++i)
+    {
+        V += RandomU32(rng);
+    }
+    return V;
 }
 #pragma optimize("", on)
 
+/// @summary Generate a non-random sequence of integers in ascending order.
+/// @param values The array of values to populate.
+/// @param start The first value in the sequence.
+/// @param count The number of values in the sequence.
 public_function void
 Sequence
 (
@@ -225,6 +270,10 @@ Sequence
     }
 }
 
+/// @summary Shuffle the values in an array using the Knuth-Fisher-Yates algorithm.
+/// @param values The array of values to shuffle.
+/// @param count The number of values in the array.
+/// @param rng The PRNG used to perform the random shuffling.
 public_function void
 Shuffle
 (
@@ -244,6 +293,11 @@ Shuffle
     }
 }
 
+/// @summary Samples a set without replacement. All values in the set have uniform weight; that is, all values are equally likely to be chosen. Each value in the set can only be chosen once. Values are returned in ascending order. Use Shuffle() to randomize the sampled values.
+/// @param values Pointer to storage for an array of 32-bit unsigned integer values that will be set to the sampled values. Values are stored in ascending order.
+/// @param population_size The total size of the population being sampled. The maximum allowable value is UINT32_MAX + 1 (4294967296).
+/// @param sample_size The number of samples being drawn from the set. The maximum allowable value is UINT32_MAX + 1 (4294967296).
+/// @param rng The state of the random number generator to be used when sampling the population.
 public_function void
 ChooseWithoutReplacement
 (
@@ -253,6 +307,8 @@ ChooseWithoutReplacement
     WELL512_PRNG_STATE           *rng
 )
 {   // algorithm 3.4.2S of The Art of Computer Programming, Vol. 2
+    assert(sample_size     <= (uint64_t(UINT32_MAX)+1));
+    assert(population_size <= (uint64_t(UINT32_MAX)+1));
     uint64_t n = sample_size;      // max allowable is UINT32_MAX + 1
     uint64_t N = population_size;  // max allowable is UINT32_MAX + 1
     uint32_t t = 0;                // total dealt with so far
@@ -271,6 +327,11 @@ ChooseWithoutReplacement
     }
 }
 
+/// @summary Samples a set with replacement. All values in the set have uniform weight; that is, all values are equally likely to be chosen. Each value in the set may be selected multiple times.
+/// @param population_size The total size of the population being sampled. The maximum allowable value is UINT32_MAX + 1 (4294967296).
+/// @param sample_size The number of samples being drawn from the set. The maximum allowable value is UINT32_MAX + 1 (4294967296).
+/// @param values Pointer to storage for an array of 32-bit unsigned integer values that will be set to the sampled values. Values are stored in ascending order.
+/// @param rng The state of the random number generator to be used when sampling the population.
 public_function void
 ChooseWithReplacement
 (
