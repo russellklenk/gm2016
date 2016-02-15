@@ -132,8 +132,10 @@ struct ASYNC_WORKER
 
 /// @summary Define the data associated with a work item.
 struct WORK_ITEM
-{   static size_t const MAX_DATA = 48;    /// The maximum amount of data that can be passed to the task.
-    uint32_t            Reserved0;        /// This value is reserved for future use.
+{   static size_t const ALIGNMENT = CACHELINE_SIZE;
+    static size_t const MAX_DATA  = 48;   /// The maximum amount of data that can be passed to the task.
+    typedef std::atomic<uint32_t> tag_t;  /// An atomic value used by the MPMC_QUEUE to avoid the ABA problem.
+    tag_t               Version;          /// The work item version tag (used by MPMC_QUEUE only.)
     task_id_t           ParentTask;       /// The identifier of the parent task, or INVALID_TASK_ID.
     TASK_ENTRY          TaskMain;         /// The task entry point.
 #if TARGET_ARCHITECTURE == ARCHITECTURE_X86_32 || TARGET_ARCHITECTURE == ARCHITECTURE_ARM_32
@@ -148,6 +150,19 @@ struct PERMITS_LIST
     static size_t const MAX_TASKS = 15;   /// The maximum number of task IDs that can be stored in a permits list.
     int32_t             Count;            /// The number of items in the permits list.
     task_id_t           Tasks[MAX_TASKS]; /// The task IDs in the permits list. This is the set of tasks to launch when the owning task completes.
+};
+
+/// @summary Define the data representing a work queue safe for access by multiple concurrent producers and multiple concurrent consumers.
+struct WORK_QUEUE
+{   static size_t const ALIGNMENT           = CACHELINE_SIZE;
+    static size_t const PAD                 = CACHELINE_SIZE - sizeof(std::atomic<int64_t>);
+    typedef std::atomic<uint32_t> index_t;/// An atomic index used to represent the ends of the queue.
+    index_t             Tail;             /// The index at which items are enqueued, representing the tail of the queue.
+    uint8_t             Pad0[PAD];        /// Padding separating producer data from consumer data.
+    index_t             Head;             /// The index at which items are dequeued, representing the head of the queue.
+    uint8_t             Pad1[PAD];        /// Padding separating consumer data from shared data.
+    uint32_t            Mask;             /// The bitmask used to map the Head and Tail indices into the storage array.
+    WORK_ITEM          *WorkItems;        /// Contiguous storage for the work item data.
 };
 
 /// @summary Define the data representing a work-stealing deque of task identifiers. Each compute worker thread maintains its own queue.
@@ -220,6 +235,8 @@ struct WIN32_ASYNC_TASK_SCHEDULER
     unsigned int       *OSThreadIds;      /// The operating system identifiers for each worker thread.
     HANDLE             *OSThreadHandle;   /// The operating system thread handle for each worker thread.
     ASYNC_WORKER       *WorkerState;      /// The state data for each worker thread.
+
+    WORK_QUEUE          WorkQueue;        /// The global MPMC work item queue.
 };
 
 /// @summary Define the data associated with a compute-oriented task scheduler.
@@ -480,6 +497,135 @@ CalculateMemoryForTaskQueue
 )
 {
     return sizeof(task_id_t) * capacity;
+}
+
+/// @summary Place an item in the concurrent work queue. Safe for multiple concurrent producers.
+/// @param queue The concurrent work queue to write to.
+/// @param task_main The task entry point.
+/// @param work_data Optional work item-specific data to be copied into the work item.
+/// @param data_size The size of the work item data, in bytes.
+/// @return Zero if the item was enqueued, or -1 if the queue is currently full. 
+internal_function int
+WorkQueuePut
+(
+    WORK_QUEUE       *queue, 
+    task_id_t            id, 
+    TASK_ENTRY    task_main,
+    void   const *work_data, 
+    size_t const  data_size
+)
+{
+    WORK_ITEM *item;
+    uint32_t   mask = queue->Mask;
+    uint32_t    pos = queue->Tail.load(std::memory_order_relaxed);
+
+    for ( ; ; )
+    {   // attempt to claim the item at index 'pos'.
+        item  = &queue->WorkItems[pos & mask];
+        uint32_t version = item->Version.load(std::memory_order_acquire);
+        intptr_t    diff = intptr_t(version) - intptr_t(pos);
+
+        if (diff == 0)
+        {   // attempt to claim this slot in the queue storage.
+            if (queue->Tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed))
+                break; // got it.
+        }
+        else if (diff > 0)
+        {   // lost the race to another producer; try again.
+            pos = queue->Tail.load(std::memory_order_relaxed);
+        }
+        else // diff < 0
+        {   // the queue is full; fail immediately.
+            return -1;
+        }
+    }
+
+    // set the work item data before the version tag.
+    item->ParentTask = id;
+    item->TaskMain   = task_main;
+    if (data_size > 0) CopyMemory(item->TaskArgs, work_data, data_size);
+
+    // update the version tag with the index of the next write slot.
+    item->Version.store(pos + 1, std::memory_order_release);
+    return 0;
+}
+
+/// @summary Attempt to retrieve a waiting item in a work queue. Safe for access by multiple concurrent consumers.
+/// @param queue The work queue to read from.
+/// @param dst On return, the dequeued work item data is copied to this location.
+/// @return Zero if an item was dequeued, or -1 if the queue is currently empty.
+internal_function int
+WorkQueueGet
+(
+    WORK_QUEUE *queue, 
+    WORK_ITEM    *dst
+)
+{
+    WORK_ITEM *item;
+    uint32_t   mask = queue->Mask;
+    uint32_t    pos = queue->Head.load(std::memory_order_relaxed);
+
+    for ( ; ; )
+    {   // attempt to claim the item at index 'pos'.
+        item  = &queue->WorkItems[pos & mask];
+        uint32_t version = item->Version.load(std::memory_order_acquire);
+        intptr_t    diff = intptr_t(version) - intptr_t(pos + 1);
+
+        if (diff == 0)
+        {   // attempt to claim this slot in the queue storage.
+            if (queue->Head.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed))
+                break; // got it.
+        }
+        else if (diff > 0)
+        {   // lost the race to another consumer; try again.
+            pos = queue->Head.load(std::memory_order_relaxed);
+        }
+        else // diff < 0
+        {   // the queue is empty; fail immediately.
+            return -1;
+        }
+    }
+
+    // copy the data for the caller before updating the version tag.
+    CopyMemory(dst, item, sizeof(WORK_ITEM));
+    // update the version tag with the index of the next read slot.
+    item->Version.store(pos + mask + 1, std::memory_order_release);
+    return 0;
+}
+
+/// @summary Allocate the memory for a work queue and initialize the queue to empty.
+/// @param queue The work queue to initialize.
+/// @param capacity The capacity of the queue. This value must be a power of two greater than zero.
+/// @param arena The memory arena to allocate from. The caller should ensure that sufficient memory is available.
+internal_function void
+CreateWorkQueue
+(
+    WORK_QUEUE   *queue, 
+    size_t     capacity, 
+    MEMORY_ARENA *arena
+)
+{   // the capacity must be a power of two.
+    assert((capacity & (capacity - 1)) == 0);
+    queue->Tail.store(0, std::memory_order_relaxed);
+    queue->Head.store(0, std::memory_order_relaxed);
+    queue->Mask      = uint32_t(capacity) - 1;
+    queue->WorkItems = PushArray<WORK_ITEM>(arena , capacity);
+    for (uint32_t  i = 0, n = uint32_t(capacity); i < n; ++i)
+    {   // each item stores its position within the queue.
+        queue->WorkItems[i].Version.store(i, std::memory_order_relaxed);
+    }
+}
+
+/// @summary Calculate the amount of memory required to store a work queue.
+/// @param capacity The capacity of the queue.
+/// @return The minimum number of bytes required to store the queue items, not including the size of the WORK_QUEUE instance.
+internal_function size_t
+CalculateMemoryForWorkQueue
+(
+    size_t capacity
+)
+{
+    return sizeof(WORK_ITEM) * capacity;
 }
 
 /// @summary Calculate the amount of memory required to store task source data.
@@ -892,7 +1038,7 @@ DefineTask
     WORK_ITEM &work_item  = source->WorkItems [buffer_index][task_index];
     PERMITS_LIST &permit  = source->PermitList[buffer_index][task_index];
 
-    work_item.Reserved0   = 0;
+    work_item.Version.store(0, std::memory_order_relaxed);
     work_item.ParentTask  = parent_id;
     work_item.TaskMain    = task_main;
     if (task_args != NULL && args_size > 0)
