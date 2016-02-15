@@ -105,5 +105,6 @@ set foldmethod=marker
 
 execute pathogen#infect()
 
+let g:kolor_italic=1
 colorscheme kolor
 
