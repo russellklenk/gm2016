@@ -82,9 +82,9 @@ struct FENCE_TASK_DATA
 internal_function int
 TestTaskMain
 (
-    task_id_t                   id,
+    compute_task_t              id,
     TASK_SOURCE            *source, 
-    WORK_ITEM                *task, 
+    COMPUTE_TASK             *task, 
     MEMORY_ARENA            *arena, 
     WIN32_THREAD_ARGS *thread_args
 )
@@ -94,7 +94,7 @@ TestTaskMain
     UNUSED_ARG(arena);
     UNUSED_ARG(thread_args);
 
-    TEST_TASK_DATA *args = (TEST_TASK_DATA*) task->TaskArgs;
+    TEST_TASK_DATA *args = (TEST_TASK_DATA*) task->Data;
     for (size_t i = args->Index, e = args->Index + args->Count; i < e; ++i)
     {
         args->Array[i] = 1;
@@ -105,9 +105,9 @@ TestTaskMain
 internal_function int
 LaunchTaskMain
 (
-    task_id_t                   id,
+    compute_task_t              id,
     TASK_SOURCE            *source, 
-    WORK_ITEM                *task, 
+    COMPUTE_TASK             *task, 
     MEMORY_ARENA            *arena, 
     WIN32_THREAD_ARGS *thread_args
 )
@@ -115,15 +115,15 @@ LaunchTaskMain
     UNUSED_ARG(arena);
     UNUSED_ARG(thread_args);
     
-    LAUNCH_TASK_DATA *args = (LAUNCH_TASK_DATA*) task->TaskArgs;
+    LAUNCH_TASK_DATA *args = (LAUNCH_TASK_DATA*) task->Data;
     ZeroMemory(args->Array,args->Count * sizeof(uint8_t));
     for (size_t i = 0, x = 0; i < args->Count; ++x)
     {   // each child task will set up to 64 consecutive values to 1.
         // this should prevent cache contention between tasks.
         size_t         n = (args->Count- i) >= 64 ? 64 : (args->Count - i);
         TEST_TASK_DATA a = {args->Array, i, n};
-        task_id_t  child =  NewChildTask(source, TestTaskMain, &a, sizeof(TEST_TASK_DATA), id);
-        FinishTask(source,  child);
+        compute_task_t c =  NewChildTask(source, TestTaskMain, &a, sizeof(TEST_TASK_DATA), id);
+        FinishTask(source,  c);
         i += n;
 
         // wake someone up to help after a few tasks have been added.
@@ -138,9 +138,9 @@ LaunchTaskMain
 internal_function int
 FenceTaskMain
 (
-    task_id_t                   id,
+    compute_task_t              id,
     TASK_SOURCE            *source, 
-    WORK_ITEM                *task, 
+    COMPUTE_TASK             *task, 
     MEMORY_ARENA            *arena, 
     WIN32_THREAD_ARGS *thread_args
 )
@@ -150,7 +150,7 @@ FenceTaskMain
     UNUSED_ARG(arena);
     UNUSED_ARG(thread_args);
     
-    FENCE_TASK_DATA *args = (FENCE_TASK_DATA*) task->TaskArgs;
+    FENCE_TASK_DATA *args = (FENCE_TASK_DATA*) task->Data;
     bool               ok =  true;
     for (size_t i = 0,  n =  args->Count; i < n; ++i)
     {
@@ -644,9 +644,9 @@ WinMain
         // Also need to wait until the next buffer is 'available' for use (all tasks have completed.)
         ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(current_tick) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
         LAUNCH_TASK_DATA launch_data = { workspace, workspace_size };
-        FENCE_TASK_DATA  fence_data  = { workspace, workspace_size, ev_fence };
-        task_id_t        launch_task = NewTask(GetRootTaskSource(&task_scheduler), LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA));
-        task_id_t        fence_task  = NewTask(GetRootTaskSource(&task_scheduler), FenceTaskMain , &fence_data , sizeof(FENCE_TASK_DATA ) , launch_task);
+        FENCE_TASK_DATA   fence_data = { workspace, workspace_size, ev_fence };
+        compute_task_t   launch_task = NewTask(GetRootTaskSource(&task_scheduler), LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA));
+        compute_task_t    fence_task = NewTask(GetRootTaskSource(&task_scheduler), FenceTaskMain , &fence_data , sizeof(FENCE_TASK_DATA ) , launch_task);
         FinishTask(GetRootTaskSource(&task_scheduler), fence_task);
         FinishTask(GetRootTaskSource(&task_scheduler), launch_task);
         SignalWaitingWorkers(GetRootTaskSource(&task_scheduler));
