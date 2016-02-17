@@ -79,11 +79,11 @@ struct FENCE_TASK_DATA
 /*//////////////////////////
 //   Internal Functions   //
 //////////////////////////*/
-internal_function int
+internal_function void
 TestTaskMain
 (
-    compute_task_t              id,
-    TASK_SOURCE            *source, 
+    task_id_t                   id,
+    COMPUTE_TASK_SOURCE    *source, 
     COMPUTE_TASK             *task, 
     MEMORY_ARENA            *arena, 
     WIN32_THREAD_ARGS *thread_args
@@ -99,14 +99,13 @@ TestTaskMain
     {
         args->Array[i] = 1;
     }
-    return 0;
 }
 
-internal_function int
+internal_function void
 LaunchTaskMain
 (
-    compute_task_t              id,
-    TASK_SOURCE            *source, 
+    task_id_t                   id,
+    COMPUTE_TASK_SOURCE    *source, 
     COMPUTE_TASK             *task, 
     MEMORY_ARENA            *arena, 
     WIN32_THREAD_ARGS *thread_args
@@ -122,8 +121,8 @@ LaunchTaskMain
         // this should prevent cache contention between tasks.
         size_t         n = (args->Count- i) >= 64 ? 64 : (args->Count - i);
         TEST_TASK_DATA a = {args->Array, i, n};
-        compute_task_t c =  NewChildTask(source, TestTaskMain, &a, sizeof(TEST_TASK_DATA), id);
-        FinishTask(source,  c);
+        task_id_t  child =  NewChildTask(source, TestTaskMain, &a, sizeof(TEST_TASK_DATA), id);
+        FinishComputeTask(source, child);
         i += n;
 
         // wake someone up to help after a few tasks have been added.
@@ -132,14 +131,13 @@ LaunchTaskMain
         if (x & 7) SignalWaitingWorkers(source);
     }
     SignalWaitingWorkers(source);
-    return 0;
 }
 
-internal_function int
+internal_function void
 FenceTaskMain
 (
-    compute_task_t              id,
-    TASK_SOURCE            *source, 
+    task_id_t                   id,
+    COMPUTE_TASK_SOURCE    *source, 
     COMPUTE_TASK             *task, 
     MEMORY_ARENA            *arena, 
     WIN32_THREAD_ARGS *thread_args
@@ -160,7 +158,6 @@ FenceTaskMain
     //if (ok) ConsoleOutput("All tasks completed successfully!\n");
     //else ConsoleOutput("One or more tasks failed.\n");
     SetEvent(args->Signal);
-    return 0;
 }
 
 /// @summary Initializes a command line arguments definition with the default program configuration.
@@ -639,17 +636,14 @@ WinMain
             next_tick =(current_tick - miss_time) + SliceOfSecond(60);
         }
         // work work work
-        // TODO(rlk): Need to have a SchedulerTickBegin and SourceTickBegin to reset the TASK_SOURCE::TaskCounts[next_buffer_index] to 0.
-        // We're running out of space in the task buffers because the count is never being reset.
-        // Also need to wait until the next buffer is 'available' for use (all tasks have completed.)
         ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(current_tick) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
         LAUNCH_TASK_DATA launch_data = { workspace, workspace_size };
         FENCE_TASK_DATA   fence_data = { workspace, workspace_size, ev_fence };
-        compute_task_t   launch_task = NewTask(GetRootTaskSource(&task_scheduler), LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA));
-        compute_task_t    fence_task = NewTask(GetRootTaskSource(&task_scheduler), FenceTaskMain , &fence_data , sizeof(FENCE_TASK_DATA ) , launch_task);
-        FinishTask(GetRootTaskSource(&task_scheduler), fence_task);
-        FinishTask(GetRootTaskSource(&task_scheduler), launch_task);
-        SignalWaitingWorkers(GetRootTaskSource(&task_scheduler));
+        task_id_t        launch_task = NewComputeTask(RootComputeSource(&task_scheduler), LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA));
+        task_id_t         fence_task = NewComputeTask(RootComputeSource(&task_scheduler), FenceTaskMain , &fence_data , sizeof(FENCE_TASK_DATA ) , launch_task);
+        FinishComputeTask(RootComputeSource(&task_scheduler), fence_task);
+        FinishComputeTask(RootComputeSource(&task_scheduler), launch_task);
+        SignalWaitingWorkers(RootComputeSource(&task_scheduler));
         WaitForSingleObject(ev_fence, INFINITE);
 
         // all work for the current tick has completed.
