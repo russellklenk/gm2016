@@ -28,23 +28,44 @@ struct MEMORY_ARENA
     size_t   ReserveTotalBytes;  /// The total size of the current reservation, in bytes.
 };
 
-/// @summary Reserve process address space for a memory arena. No address space is committed.
+/// @summary Reserve process address space for a memory arena. By default, no address space is committed.
 /// @param arena The memory arena to initialize.
 /// @param arena_size The number of bytes of process address space to reserve.
-/// @return Zero if the arena is initialize, or -1 if an error occurred.
+/// @param commit_all Specify true to commit the entire reserved range immediately.
+/// @param guard_page Specify true to allocate and commit a guard page to detect memory overwrites.
+/// @return Zero if the arena is initialized, or -1 if an error occurred.
 public_function int
 CreateMemoryArena
 (
     WIN32_MEMORY_ARENA     *arena, 
-    size_t             arena_size
+    size_t             arena_size,
+    bool               commit_all=false, 
+    bool               guard_page=false
 )
-{   // virtual memory allocations are rounded up to the next even multiple of the system 
-    // page size, and have a starting address that is an even multiple of the system 
-    // allocation granularity (SYSTEM_INFO::dwAllocationGranularity).
+{   // retrieve the system page size and allocation granularity.
     SYSTEM_INFO sys_info = {};
     GetNativeSystemInfo(&sys_info);
-    arena_size  = AlignUp(arena_size, size_t(sys_info.dwPageSize));
-    void *base  = VirtualAlloc(NULL, arena_size, MEM_RESERVE, PAGE_READWRITE);
+
+    // virtual memory allocations are rounded up to the next even multiple of the system
+    // page size, and have a starting address that is an even multiple of the system 
+    // allocation granularity (SYSTEM_INFO::dwAllocationGranularity).
+    arena_size = AlignUp(arena_size, size_t(sys_info.dwPageSize));
+    if (guard_page)
+    {   // add an extra page for use as a guard page.
+        extra = sys_info.dwPageSize;
+    }
+
+    size_t   commit_size = 0;
+    size_t   extra  = 0;
+    DWORD    flags  = MEM_RESERVE;
+    if (commit_all)
+    {   // commit the entire range of address space.
+        commit_size = arena_size;
+        flags      |= MEM_COMMIT;
+    }
+
+    // reserve (and optionally commit) contiguous virtual address space.
+    void *base  = VirtualAlloc(NULL, arena_size + extra, flags, PAGE_READWRITE);
     if   (base == NULL)
     {   // unable to reserve the requested amount of address space; fail.
         arena->NextOffset        = 0;
@@ -56,8 +77,14 @@ CreateMemoryArena
         arena->PageSize          = sys_info.dwPageSize;
         return -1;
     }
+
+    if (guard_page)
+    {   // commit the guard page, if necessary, and change the protection flags.
+        VirtualAlloc(((uint8_t*)base + arena_size), sys_info.dwPageSize, MEM_COMMIT, PAGE_NOACCESS);
+    }
+
     arena->NextOffset        = 0;
-    arena->BytesCommitted    = 0;
+    arena->BytesCommitted    = commit_size;
     arena->BytesReserved     = arena_size;
     arena->BaseAddress       = (uint8_t*) base;
     arena->ReserveAlignBytes = 0;
