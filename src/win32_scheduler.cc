@@ -1140,40 +1140,6 @@ terminate_worker:
     return 0;
 }
 
-/// @summary Calculate the amount of memory required for a given scheduler configuration.
-/// @param config The scheduler configuration returned from the CheckSchedulerConfiguration function.
-/// @param max_sources The maximum number of task sources that can be registered with the scheduler.
-/// @return The number of bytes required to create a compute task scheduler of the specified type with the given configuration.
-internal_function size_t
-CalculateMemoryForScheduler
-(
-    TASK_SCHEDULER_CONFIG     *config, 
-)
-{
-    if (max_sources == 0)
-    {   // default to the number of worker threads plus one for the main thread.
-        max_sources = config->MaxWorkerThreads + 1;
-    }
-    if (max_sources > MAX_SCHEDULER_THREADS)
-    {   // limit to the maximum number of sources.
-        max_sources = MAX_SCHEDULER_THREADS;
-    }
-
-    size_t  size = 0;
-    // account for the size of the variable-length data arrays.
-    size += AllocationSizeForArray<unsigned int       >(config->MaxWorkerThreads);
-    size += AllocationSizeForArray<HANDLE             >(config->MaxWorkerThreads);
-    size += AllocationSizeForArray<COMPUTE_WORKER     >(config->MaxWorkerThreads);
-    size += AllocationSizeForArray<COMPUTE_TASK_SOURCE>(max_sources);
-    // account for the size of the minimum number of task sources.
-    for (size_t i = 0, n = config->MaxWorkerThreads + 1; i < n; ++i)
-    {   // the main thread and worker threads always use the scheduler configuration.
-        size += CalculateMemoryForComputeTaskSource(config->MaxActiveTicks, config->MaxTasksPerTick);
-    }
-    // ... 
-    return size;
-}
-
 /// @summary Define a new task within a task source.
 /// @param source The task source that will store the task definition.
 /// @param task_main The entry point of the task.
@@ -1419,163 +1385,325 @@ GetTaskIdParts
     parts->TaskIndex     = (id & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
 }
 
-/// @summary Validates a given scheduler configuration and populates any default values with their actual values. Emits performance warnings if necessary.
+/// @summary Calculate the amount of memory required for a given scheduler configuration.
+/// @param config The pre-validated scheduler configuration.
+/// @return The number of bytes required to create a compute task scheduler of the specified type with the given configuration.
+public_function size_t
+CalculateMemoryForScheduler
+(
+    WIN32_TASK_SCHEDULER_CONFIG const *config, 
+)
+{
+    size_t    buffer_count = 2;
+    size_t   size_in_bytes = 0;
+    size_t general_threads = config->PoolSize[TASK_POOL_GENERAL].MaxThreads;
+    size_t compute_threads = config->PoolSize[TASK_POOL_COMPUTE].MaxThreads;
+    size_t   total_threads = general_threads + compute_threads;
+    size_t   general_tasks = config->PoolSize[TASK_POOL_GENERAL].MaxTasks;
+    size_t   compute_tasks = config->PoolSize[TASK_POOL_COMPUTE].MaxTasks;
+    size_t   max_max_tasks = general_tasks > compute_tasks ? general_tasks : compute_tasks;
+    // account for the size of the thread pools.
+    size_in_bytes += CalculateMemoryForThreadPool(general_threads);
+    size_in_bytes += CalculateMemoryForThreadPool(compute_threads);
+    // account for the size of the main thread task source.
+    size_in_bytes += CalculateMemoryForTaskSource(buffer_count, max_max_tasks);
+    // account for the size of the general pool worker threads.
+    size_in_bytes += CalculateMemoryForTaskSource(buffer_count, general_tasks) * general_threads;
+    // account for the size of the compute pool worker threads.
+    size_in_bytes += CalculateMemoryForTaskSource(buffer_count, compute_tasks) * compute_threads;
+    // ... 
+    return size_in_bytes;
+}
+
+/// @summary Retrieve a default scheduler configuration based on host CPU resources.
+/// @param config The scheduler configuration to populate.
+/// @param host_cpu_info Information about the CPU resources of the host system.
+public_function void
+DefaultSchedulerConfiguration
+(
+    WIN32_TASK_SCHEDULER_CONFIG        *config, 
+    WIN32_CPU_INFO const        *host_cpu_info
+)
+{   // everything starts out as zero.
+    ZeroMemory(config, sizeof(WIN32_TASK_SCHEDULER_CONFIG));
+    // set up defaults for the general pool. tasks are expected to be created relatively 
+    // infrequently, and to be fairly long-running (one to several application ticks.) 
+    // having more software threads than hardware threads helps reduce latency.
+    WIN32_THREAD_POOL_SIZE &general_pool = config->PoolSize[TASK_POOL_GENERAL];
+    general_pool.MinThreads = 2;
+    general_pool.MaxThreads = host_cpu_info->HardwareThreads * 2;
+    general_pool.MaxTasks   = 256;
+    general_pool.ArenaSize  = 8 * 1024 * 1024; // 8MB
+    // set up defaults for the compute pool. tasks are expected to be created very 
+    // frequently, and to be short lived (less than one application tick.) limit 
+    // to the number of hardware threads to avoid over-subscribing CPU resources.
+    WIN32_THREAD_POOL_SIZE &compute_pool = config->PoolSize[TASK_POOL_COMPUTE];
+    compute_pool.MinThreads = 1;
+    compute_pool.MaxThreads = host_cpu_info->HardwareThreads - 1;
+    compute_pool.MaxTasks   = 2048;
+    compute_pool.ArenaSize  = 2 * 1024 * 1024;  // 2MB
+    if (compute_pool.MaxThreads < 1)
+    {   // on a single-core system, limit to 1 thread.
+        compute_pool.MaxThreads = 1;
+    }
+    // scale up the maximum number of tasks per-pool based on hardware resources.
+    if (host_cpu_info->HardwareThreads > 8)
+    {   // six-core CPU or greater - allow more tasks to be created.
+        general_pool.MaxTasks = 512;
+        compute_pool.MaxTasks = 4096;
+    }
+    if (host_cpu_info->HardwareThreads > 16)
+    {   // more than six cores, allow even more tasks to be created.
+        general_pool.MaxTasks = 1024;
+        compute_pool.MaxTasks = 8192;
+    }
+    if (host_cpu_info->HardwareThreads > 32)
+    {   // and so on...
+        general_pool.MaxTasks = 2048;
+        compute_pool.MaxTasks = 16384;
+    }
+    if (host_cpu_info->HardwareThreads > 64)
+    {   // and so on...
+        general_pool.MaxTasks = 4096;
+        compute_pool.MaxTasks = 32768;
+    }
+    if (host_cpu_info->HardwareThreads > 128)
+    {   // and so on.
+        general_pool.MaxTasks = 8192;
+        compute_pool.MaxTasks = 65536;
+    }
+    // default the maximum number of task sources to the number of worker threads + 1 for the main thread.
+    config->MaxTaskSources = general_pool.MaxThreads + compute_pool.MaxThreads + 1;
+}
+
+/// @summary Validates a given scheduler configuration.
 /// @param dst_config The configuration object to receive the validated configuration data.
 /// @param src_config The configuration object specifying the input configuration data.
-/// @param cpu_info Information about the CPU resources of the host system.
-/// @param scheduler_type One of SCHEDULER_TYPE specifying the type of task scheduler being created.
-/// @return true if no performance warnings were emitted.
-public_function bool
+/// @param host_cpu_info Information about the CPU resources of the host system.
+/// @param config_valid On return, set to true if a valid configuration was written to dst_config.
+/// @param performance_warnings On return, set to true if one or more performance warnings were emitted.
+public_function void
 CheckSchedulerConfiguration
 (
-    TASK_SCHEDULER_CONFIG    *dst_config, 
-    TASK_SCHEDULER_CONFIG    *src_config, 
-    WIN32_CPU_INFO             *cpu_info,
-    uint32_t              scheduler_type
+    WIN32_TASK_SCHEDULER_CONFIG          *dst_config, 
+    WIN32_TASK_SCHEDULER_CONFIG const    *src_config,
+    WIN32_CPU_INFO              const *host_cpu_info,
+    bool                               &config_valid, 
+    bool                       &performance_warnings
 )
 {
     if (dst_config == NULL)
-    {   // a destination configuration object MUST be supplied.
-        return false;
+    {
+        ConsoleError("ERROR: A destination scheduler configuration (dst_config) must be supplied to CheckSchedulerConfiguration.\n");
+        performance_warnings = false;
+        config_valid = false;
+        return;
     }
     if (src_config == NULL)
-    {   // an input configuration object MUST be supplied.
-        return false;
+    {
+        ConsoleError("ERROR: A source scheduler configuration (src_config) must be supplied to CheckSchedulerConfiguration.\n");
+        performance_warnings = false;
+        config_valid = false;
+        return;
     }
-    if (cpu_info == NULL)
-    {   // information about host CPU resources MUST be supplied.
-        return false;
-    }
-    if (scheduler_type != SCHEDULER_TYPE_ASYNC && scheduler_type != SCHEDULER_TYPE_COMPUTE)
-    {   // the input scheduler type is not valid.
-        return false;
-    }
-
-    // we want to return a valid configuration, so track the source validation result.
-    bool performance_ok = true;
-    
-    // default (if necessary) and validate the maximum number of ticks-in-flight.
-    if (src_config->MaxActiveTicks == 0)
-    {   // give the destination configuration the default value.
-        dst_config->MaxActiveTicks  = 2;
-    }
-    else
-    {   // copy the value from the input configuration.
-        dst_config->MaxActiveTicks  = src_config->MaxActiveTicks;
-    }
-    // validate the MaxActiveTicks value.
-    if (dst_config->MaxActiveTicks  > MAX_TICKS_IN_FLIGHT)
-    {   // set to the largest acceptable value.
-        ConsoleOutput("WARNING: Too many active ticks in-flight may cause excessive memory usage.\n");
-        dst_config->MaxActiveTicks  = MAX_TICKS_IN_FLIGHT;
-        performance_ok = false;
+    if (host_cpu_info == NULL)
+    {
+        ConsoleError("ERROR: Host CPU information must be supplied to CheckSchedulerConfiguration.\n");
+        performance_warnings = false;
+        config_valid = false;
+        return;
     }
 
-    // default (if necessary) and validate the maximum number of worker threads.
-    if (src_config->MaxWorkerThreads == 0)
-    {   // the default value of this item depends on the scheduler type.
-        if (scheduler_type == SCHEDULER_TYPE_ASYNC)
-        {   // an async task scheduler is expected to have most threads idle/waiting.
-            // therefore, allow it to have more worker threads total to handle additional requests.
-            dst_config->MaxWorkerThreads = cpu_info->HardwareThreads * 2;
-        }
-        else if (scheduler_type == SCHEDULER_TYPE_COMPUTE)
-        {   // a compute task scheduler shouldn't have more threads than there are hardware resources.
-            dst_config->MaxWorkerThreads = cpu_info->HardwareThreads;
+    // retrieve the current system memory usage.
+    MEMORYSTATUSEX memory = {};
+    size_t general_memory = 0;
+    size_t compute_memory = 0;
+    ZeroMemory(&memory, sizeof(MEMORYSTATUSEX));
+    memory.dwLength   = sizeof(MEMORYSTATUSEX);
+    GlobalMemoryStatusEx(&memory);
+
+    {   // validation for the general thread pool.
+        // the general thread pool jobs are expected to be created relatively infrequently,
+        // and each job is expected to be relatively long-lived. having more threads than 
+        // hardware threads helps to keep CPU resources busy when there's no compute work.
+        WIN32_THREAD_POOL_SIZE const &src = src_config->PoolSize[TASK_POOL_GENERAL];
+        WIN32_THREAD_POOL_SIZE       &dst = dst_config->PoolSize[TASK_POOL_GENERAL];
+
+        if (src.MinThreads < 1)
+        {   // the general pool must have at least one background thread.
+            dst.MinThreads = 1;
         }
         else
-        {   // this case should have been caught by the check at the start of the function.
-            ConsoleError("ERROR: Unhandled scheduler_type when defaulting TASK_SCHEDULER_CONFIG::MaxWorkerThreads. Defaulting to 1 thread.\n");
-            dst_config->MaxWorkerThreads = 1;
-            performance_ok = false;
+        {   // copy the value from the source configuration.
+            dst.MinThreads = src.MinThreads;
         }
-    }
-    else
-    {   // copy the value from the input configuration.
-        dst_config->MaxWorkerThreads = src_config->MaxWorkerThreads;
-    }
-    // validate the MaxWorkerThreads value.
-    if (dst_config->MaxWorkerThreads > MAX_WORKER_THREADS)
-    {   // set to the largest acceptable value.
-        ConsoleOutput("WARNING: Too many worker threads requested. An excessive number of worker threads may reduce performance.\n");
-        dst_config->MaxWorkerThreads = MAX_WORKER_THREADS;
-        performance_ok = false;
-    }
-    if (dst_config->MaxWorkerThreads <(cpu_info->HardwareThreads - 2))
-    {   // spit out a warning in this case; the hardware is being under-utilized.
-        ConsoleOutput("WARNING: Fewer worker threads than hardware threads requested; the hardware may be under-utilized.\n");
-        performance_ok = false;
-    }
-    if (dst_config->MaxWorkerThreads >(cpu_info->HardwareThreads * 4))
-    {   // spit out a warning in this case, which is probably hurting more than helping.
-        ConsoleOutput("WARNING: Significantly more worker threads allowed than hardware resources available, which may decrease performance.\n");
-        performance_ok = false;
-    }
-
-    // default (if necessary) and validate the maximum number of tasks per-tick.
-    // this is really best set by the application, but use a reasonable default if none is specified.
-    if (src_config->MaxTasksPerTick == 0)
-    {   // the default value of this item depends on the scheduler type.
-        if (scheduler_type == SCHEDULER_TYPE_ASYNC)
-        {   // an async task scheduler will have far fewer tasks than a compute scheduler.
-            dst_config->MaxTasksPerTick = 512;
-        }
-        else if (scheduler_type == SCHEDULER_TYPE_COMPUTE)
-        {   // a compute task scheduler is expected to spawn many tasks.
-            dst_config->MaxTasksPerTick = 4096;
+        if (src.MaxThreads < 1)
+        {   // the general pool must have at least one background thread.
+            dst.MaxThreads = 1;
         }
         else
-        {   // this case should have been caught by the check at the start of the function.
-            ConsoleError("ERROR: Unhandled scheduler_type when defaulting TASK_SCHEDULER_CONFIG::MaxTasksPerTick. Defaulting to 2048 tasks per-tick.\n");
-            dst_config->MaxTasksPerTick = 2048;
-            performance_ok = false;
+        {   // copy the value from the source configuration.
+            dst.MaxThreads = src.MaxThreads;
         }
+        if (dst.MinThreads > dst.MaxThreads)
+        {   // swap to ensure that max >= min.
+            size_t    temp = dst.MinThreads;
+            dst.MinThreads = dst.MaxThreads;
+            dst.MaxThreads = dst.MinThreads;
+        }
+        if (src.MaxTasks <= (dst.MaxThreads * 4))
+        {   // select a more reasonable value based on available hardware resources.
+            if (host_cpu_info->HardwareThreads <   8) dst.MaxTasks = 256;
+            if (host_cpu_info->HardwareThreads >   8) dst.MaxTasks = 512;
+            if (host_cpu_info->HardwareThreads >  16) dst.MaxTasks = 1024;
+            if (host_cpu_info->HardwareThreads >  32) dst.MaxTasks = 2048;
+            if (host_cpu_info->HardwareThreads >  64) dst.MaxTasks = 4096;
+            if (host_cpu_info->HardwareThreads > 128) dst.MaxTasks = 8192;
+        }
+        else
+        {   // copy the value from the source configuration.
+            dst.MaxTasks = src.MaxTasks;
+        }
+        // the maximum number of tasks per-tick should always be a power of two.
+        if ((dst.MaxTasks & (dst.MaxTasks-1)) != 0)
+        {   // round up to the next largest power-of-two.
+            size_t n = 1;
+            size_t m = dst.MaxTasks;
+            while (n < m)
+            {   // bump up to the next power-of-two.
+                n <<= 1;
+            }
+            dst.MaxTasks = m;
+        }
+        // there is no per-thread memory requirement, so copy the source value directly.
+        // calculate the amount of per-thread memory used in the general pool.
+        dst.ArenaSize   = src.ArenaSize;
+        general_memory  = dst.MaxThreads * dst.ArenaSize;
+        general_memory += dst.MaxThreads * CalculateMemoryForTaskSource(2, dst.MaxTasks);
+    }
+    {   // validation for the compute thread pool.
+        // the compute thread pool jobs are expected to be created very frequently, in large 
+        // numbers, and each job is expected to be very short-lived (one tick or less.)
+        // to avoid over-subscribing CPU resources, limit to the number of hardware threads.
+        WIN32_THREAD_POOL_SIZE const &src = src_config->PoolSize[TASK_POOL_COMPUTE];
+        WIN32_THREAD_POOL_SIZE       &dst = dst_config->PoolSize[TASK_POOL_COMPUTE];
+
+        if (src.MinThreads < 1)
+        {   // the compute pool must have at least one background thread.
+            dst.MinThreads = 1;
+        }
+        else
+        {   // copy the value from the source configuration.
+            dst.MinThreads = src.MinThreads;
+        }
+        if (src.MaxThreads < 1)
+        {   // the compute pool must have at least one background thread.
+            dst.MaxThreads = 1;
+        }
+        else
+        {   // copy the value from the source configuration.
+            dst.MaxThreads = src.MaxThreads;
+        }
+        if (dst.MinThreads > dst.MaxThreads)
+        {   // swap to ensure that max >= min.
+            size_t    temp = dst.MinThreads;
+            dst.MinThreads = dst.MaxThreads;
+            dst.MaxThreads = dst.MinThreads;
+        }
+        if (src.MaxTasks <= (dst.MaxThreads * 64))
+        {   // select a more reasonable value based on available hardware resources.
+            if (host_cpu_info->HardwareThreads <   8) dst.MaxTasks = 2048;
+            if (host_cpu_info->HardwareThreads >   8) dst.MaxTasks = 4096;
+            if (host_cpu_info->HardwareThreads >  16) dst.MaxTasks = 8192;
+            if (host_cpu_info->HardwareThreads >  32) dst.MaxTasks = 16384;
+            if (host_cpu_info->HardwareThreads >  64) dst.MaxTasks = 32768;
+            if (host_cpu_info->HardwareThreads > 128) dst.MaxTasks = 65536;
+        }
+        else
+        {   // copy the value from the source configuration.
+            dst.MaxTasks = src.MaxTasks;
+        }
+        // the maximum number of tasks per-tick should always be a power of two.
+        if ((dst.MaxTasks & (dst.MaxTasks-1)) != 0)
+        {   // round up to the next largest power-of-two.
+            size_t n = 1;
+            size_t m = dst.MaxTasks;
+            while (n < m)
+            {   // bump up to the next power-of-two.
+                n <<= 1;
+            }
+            dst.MaxTasks = m;
+        }
+        // there is no per-thread memory requirement, so copy the source value directly.
+        // calculate the amount of per-thread memory used in the general pool.
+        dst.ArenaSize   = src.ArenaSize;
+        compute_memory  = dst.MaxThreads * dst.ArenaSize;
+        compute_memory += dst.MaxThreads * CalculateMemoryForTaskSource(2, dst.MaxTasks);
+    }
+
+    {   // validate configuration against system limits.
+        if ((dst_config->PoolSize[TASK_POOL_GENERAL].MaxThreads  + 
+             dst_config->PoolSize[TASK_POOL_COMPUTE].MaxThreads) > MAX_WORKER_THREADS)
+        {   // there are too many worker threads for the software to support.
+            ConsoleError("ERROR: Too many worker threads for this scheduler implementation. Max is %u.\n", MAX_WORKER_THREADS);
+            performance_warnings = false;
+            config_valid = false;
+            return;
+        }
+        if (dst_config->PoolSize[TASK_POOL_GENERAL].MaxTasks > MAX_TASKS_PER_BUFFER)
+        {   // there are too many tasks for the scheduler to suport.
+            ConsoleError("ERROR: Too many tasks per-worker in the general pool. Max is %u.\n", MAX_TASKS_PER_BUFFER);
+            performance_warnings = false;
+            config_valid = false;
+            return;
+        }
+        if (dst_config->PoolSize[TASK_POOL_COMPUTE].MaxTasks > MAX_TASKS_PER_BUFFER)
+        {   // there are too many tasks for the scheduler to suport.
+            ConsoleError("ERROR: Too many tasks per-worker in the compute pool. Max is %u.\n", MAX_TASKS_PER_BUFFER);
+            performance_warnings = false;
+            config_valid = false;
+            return;
+        }
+        if ((general_memory + compute_memory) >= memory.ullAvailPhys)
+        {   // too much per-thread memory is requested; allocation will never succeed.
+            ConsoleError("ERROR: Too much thread-local memory requested. Requested %zu bytes, but only %zu bytes available.\n", (general_memory+compute_memory), memory.ullAvailPhys);
+            performance_warnings = false;
+            config_valid = false;
+            return;
+        }
+    }
+
+    {   // validate configuration performance against available resources.
+        if ((double) (general_memory + compute_memory) >= (memory.ullAvailPhys * 0.8))
+        {   // dangerously close to consuming all available physical memory in the system.
+            ConsoleOutput("WARNING: Scheduler will consume >= 80 percent of available physical memory. Swapping may occur.\n");
+            performance_warnings = true;
+        }
+        if (dst_config->PoolSize[TASK_POOL_COMPUTE].MaxThreads > host_cpu_info->HardwareThreads)
+        {   // the host CPU is probably over-subscribed.
+            ConsoleOutput("WARNING: Compute pool has more threads than host CPU(s). Performance may be degraded.\n");
+            performance_warnings = true;
+        }
+    }
+
+    size_t general_threads = dst_config->PoolSize[TASK_POOL_GENERAL].MaxThreads;
+    size_t compute_threads = dst_config->PoolSize[TASK_POOL_COMPUTE].MaxThreads;
+    size_t   total_threads = general_thread + compute_threads;
+    if (src_config->MaxTaskSources < (total_threads + 1))
+    {   // calculate an appropriate default value based on the thread pool sizes.
+        dst_config->MaxTaskSources = (total_threads + 1); // the minimum acceptable value.
     }
     else
-    {   // copy the value from the input configuration.
-        dst_config->MaxTasksPerTick = src_config->MaxTasksPerTick;
+    {   // copy the value from the source configuration.
+        dst_config->MaxTaskSources =  src_config->MaxTaskSources;
     }
-    // the maximum number of tasks per-tick should always be a power of two.
-    if ((dst_config->MaxTasksPerTick & (dst_config->MaxTasksPerTick-1)) != 0)
-    {   // round up to the next largest power-of-two.
-        size_t n = 1;
-        size_t m = dst_config->MaxTasksPerTick;
-        while (n < m)
-        {   // bump up to the next power-of-two.
-            n <<= 1;
-        }
-        dst_config->MaxTasksPerTick = m;
+    if (dst_config->MaxTaskSources > MAX_SCHEDULER_THREADS)
+    {   // the global scheduler limit has been exceeded.
+        ConsoleError("ERROR: Too many task sources. Max is %u.\n", MAX_SCHEDULER_THREADS);
+        config_valid = false;
+        return;
     }
-    // validate the MaxTasksPerTick value.
-    if (dst_config->MaxTasksPerTick > MAX_TASKS_PER_TICK)
-    {   // set to the largest acceptable value.
-        ConsoleOutput("WARNING: Too many tasks per-tick will be spawned. Errors or excessive memory usage may result.\n");
-        dst_config->MaxTasksPerTick = MAX_TASKS_PER_TICK;
-        performance_ok = false;
-    }
-
-    // default (if necessary) and validate the maximum amount of worker thread-local memory.
-    if (src_config->MaxTaskArenaSize == 0)
-    {   // give each thread up to 2MB.
-        dst_config->MaxTaskArenaSize = WORKER_THREAD_ARENA_SIZE_DEFAULT;
-    }
-    else
-    {   // copy the value from the input configuration. this handles WORKER_THREAD_ARENA_NOT_NEEDED also.
-        dst_config->MaxTaskArenaSize = src_config->MaxTaskArenaSize;
-    }
-
-    MEMORYSTATUSEX mem_info = {};
-    mem_info.dwLength       = sizeof(MEMORYSTATUSEX);
-    if (GlobalMemoryStatusEx(&mem_info) && (dst_config->MaxTaskArenaSize  != WORKER_THREAD_ARENA_NOT_NEEDED))
-    {   // if the total amount of memory requested exceeds the amount of available physical memory, issue a warning.
-        if (((DWORDLONG) dst_config->MaxWorkerThreads * (DWORDLONG) dst_config->MaxTaskArenaSize) >= mem_info.ullTotalPhys)
-        {
-            ConsoleOutput("WARNING: Total amount of task memory exceeds total physical memory.\n");
-            performance_ok = false;
-        }
-    }
-
-    return performance_ok;
+    config_valid = true;
 }
 
 /// @summary Allocate and initialize a TASK_SOURCE from a scheduler instance.
@@ -1669,9 +1797,8 @@ CreateScheduler
     MEMORY_ARENA                    *arena
 )
 {
-    TASK_SCHEDULER_CONFIG valid_config = {};
-    WIN32_CPU_INFO           *cpu_info = main_args->HostCPUInfo;
-    size_t                   alignment = std::alignment_of<WIN32_COMPUTE_TASK_SCHEDULER>::value;
+    WIN32_CPU_INFO *cpu_info = main_args->HostCPUInfo;
+    size_t         alignment = std::alignment_of<WIN32_TASK_SCHEDULER>::value;
 
     CheckSchedulerConfiguration(&valid_config, config, cpu_info, SCHEDULER_TYPE_COMPUTE);
     if (max_sources == 0)
