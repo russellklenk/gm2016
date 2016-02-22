@@ -1,3 +1,7 @@
+Fast counting semaphore implementation
+Use counting semaphore for SignalWaitingWorkers -> SignalWaitingWorkers(s, N)
+Use counting semaphore for GENERAL_TASK_QUEUE
+Finish refactoring scheduler startup and shutdown
 Add the ability to try stealing from a random task. Waiting on the events is expensive.
 Figure out how to avoid having to constantly call SignalWaitingWorkers, which signals a kernel-mode event.
 Continue to test scheduler and fix functional issues.
