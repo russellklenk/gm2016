@@ -591,7 +591,8 @@ ComputeTaskQueueClear
 /// @param queue The task queue to initialize.
 /// @param capacity The capacity of the queue. This value must be a power of two greater than zero.
 /// @param arena The memory arena to allocate from. The caller should ensure that sufficient memory is available.
-internal_function void
+/// @return Zero if the queue is created successfully, or -1 if an error occurred.
+internal_function int
 CreateComputeTaskQueue
 (
     COMPUTE_TASK_QUEUE   *queue, 
@@ -604,6 +605,7 @@ CreateComputeTaskQueue
     queue->Private.store(0, std::memory_order_relaxed);
     queue->Mask  = int64_t(capacity) - 1;
     queue->Tasks = PushArray<task_id_t>(arena, capacity);
+    return 0;
 }
 
 /// @summary Calculate the amount of memory required to store a task queue.
@@ -1729,57 +1731,63 @@ NewTaskSource
         }
         buffer_size = n;
     }
-    if (buffer_size > MAX_TASKS_PER_TICK)
+    if (buffer_size > MAX_TASKS_PER_BUFFER)
     {   // consider this to be an error; it's easily trapped during development.
+        ConsoleError("ERROR: NewTaskSource - requested buffer size %zu exceeds maximum %u.\n", buffer_size, MAX_TASKS_PER_BUFFER);
         return NULL;
     }
-    if (scheduler->SourceCount == scheduler->MaxSourceCount)
+    if (scheduler->SourceCount == scheduler->MaxSources)
     {   // no additional sources can be allocated from the scheduler.
+        ConsoleError("ERROR: NewTaskSource - max sources exceeded; increase limit WIN32_TASK_SCHEDULER_CONFIG::MaxTaskSources.\n");
         return NULL;
     }
-    size_t bytes_needed = CalculateMemoryForTaskSource(2, buffer_size);
-    size_t alignment    = std::alignment_of<void*>::value;
+    size_t buffer_count = 2;
+    size_t bytes_needed = CalculateMemoryForTaskSource(buffer_count, buffer_size);
+    size_t    alignment = std::alignment_of<WIN32_TASK_SOURCE>::value;
     if (!ArenaCanAllocate(arena, bytes_needed, alignment))
     {   // the arena doesn't have sufficient memory to initialize a source with the requested attributes.
+        ConsoleError("ERROR: NewTaskSource - insufficient memory in global arena; need %zu bytes.\n", bytes_needed);
         return NULL;
     }
 
-    size_t const   PER_GROUP =  64;
-    size_t        num_groups =((scheduler->MaxSourceCount - 1) / PER_GROUP) + 1;
-    size_t         remaining =  scheduler->MaxSourceCount - (PER_GROUP * (num_groups - 1));
-    size_t        last_group =  num_groups - 1;
-    size_t        this_group =  scheduler->SourceCount / PER_GROUP;
-    COMPUTE_TASK_SOURCE *src = &scheduler->SourceList[scheduler->SourceCount];
-    src->StealSignal         = CreateEvent(NULL, FALSE, FALSE, NULL); // auto-reset
-    src->GroupIndex          = this_group;
-    src->SourceIndex         =(uint32_t)  scheduler->SourceCount;
-    src->SourceGroupSize     =(uint32_t)((this_group == last_group) ? remaining : PER_GROUP);
-    src->MaxTicksInFlight    = max_active_ticks;
-    src->MaxTasksPerTick     = max_tasks_per_tick;
-    src->TaskSourceCount     = scheduler->MaxSourceCount;
-    src->TaskSources         = scheduler->SourceList;
-    src->BufferIndex         = 0;
-    src->TaskCount           = 0;
-    CreateComputeTaskQueue(&src->WorkQueue , max_tasks_per_tick, arena);
-    for (size_t i = 0, n = max_active_ticks; i < n; ++i)
+    WIN32_TASK_SOURCE *source =&scheduler->SourceList[scheduler->SourceCount];
+    if (CreateComputeTaskQueue(&source->WorkQueue, buffer_size, arena) < 0)
+    {   // unable to initialize the work-stealing dequeue for the source.
+        ConsoleError("ERROR: NewTaskSource - failed to create compute task queue.\n");
+        return NULL;
+    }
+    if (CreateSemaphore(&source->StealSignal , 0, 1024) < 0)
+    {   // unable to allocate the semaphore used for waking worker threads.
+        ConsoleError("ERROR: NewTaskSource - failed to create work-stealing semaphore (%08X).\n", GetLastError());
+        return NULL;
+    }
+    source->SourceIndex    = scheduler->SourceCount;
+    source->SourceCount    = scheduler->MaxSources;
+    source->TaskSources    = scheduler->SourceList;
+    source->TasksPerBuffer = buffer_size;
+    source->BufferIndex    = 0;
+    source->TaskCount      = 0;
+    for (size_t i = 0; i < buffer_count; ++i)
     {
-        src->WorkItems [i] = PushArray<COMPUTE_TASK>(arena, max_tasks_per_tick);
-        src->WorkCounts[i] = PushArray<int32_t     >(arena, max_tasks_per_tick);
-        src->PermitList[i] = PushArray<PERMITS_LIST>(arena, max_tasks_per_tick);
+        source->WorkItems [i] = PushArray<COMPUTE_TASK_DATA>(arena, buffer_size);
+        source->WorkCounts[i] = PushArray<int32_t          >(arena, buffer_size);
+        source->PermitList[i] = PushArray<PERMITS_LIST     >(arena, buffer_size);
     }
     scheduler->SourceCount++;
-    return src;
+    return source;
 }
 
-/// @summary Wake exactly one waiting worker thread if there's work it could steal. Call this if one or more items are added to a work queue.
+/// @summary Wake exactly one or more waiting worker threads if there's work to be stolen. Call this if one or more items are added to a work queue.
 /// @param source The WIN32_TASK_SOURCE owned by the calling thread.
+/// @param count The number of resources made available in the work queue.
 public_function void
 SignalWaitingWorkers
 (
-    WIN32_TASK_SOURCE *source
+    WIN32_TASK_SOURCE *source, 
+    size_t              count
 )
-{   // TODO(rlk): should be a counting semaphore; call SignalWaitingWorkers(source, N).
-    SetEvent(source->StealSignal);
+{
+    PostSemaphore(source->StealSignal, int32_t(count));
 }
 
 /// @summary Create a new asynchronous task scheduler instance. The scheduler worker threads are launched separately.
