@@ -170,6 +170,15 @@ enum TASK_POOL : uint32_t
     TASK_POOL_COUNT         = 2                  /// The number of thread pools defined by the scheduler.
 };
 
+/// @summary Define the data associated with a spinning semaphore, which is guaranteed to remain in user mode unless a thread must be put to sleep or woken.
+struct SEMAPHORE
+{   static size_t const     PAD                    = CACHELINE_SIZE - sizeof(std::atomic<int32_t>);
+    std::atomic<int32_t>    Count;               /// The current count of the semaphore.
+    uint8_t                 Padding[PAD];        /// Unused padding out to the next cacheline boundary.
+    int32_t                 SpinCount;           /// The spin count assigned to the semaphore at creation time.
+    HANDLE                  KSem;                /// The handle of the kernel semaphore object.
+};
+
 /// @summary Define a structure specifying the constituent parts of a task ID.
 struct TASK_ID_PARTS
 {
@@ -212,7 +221,7 @@ struct COMPUTE_TASK_DATA
 /// The work item data is stored directly within the queue. All tasks in the queue are in the ready-to-run state. A single queue feeds all workers.
 struct GENERAL_TASK_QUEUE
 {   static size_t const     ALIGNMENT              = CACHELINE_SIZE;
-    static size_t const     PAD                    = CACHELINE_SIZE - sizeof(uint32_t);
+    static size_t const     PAD                    = CACHELINE_SIZE - sizeof(std::atomic<uint32_t>);
     std::atomic<uint32_t>   Tail;                /// The index at which items are enqueued, representing the tail of the queue.
     uint8_t                 Pad0[PAD];           /// Padding separating producer data from consumer data.
     std::atomic<uint32_t>   Head;                /// The index at which items are dequeued, representing the head of the queue.
@@ -225,7 +234,7 @@ struct GENERAL_TASK_QUEUE
 /// The worker thread can perform push and take operations. Other worker threads can perform concurrent steal operations.
 struct COMPUTE_TASK_QUEUE
 {   static size_t const     ALIGNMENT              = CACHELINE_SIZE;
-    static size_t const     PAD                    = CACHELINE_SIZE - sizeof(int64_t);
+    static size_t const     PAD                    = CACHELINE_SIZE - sizeof(std::atomic<int64_t>);
     std::atomic<int64_t>    Public;              /// The public end of the deque, updated by steal operations (Top).
     uint8_t                 Pad0[PAD];           /// Padding separating the public data from the private data.
     std::atomic<int64_t>    Private;             /// The private end of the deque, updated by push and take operations (Bottom).
@@ -312,20 +321,13 @@ struct WIN32_THREAD_POOL_CONFIG
 /// @summary Define the data associated with a thread that can produce compute tasks (but not necessarily execute them.)
 /// Each worker thread in the scheduler thread pool is a COMPUTE_TASK_SOURCE that can also execute tasks.
 /// The maximum number of task sources is fixed at scheduler creation time.
-struct WIN32_TASK_SOURCE
+struct cacheline_align WIN32_TASK_SOURCE
 {   static size_t const      ALIGNMENT              = CACHELINE_SIZE;
 
-#pragma warning(push)
-#pragma warning(disable:4324)                    /// WARNING: structure was padded due to __declspec(align())
-    cacheline_align
     COMPUTE_TASK_QUEUE       WorkQueue;          /// The queue of ready-to-run task IDs.
-#pragma warning(pop)
 
-    HANDLE                   StealSignal;        /// An auto-reset event used to wake a single thread when work can be stolen.
-    size_t                   GroupIndex;         /// The zero-based index of the source group.
-    uint32_t                 SourceGroupSize;    /// The number of sources in the source group. Each source group may contain up to 64 sources. Constant.
-    uint32_t                 SourceIndex;        /// The zero-based index of the source within the source list. Constant.
-
+    SEMAPHORE                StealSignal;        /// An auto-reset event used to wake a single thread when work can be stolen.
+    size_t                   SourceIndex;        /// The zero-based index of the source within the source list.
     size_t                   SourceCount;        /// The total number of task sources defined in the scheduler. Constant.
     WIN32_TASK_SOURCE       *TaskSources;        /// The list of per-source state for each task source. Managed by the scheduler.
     
@@ -1268,6 +1270,126 @@ DefineComputeTask
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
+/// @summary Create a new semaphore object initialized with the specified resource count and spin count.
+/// @param sem The semaphore object to initialize.
+/// @param n The initial resource count of the semaphore.
+/// @param spin_count The spin count.'
+/// @return Zero if the semaphore is created successfully, or -1 if an error occurred.
+public_function inline int
+CreateSemaphore
+(
+    SEMAPHORE       *sem, 
+    int32_t            n, 
+    int32_t   spin_count
+)
+{
+    sem->Count.N.store(n, std::memory_order_relaxed);
+    sem->SpinCount = spin_count > 1 ? spin_count : 1;
+    sem->KSem = CreateSemaphore(NULL, 0, LONG_MAX, NULL);
+    return (sem->KSem != NULL) ? 0 : -1;
+}
+
+/// @summary Free resources associated with a semaphore object.
+/// @param sem The semaphore to delete.
+public_function inline void
+DeleteSemaphore
+(
+    SEMAPHORE *sem
+)
+{
+    if (sem->KSem != NULL)
+    {
+        CloseHandle(sem->KSem);
+        sem->KSem = NULL;
+    }
+}
+
+/// @summary Decrement a semaphore's internal counter and return whether or not a resource was available.
+/// @param sem The semaphore to decrement.
+/// @return true if a resource was available, or false if no resources are available.
+public_function inline bool
+TryWaitSemaphore
+(
+    SEMAPHORE *sem
+)
+{
+    int32_t count = sem->Count.N.load(std::memory_order_acquire);
+    while  (count > 0)
+    {
+        if (sem->Count.N.compare_exchange_weak(count, count - 1, std::memory_order_acq_rel, std::memory_order_relaxed))
+            return true;
+        // else, count was reloaded - optional backoff.
+    }
+    return false;
+}
+
+/// @summary Attempt to acquire a resource (decrement the semaphore's internal counter) and block the calling thread if none are available.
+/// @param sem The semaphore to decrement.
+public_function inline void
+WaitSemaphoreNoSpin
+(
+    SEMAPHORE *sem
+)
+{
+    if (sem->Count.N.fetch_add(-1, std::memory_order_acq_rel) < 1)
+        WaitForSingleObject(sem->KSem, INFINITE);
+}
+
+/// @summary Attempt to acquire a resource (decrement the semaphore's internal counter) and block the calling thread if none are available.
+/// @param sem The semaphore to decrement.
+public_function void
+WaitSemaphore
+(
+    SEMAPHORE *sem
+)
+{
+    int32_t spin_count = sem->SpinCount;
+    while  (spin_count--)
+    {   // attempt to acquire the resource.
+        int32_t count = sem->Count.N.load(std::memory_order_acquire);
+        while  (count > 0)
+        {
+            if (sem->Count.N.compare_exchange_weak(count, count-1, std::memory_order_acq_rel, std::memory_order_relaxed))
+                return; // successfully acquired a resource.
+            // else, count was reloaded - optional backoff?
+        }
+    }
+    // no additional spin cycles remaining; try one more time to acquire a resource and wait if none are available.
+    if (sem->Count.N.fetch_add(-1, std::memory_order_acq_rel) < 1)
+        WaitForSingleObject(sem->KSem, INFINITE);
+}
+
+/// @summary Make a resource available (increment the semaphore's internal counter) and unblock a single waiting thread.
+/// @param sem The semaphore to increment.
+public_function inline void
+PostSemaphore
+(
+    SEMAPHORE *sem
+)
+{   // only signal the underlying semaphore of there was at least one thread waiting.
+    if (sem->Count.N.fetch_add(1, std::memory_order_acq_rel) < 0)
+        ReleaseSemaphore(sem->KSem, 1, 0);
+}
+
+/// @summary Make one or more resources available (increment the semaphore's internal counter) and unblock one or more waiting threads.
+/// @param sem The semaphore to increment.
+/// @param n The number of resources to make available.
+public_function void
+PostSemaphore
+(
+    SEMAPHORE *sem, 
+    int32_t      n
+)
+{
+    int32_t old = sem->Count.N.fetch_add(n, std::memory_order_acq_rel);
+    if (old < 0)
+    {
+        int32_t min_waiters =-old;
+        int32_t num_to_wake = num_waiters < n ? num_waiters : n; // min(num_waiters, n)
+        ReleaseSemaphore(sem->KSem, num_to_wake, 0);
+    }
+}
+
 /// @summary Retrieve the zero-based index of the thread that created a task.
 /// @param id The task identifier.
 /// @return The zero-based index of the thread that created the task.
