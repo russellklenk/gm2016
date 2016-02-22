@@ -367,6 +367,7 @@ struct WIN32_THREAD_POOL_SIZE
 /// @summary Define a structure used to specify data used to configure a task scheduler instance at creation time.
 struct WIN32_TASK_SCHEDULER_CONFIG
 {   static size_t const      NUM_POOLS             = TASK_POOL_COUNT;
+    WIN32_THREAD_ARGS       *MainThreadArgs;     /// The global data managed by the main thread and available to all threads.
     size_t                   MaxTaskSources;     /// The maximum number of threads (task sources) that can create tasks.
     WIN32_THREAD_POOL_SIZE   PoolSize[NUM_POOLS];/// The maximum number of worker threads in each type of thread pool.
 };
@@ -1481,39 +1482,33 @@ DefaultSchedulerConfiguration
 /// @summary Validates a given scheduler configuration.
 /// @param dst_config The configuration object to receive the validated configuration data.
 /// @param src_config The configuration object specifying the input configuration data.
-/// @param host_cpu_info Information about the CPU resources of the host system.
-/// @param config_valid On return, set to true if a valid configuration was written to dst_config.
 /// @param performance_warnings On return, set to true if one or more performance warnings were emitted.
-public_function void
+/// @return Zero if the configuration is valid, or -1 if the configuration is not valid.
+public_function int
 CheckSchedulerConfiguration
 (
-    WIN32_TASK_SCHEDULER_CONFIG          *dst_config, 
-    WIN32_TASK_SCHEDULER_CONFIG const    *src_config,
-    WIN32_CPU_INFO              const *host_cpu_info,
-    bool                               &config_valid, 
-    bool                       &performance_warnings
+    WIN32_TASK_SCHEDULER_CONFIG       *dst_config, 
+    WIN32_TASK_SCHEDULER_CONFIG const *src_config,
+    bool                    &performance_warnings
 )
 {
     if (dst_config == NULL)
     {
         ConsoleError("ERROR: A destination scheduler configuration (dst_config) must be supplied to CheckSchedulerConfiguration.\n");
         performance_warnings = false;
-        config_valid = false;
-        return;
+        return -1;
     }
     if (src_config == NULL)
     {
         ConsoleError("ERROR: A source scheduler configuration (src_config) must be supplied to CheckSchedulerConfiguration.\n");
         performance_warnings = false;
-        config_valid = false;
-        return;
+        return -1;
     }
-    if (host_cpu_info == NULL)
+    if (src_config->MainThreadArgs == NULL || src_config->MainThreadArgs->HostCPUInfo == NULL)
     {
         ConsoleError("ERROR: Host CPU information must be supplied to CheckSchedulerConfiguration.\n");
         performance_warnings = false;
-        config_valid = false;
-        return;
+        return -1;
     }
 
     // retrieve the current system memory usage.
@@ -1649,29 +1644,35 @@ CheckSchedulerConfiguration
         {   // there are too many worker threads for the software to support.
             ConsoleError("ERROR: Too many worker threads for this scheduler implementation. Max is %u.\n", MAX_WORKER_THREADS);
             performance_warnings = false;
-            config_valid = false;
-            return;
+            return -1;
         }
         if (dst_config->PoolSize[TASK_POOL_GENERAL].MaxTasks > MAX_TASKS_PER_BUFFER)
         {   // there are too many tasks for the scheduler to suport.
             ConsoleError("ERROR: Too many tasks per-worker in the general pool. Max is %u.\n", MAX_TASKS_PER_BUFFER);
             performance_warnings = false;
-            config_valid = false;
-            return;
+            return -1;
         }
         if (dst_config->PoolSize[TASK_POOL_COMPUTE].MaxTasks > MAX_TASKS_PER_BUFFER)
         {   // there are too many tasks for the scheduler to suport.
             ConsoleError("ERROR: Too many tasks per-worker in the compute pool. Max is %u.\n", MAX_TASKS_PER_BUFFER);
             performance_warnings = false;
-            config_valid = false;
-            return;
+            return -1;
         }
         if ((general_memory + compute_memory) >= memory.ullAvailPhys)
         {   // too much per-thread memory is requested; allocation will never succeed.
             ConsoleError("ERROR: Too much thread-local memory requested. Requested %zu bytes, but only %zu bytes available.\n", (general_memory+compute_memory), memory.ullAvailPhys);
             performance_warnings = false;
-            config_valid = false;
-            return;
+            return -1;
+        }
+        if (src_config->MainThreadArgs != NULL)
+        {   // copy the value from the source configuration.
+            dst_config->MainThreadArgs  = src_config->MainThreadArgs;
+        }
+        else
+        {   // a valid WIN32_THREAD_ARGS must be supplied.
+            ConsoleError("ERROR: No WIN32_THREAD_ARGS specified in scheduler configuration.\n");
+            performance_warnings = false;
+            return -1;
         }
     }
 
@@ -1702,10 +1703,9 @@ CheckSchedulerConfiguration
     if (dst_config->MaxTaskSources > MAX_SCHEDULER_THREADS)
     {   // the global scheduler limit has been exceeded.
         ConsoleError("ERROR: Too many task sources. Max is %u.\n", MAX_SCHEDULER_THREADS);
-        config_valid = false;
-        return;
+        return -1;
     }
-    config_valid = true;
+    return 0;
 }
 
 /// @summary Allocate and initialize a TASK_SOURCE from a scheduler instance.
@@ -1793,91 +1793,120 @@ SignalWaitingWorkers
 /// @summary Create a new asynchronous task scheduler instance. The scheduler worker threads are launched separately.
 /// @param scheduler The scheduler instance to initialize.
 /// @param config The scheduler configuration.
-/// @param main_args The global data managed by the main thread and passed to all worker threads.
 /// @param arena The memory arena used to allocate scheduler memory. Per-worker memory is allocated directly from the OS.
-/// @param max_sources The maximum number of task sources. The minimum value is the number of worker threads plus one for the main thread.
 /// @return A pointer to the new scheduler instance, or NULL.
 public_function int
 CreateScheduler
 (
-    WIN32_TASK_SCHEDULER        *scheduler, 
-    TASK_SCHEDULER_CONFIG const    *config, 
-    MEMORY_ARENA                    *arena
+    WIN32_TASK_SCHEDULER              *scheduler, 
+    WIN32_TASK_SCHEDULER_CONFIG const    *config,
+    MEMORY_ARENA                          *arena
 )
-{
-    WIN32_CPU_INFO *cpu_info = main_args->HostCPUInfo;
-    size_t         alignment = std::alignment_of<WIN32_TASK_SCHEDULER>::value;
+{   // zero the scheduler object to prevent double-free errors.
+    ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
 
-    CheckSchedulerConfiguration(&valid_config, config, cpu_info, SCHEDULER_TYPE_COMPUTE);
-    if (max_sources == 0)
-    {   // use the default, which is worker thread count + 1 for the main thread.
-        max_sources = valid_config.MaxWorkerThreads + 1;
-    }
-    if (max_sources <(valid_config.MaxWorkerThreads + 1))
-    {   // enforce a minimum value, each worker needs to be able to produce tasks.
-        max_sources = valid_config.MaxWorkerThreads + 1;
-    }
-    if (max_sources > MAX_SCHEDULER_THREADS)
-    {   // requesting more than the maximum supported number of sources is an error.
-        ConsoleError("ERROR: Too many task sources requested (%u); max is %u.\n", (unsigned) max_sources, (unsigned) MAX_SCHEDULER_THREADS);
-        return -1;
-    }
-    size_t expected_size = CalculateMemoryForComputeScheduler(&valid_config, max_sources);
-    if (!ArenaCanAllocate(arena, expected_size, alignment))
-    {   // there's not enough memory for the core scheduler and worker data.
-        ConsoleError("ERROR: Insufficient memory in arena for task scheduler; need at least %zu bytes.\n", expected_size);
-        return -1;
-    }
-
-    size_t mem_mark = ArenaMarker(arena);
-    HANDLE ev_error = CreateEvent(NULL, TRUE, FALSE, NULL);
-    HANDLE ev_start = CreateEvent(NULL, TRUE, FALSE, NULL);
-    HANDLE ev_halt  = CreateEvent(NULL, TRUE, FALSE, NULL);
-
-    scheduler->ErrorSignal      = ev_error;
-    scheduler->StartSignal      = ev_start;
-    scheduler->HaltSignal       = ev_halt;
-    scheduler->ThreadCount      = 0;
-    scheduler->OSThreadIds      = PushArray<unsigned int  >(arena, valid_config.MaxWorkerThreads);
-    scheduler->OSThreadHandle   = PushArray<HANDLE        >(arena, valid_config.MaxWorkerThreads);
-    scheduler->WorkerState      = PushArray<COMPUTE_WORKER>(arena, valid_config.MaxWorkerThreads);
-    scheduler->MaxTicksInFlight = valid_config.MaxActiveTicks;
-    scheduler->MaxTasksPerTick  = valid_config.MaxTasksPerTick;
-    scheduler->MaxSourceCount   = max_sources;
-    scheduler->SourceCount      = 0;
-    scheduler->SourceList       = PushArray<COMPUTE_TASK_SOURCE>(arena, max_sources);
-    ZeroMemory(scheduler->OSThreadIds   , valid_config.MaxWorkerThreads * sizeof(unsigned int));
-    ZeroMemory(scheduler->OSThreadHandle, valid_config.MaxWorkerThreads * sizeof(HANDLE));
-    ZeroMemory(scheduler->WorkerState   , valid_config.MaxWorkerThreads * sizeof(COMPUTE_WORKER));
-    ZeroMemory(scheduler->SourceList    , max_sources                   * sizeof(COMPUTE_TASK_SOURCE));
-
-    // always allocate source 0 to the main thread.
-    NewComputeTaskSource(scheduler, arena, 0, 0);
-
-    // spawn the worker threads. each thread is allocated a task source.
-    size_t spawn_count = SCHEDULER_MIN(valid_config.MaxWorkerThreads, cpu_info->HardwareThreads);
-    for (size_t i = 0; i < spawn_count; ++i)
+    // validate the scheduler configuration.
+    WIN32_TASK_SCHEDULER_CONFIG valid_config = {};
+    bool                performance_warnings = false;
+    if (CheckSchedulerConfiguration(&valid_config, config, performance_warnings) < 0)
     {
-        if (!SpawnComputeWorker(&valid_config, scheduler, main_args, arena))
-        {   // the worker thread could not be started, or failed to initialize.
-            // there's no point in continuing.
-            goto cleanup_and_fail;
-        }
+        ConsoleError("ERROR: CreateScheduler - invalid scheduler configuration.\n");
+        return -1;
+    }
+    if (performance_warnings)
+    {
+        ConsoleOutput("WARNING: CreateScheduler - one or more performance warnings. Check console.\n");
+    }
+
+    size_t mem_marker   = ArenaMarker(arena);
+    size_t mem_required = CalculateMemoryForScheduler(&valid_config);
+    if (!ArenaCanAllocate(arena, mem_required, std::alignment_of<WIN32_TASK_SCHEDULER>::value))
+    {
+        ConsoleError("ERROR: CreateScheduler - insufficient memory; %zu bytes required.\n", mem_required);
+        return -1;
+    }
+
+    HANDLE ev_error     = CreateEvent(NULL, TRUE, FALSE, NULL);
+    HANDLE ev_launch    = CreateEvent(NULL, TRUE, FALSE, NULL);
+    HANDLE ev_terminate = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (ev_error == NULL || ev_launch == NULL || ev_terminate == NULL)
+    {   // the scheduler cannot control worker threads without synchronization objects.
+        ConsoleError("ERROR: CreateScheduler - unable to create synchronization events (%08X).\n", GetLastError());
+        if (ev_terminate != NULL) CloseHandle(ev_terminate);
+        if (ev_launch    != NULL) CloseHandle(ev_launch);
+        if (ev_error     != NULL) CloseHandle(ev_error);
+        return -1;
+    }
+
+    // initialize, but do not launch, the general task thread pool.
+    WIN32_THREAD_POOL_CONFIG general_config = {};
+    general_config.TaskScheduler   = scheduler;
+    general_config.ThreadMain      = GeneralWorkerMain;
+    general_config.MainThreadArgs  = valid_config.MainThreadArgs;
+    general_config.MinThreads      = valid_config.PoolSize[TASK_POOL_GENERAL].MinThreads;
+    general_config.MaxThreads      = valid_config.PoolSize[TASK_POOL_GENERAL].MaxThreads;
+    general_config.WorkerArenaSize = valid_config.PoolSize[TASK_POOL_GENERAL].ArenaSize;
+    general_config.StartSignal     = ev_launch;
+    general_config.ErrorSignal     = ev_error;
+    general_config.TerminateSignal = ev_terminate;
+    general_config.FlagsTransient  = WORKER_FLAGS_GENERAL | WORKER_FLAGS_TRANSIENT;
+    general_config.FlagsPersistent = WORKER_FLAGS_GENERAL;
+    if (CreateThreadPool(&scheduler->GeneralPool, &general_config, arena) < 0)
+    {
+        ConsoleError("ERROR: CreateScheduler - unable to create general thread pool.\n");
+        CloseHandle(ev_terminate);
+        CloseHandle(ev_launch);
+        CloseHandle(ev_error);
+        return -1;
+    }
+
+    // initialize, but do not launch, the compute task thread pool.
+    WIN32_THREAD_POOL_CONFIG compute_config = {};
+    compute_config.TaskScheduler   = scheduler;
+    compute_config.ThreadMain      = ComputeWorkerMain;
+    compute_config.MainThreadArgs  = valid_config.MainThreadArgs;
+    compute_config.MinThreads      = valid_config.PoolSize[TASK_POOL_COMPUTE].MinThreads;
+    compute_config.MaxThreads      = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxThreads;
+    compute_config.WorkerArenaSize = valid_config.PoolSize[TASK_POOL_COMPUTE].ArenaSize;
+    compute_config.StartSignal     = ev_launch;
+    compute_config.ErrorSignal     = ev_error;
+    compute_config.TerminateSignal = ev_terminate;
+    compute_config.FlagsTransient  = WORKER_FLAGS_COMPUTE | WORKER_FLAGS_TRANSIENT;
+    compute_config.FlagsPersistent = WORKER_FLAGS_COMPUTE;
+    if (CreateThreadPool(&scheduler->ComputePool, &compute_config, arena) < 0)
+    {   // the general task thread pool shares synchronization events, so it was told to exit.
+        ConsoleError("ERROR: CreateScheduler - unable to create compute thread pool.\n");
+        CloseHandle(ev_terminate);
+        CloseHandle(ev_launch);
+        CloseHandle(ev_error);
+        return -1;
+    }
+
+    // primary scheduler initialization is finished:
+    scheduler->MaxSources      = valid_config.MaxTaskSources;
+    scheduler->SourceCount     = 0;
+    scheduler->SourceList      = PushArray<WIN32_TASK_SOURCE>(valid_config.MaxTaskSources);
+    scheduler->StartSignal     = ev_launch;
+    scheduler->ErrorSignal     = ev_error;
+    scheduler->TerminateSignal = ev_terminate;
+    ZeroMemory(scheduler->SourceList, valid_config.MaxTaskSources * sizeof(WIN32_TASK_SOURCE));
+
+    // allocate task source index 0 to the 'root' thread.
+    size_t general_tasks = valid_config.PoolSize[TASK_POOL_GENERAL].MaxTasks;
+    size_t compute_tasks = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxTasks;
+    size_t max_max_tasks = compute_tasks > general_tasks ? compute_tasks : general_tasks;
+    if (NewTaskSource(scheduler, arena, max_max_tasks) == NULL)
+    {
+        SetEvent(ev_terminate); // signal all worker threads to die.
+        // TODO(rlk): wait for worker threads to terminate fully.
+        ArenaResetToMarker(arena, mem_marker);
+        CloseHandle(ev_terminate);
+        CloseHandle(ev_launch);
+        CloseHandle(ev_error);
+        return -1;
     }
 
     return 0;
-
-cleanup_and_fail:
-    if (scheduler != NULL && scheduler->ThreadCount > 0)
-    {   // signal workers to die.
-        SetEvent(ev_error); // all worker threads are waiting on this event.
-        WaitForMultipleObjects((DWORD) scheduler->ThreadCount, scheduler->OSThreadHandle, TRUE, INFINITE);
-    }
-    if (ev_halt  != NULL) CloseHandle(ev_halt);
-    if (ev_start != NULL) CloseHandle(ev_start);
-    if (ev_error != NULL) CloseHandle(ev_error);
-    ArenaResetToMarker(arena, mem_mark);
-    return -1;
 }
 
 /// @summary Notify all task scheduler worker threads to start monitoring work queues.
