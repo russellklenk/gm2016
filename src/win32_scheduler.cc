@@ -921,6 +921,10 @@ GenericWorkerMain
 {
     WIN32_WORKER_THREAD *thread_args = (WIN32_WORKER_THREAD*)  argp;
     WIN32_THREAD_ARGS     *main_args =  thread_args->MainThreadArgs;
+    WIN32_THREAD_POOL   *thread_pool =  tnread_args->ThreadPool;
+    WIN32_TASK_SCHEDULER  *scheduler =  thread_args->TaskScheduler;
+    WIN32_TASK_SOURCE *worker_source =  thread_args->ThreadSource;
+    MEMORY_ARENA       *worker_arena =  thread_args->ThreadArena; 
     HANDLE            init_signal[3] =
     { 
         thread_args->Signals.StartSignal,
@@ -939,9 +943,9 @@ GenericWorkerMain
         goto terminate_worker;
     }
 
-    // TODO(rlk): the main loop of the generic task worker thread.
-    // TODO(rlk): remember thread_args->StartData! it might contain a non-queued task to launch.
     // TODO(rlk): need a counting semaphore on the work queue.
+    // scheduler->GeneralWorkSignal is a counting semaphore, but not suitable for use with WFMO.
+    // probably best to make it just a regular kernel semaphore.
 
 terminate_worker:
     ConsoleOutput("Generic task worker thread %u terminated.\n", thread_args->WorkerIndex);
