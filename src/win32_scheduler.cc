@@ -311,6 +311,7 @@ struct WIN32_THREAD_POOL_CONFIG
     size_t                   MinThreads;         /// The minimum number of active worker threads (persistent threads).
     size_t                   MaxThreads;         /// The maximum number of active worker threads in the pool.
     size_t                   WorkerArenaSize;    /// The number of bytes of thread-local memory to allocate for each active thread.
+    size_t                   WorkerSourceIndex;  /// The zero-based index of the first WIN32_TASK_SOURCE in the scheduler allocated to the pool.
     HANDLE                   StartSignal;        /// Signal set by the coordinator to allow all active worker threads to start running.
     HANDLE                   ErrorSignal;        /// Signal set by any thread to indicate that a fatal error has occurred.
     HANDLE                   TerminateSignal;    /// Signal set by the coordinator to stop all active worker threads.
@@ -324,14 +325,16 @@ struct WIN32_THREAD_POOL_CONFIG
 struct cacheline_align WIN32_TASK_SOURCE
 {   static size_t const      ALIGNMENT              = CACHELINE_SIZE;
 
-    COMPUTE_TASK_QUEUE       WorkQueue;          /// The queue of ready-to-run task IDs.
+    COMPUTE_TASK_QUEUE       ComputeWorkQueue;   /// The queue of ready-to-run task IDs in the compute pool.
+    SEMAPHORE                StealSignal;        /// A counting semaphore used to wake waiting threads when work can be stolen.
 
-    SEMAPHORE                StealSignal;        /// An auto-reset event used to wake a single thread when work can be stolen.
+    GENERAL_TASK_QUEUE      *GeneralWorkQueue;   /// The MPMC queue of general task data.
     size_t                   SourceIndex;        /// The zero-based index of the source within the source list.
     size_t                   SourceCount;        /// The total number of task sources defined in the scheduler. Constant.
     WIN32_TASK_SOURCE       *TaskSources;        /// The list of per-source state for each task source. Managed by the scheduler.
     
     uint32_t                 TasksPerBuffer;     /// The allocation capacity of a single task buffer.
+    uint32_t                 BufferCount;        /// The number of buffers defined for the source. Constant.
     uint32_t                 BufferIndex;        /// The zero-based index of the task buffer being written to.
     uint32_t                 TaskCount;          /// The zero-based index of the next available task in the current buffer.
 
@@ -349,6 +352,9 @@ struct WIN32_TASK_SCHEDULER
 
     WIN32_THREAD_POOL        GeneralPool;        /// The thread pool used for running light-work asynchronous tasks.
     WIN32_THREAD_POOL        ComputePool;        /// The thread pool used for running work-heavy, non-blocking tasks.
+
+    GENERAL_TASK_QUEUE       GeneralWorkQueue;   /// The MPMC queue of tasks to execute in the general pool.
+    SEMAPHORE                GeneralWorkSignal;  /// A counting semaphore used to wake waiting threads when general tasks are waiting.
 
     HANDLE                   StartSignal;        /// Manual-reset event signaled when worker threads should start running tasks.
     HANDLE                   ErrorSignal;        /// Manual-reset event used by worker threads to signal a fatal error.
@@ -718,7 +724,8 @@ GeneralTaskQueueGet
 /// @param queue The work queue to initialize.
 /// @param capacity The capacity of the queue. This value must be a power of two greater than zero.
 /// @param arena The memory arena to allocate from. The caller should ensure that sufficient memory is available.
-internal_function void
+/// @return Zero if the queue was created successfully, or -1 if an error occurred. 
+internal_function int
 CreateGeneralTaskQueue
 (
     GENERAL_TASK_QUEUE   *queue, 
@@ -735,6 +742,7 @@ CreateGeneralTaskQueue
     {   // each item stores its position within the queue.
         queue->WorkItems[i].Sequence.store(i, std::memory_order_relaxed);
     }
+    return 0;
 }
 
 /// @summary Calculate the amount of memory required to store a work queue.
@@ -873,113 +881,6 @@ SpawnWorkerThread
         CloseHandle(worker_ready);
         return -1;
     }
-}
-
-/// @summary Initialize a new thread pool. All worker threads will wait for a launch signal.
-/// @param thread_pool The thread pool to initialize.
-/// @param pool_config The thread pool configuration.
-/// @param arena The memory arena from which to allocate global memory.
-/// @return Zero if the thread pool is successfully created, or -1 if an error occurred.
-public_function int
-CreateThreadPool
-(
-    WIN32_THREAD_POOL              *thread_pool, 
-    WIN32_THREAD_POOL_CONFIG const *pool_config, 
-    MEMORY_ARENA                         *arena
-)
-{
-    size_t   mem_marker = ArenaMarker(arena);
-    size_t mem_required = CalculateMemoryForThreadPool(pool_config->MaxThreads);
-    if (!ArenaCanAllocate(arena, mem_required, std::alignment_of<void*>::value))
-    {
-        ConsoleError("ERROR: Not enough free memory to initialize thread pool; need %zu bytes.\n", mem_required);
-        return -1;
-    }
-
-    // initialize the thread pool state and allocate memory for variable-length arrays.
-    thread_pool->MaxThreads               = pool_config->MaxThreads;
-    thread_pool->ActiveThreads            = 0;
-    thread_pool->WorkerArenaSize          = pool_config->WorkerArenaSize;
-    thread_pool->StartSignal              = pool_config->StartSignal;
-    thread_pool->ErrorSignal              = pool_config->ErrorSignal;
-    thread_pool->TerminateSignal          = pool_config->TerminateSignal;
-    thread_pool->MainThreadArgs           = pool_config->MainThreadArgs;
-    thread_pool->OSThreadIds              = PushArray<unsigned int       >(arena, pool_config->MaxThreads);
-    thread_pool->OSThreadHandle           = PushArray<HANDLE             >(arena, pool_config->MaxThreads);
-    thread_pool->OSThreadArena            = PushArray<WIN32_MEMORY_ARENA >(arena, pool_config->MaxThreads);
-    thread_pool->WorkerState              = PushArray<WIN32_WORKER_THREAD>(arena, pool_config->MaxThreads);
-    thread_pool->WorkerSource             = PushArray<WIN32_TASK_SOURCE *>(arena, pool_config->MaxThreads);
-    thread_pool->WorkerArena              = PushArray<MEMORY_ARENA       >(arena, pool_config->MaxThreads);
-    thread_pool->WorkerFreeList           = PushArray<uint32_t           >(arena, pool_config->MaxThreads);
-    thread_pool->WorkerFreeCount          = 0;
-    thread_pool->WorkerMain               = pool_config->ThreadMain;
-    thread_pool->TaskScheduler            = pool_config->TaskScheduler;
-    thread_pool->FlagsTransient           = pool_config->FlagsTransient;
-    thread_pool->FlagsPersistent          = pool_config->FlagsPersistent & ~WORKER_FLAGS_TRANSIENT;
-    ZeroMemory(thread_pool->OSThreadIds   , pool_config->MaxThreads * sizeof(unsigned int));
-    ZeroMemory(thread_pool->OSThreadHandle, pool_config->MaxThreads * sizeof(HANDLE));
-    ZeroMemory(thread_pool->OSThreadArena , pool_config->MaxThreads * sizeof(WIN32_MEMORY_ARENA));
-    ZeroMemory(thread_pool->WorkerState   , pool_config->MaxThreads * sizeof(WIN32_WORKER_THREAD));
-    ZeroMemory(thread_pool->WorkerSource  , pool_config->MaxThreads * sizeof(WIN32_TASK_SOURCE *));
-    ZeroMemory(thread_pool->WorkerArena   , pool_config->MaxThreads * sizeof(MEMORY_ARENA));
-
-    // initialize the thread-local memory arenas.
-    if (pool_config->WorkerArenaSize > 0)
-    {
-        for (size_t i = 0; i < pool_config->MaxThreads; ++i)
-        {
-            WIN32_MEMORY_ARENA *os_arena = &thread_pool->OSThreadArena[i];
-            MEMORY_ARENA       *tl_arena = &thread_pool->WorkerArena[i];
-
-            if (CreateMemoryArena(os_arena, pool_config->WorkerArenaSize, true, true) < 0)
-            {   // the physical address space could not be reserved or committed.
-                goto cleanup_and_fail;
-            }
-            if (CreateArena(tl_arena, pool_config->WorkerArenaSize, std::alignment_of<void*>::value, os_arena) < 0)
-            {   // this should never happen - there's an implementation error.
-                goto cleanup_and_fail;
-            }
-        }
-    }
-
-    // spawn workers until the minimum thread count is reached.
-    for (size_t i = 0; i < pool_config->MinThreads; ++i)
-    {
-        WIN32_WORKER_ENTRYPOINT entry = pool_config->WorkerMain;
-        WIN32_TASK_SCHEDULER   *sched = pool_config->TaskScheduler;
-        WIN32_THREAD_ARGS       *args = pool_config->MainThreadArgs;
-        uint32_t                flags = pool_config->FlagsPersistent;
-        uint32_t                index = uint32_t(i);
-        
-        if (SpawnWorkerThread(thread_pool, index, flags, args, NULL, 0) < 0)
-        {   // unable to spawn the worker thread; the minimum pool size cannot be met.
-            goto cleanup_and_fail;
-        }
-    }
-
-    // initialize the transient worker free list.
-    for (size_t i = pool_config->MaxThreads; i > pool_config->MinThreads; --i)
-    {
-        thread_pool->WorkerFreeList[thread_pool->WorkerFreeCount++] = uint32_t(i-1);
-    }
-
-    return 0;
-
-cleanup_and_fail:
-    if (thread_pool->ActiveThreads > 0)
-    {   // signal all threads in the pool to die.
-        SetEvent(pool_config->ErrorSignal);
-        WaitForMultipleObjects((DWORD) thread_pool->ActiveThreads, thread_pool->OSThreadHandle, TRUE, INFINITE);
-    }
-    if (pool_config->WorkerArenaSize > 0 && thread_pool->OSThreadArena != NULL)
-    {   // free the reserved and committed address space for thread-local arenas.
-        for (size_t i = 0; i < pool_config->MaxThreads; ++i)
-        {   // no cleanup needs to be performed for the 'user-facing' arena.
-            DeleteMemoryArena(&thread_pool->OSThreadArena[i]);
-        }
-    }
-    ArenaResetToMarker(mem_marker);
-    return -1;
 }
 
 /// @summary Execute a compute task on the calling thread.
@@ -1154,12 +1055,12 @@ terminate_worker:
 internal_function task_id_t
 DefineComputeTask
 (
-    WIN32_TASK_SOURCE           *source,
-    COMPUTE_TASK_ENTRYPOINT   task_main, 
-    void   const             *task_args, 
-    size_t const              args_size, 
-    task_id_t                 parent_id, 
-    task_id_t                 wait_task
+    WIN32_TASK_SOURCE          *source,
+    COMPUTE_TASK_ENTRYPOINT  task_main, 
+    void   const            *task_args, 
+    size_t const             args_size, 
+    task_id_t                parent_id, 
+    task_id_t                wait_task
 )
 {
     if (args_size > COMPUTE_TASK_DATA::MAX_DATA)
@@ -1167,14 +1068,14 @@ DefineComputeTask
         ConsoleError("ERROR: Argument data too large when defining task (parent %08X). Passing %zu bytes, max is %zu bytes.\n", parent_id, args_size, COMPUTE_TASK::MAX_DATA); 
         return INVALID_TASK_ID;
     }
-    if (source->TaskCount  == source->MaxTasksPerTick)
-    {   // Bump the buffer index to the next buffer.
+    if (source->TaskCount  == source->TasksPerBuffer)
+    {   // bump the buffer index to the next buffer.
         source->TaskCount   = 0; // reset the task counter for the new "current" buffer.
-        source->BufferIndex =(source->BufferIndex + 1) % source->MaxTicksInFlight;
+        source->BufferIndex =(source->BufferIndex + 1) % source->BufferCount;
         int32_t *work_count =&source->WorkCounts[source->BufferIndex][0];
         if (InterlockedAdd((volatile LONG*) work_count, 0) > 0)
         {   // Defining a new task would overwrite an active task. This check isn't thorough, but it's quick.
-            ConsoleError("ERROR: Active task overwrite when defining task (parent %08X). Increase TASK_SOURCE MaxTasksPerTick.\n", parent_id);
+            ConsoleError("ERROR: Active task overwrite when defining task (parent %08X). Increase WIN32_TASK_SOURCE::TasksPerBuffer.\n", parent_id);
             return INVALID_TASK_ID;
         }
     }
@@ -1184,13 +1085,13 @@ DefineComputeTask
     uint32_t     task_index = source->TaskCount++;
     task_id_t       task_id = MakeTaskId(buffer_index, TASK_POOL_COMPUTE, task_index, source->SourceIndex);
     int32_t     &work_count = source->WorkCounts[buffer_index][task_index];
-    COMPUTE_TASK &work_item = source->WorkItems [buffer_index][task_index];
+    COMPUTE_TASK_DATA &task = source->WorkItems [buffer_index][task_index];
     PERMITS_LIST    &permit = source->PermitList[buffer_index][task_index];
 
-    work_item.TaskId        = task_id;
-    work_item.ParentTask    = parent_id;
-    work_item.TaskMain      = task_main;
-    if (task_args != NULL  && args_size > 0)
+    task.TaskId     = task_id;
+    task.ParentTask = parent_id;
+    task.TaskMain   = task_main;
+    if (task_args  != NULL && args_size > 0)
     {   // we could first zero the work_item.TaskArgs memory.
         CopyMemory(work_item.Data, task_args, args_size);
     }
@@ -1216,7 +1117,7 @@ DefineComputeTask
                 if (n < 0)
                 {   // the wait_task completed during update of the permits list.
                     // this new task can be added to the ready-to-run queue.
-                    ComputeTaskQueuePush(&source->WorkQueue, task_id);
+                    ComputeTaskQueuePush(&source->ComputeWorkQueue, task_id);
                     return task_id;
                 }
                 // append the task ID to the permit list of wait_task.
@@ -1232,7 +1133,7 @@ DefineComputeTask
     // it may be executed before LaunchTask is called, but that's ok - 
     // the work_count value is 2, so it cannot complete until LaunchTask.
     // this allows child tasks to be safely spawned from the main task.
-    ComputeTaskQueuePush(&source->WorkQueue, task_id);
+    ComputeTaskQueuePush(&source->ComputeWorkQueue, task_id);
     return task_id;
 }
 
@@ -1386,6 +1287,142 @@ GetTaskIdParts
     parts->ThreadIndex   = (id & TASK_ID_MASK_THREAD_P) >> TASK_ID_SHIFT_THREAD;
     parts->BufferIndex   = (id & TASK_ID_MASK_BUFFER_P) >> TASK_ID_SHIFT_BUFFER;
     parts->TaskIndex     = (id & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
+}
+
+/// @summary Initialize a new thread pool. All worker threads will wait for a launch signal.
+/// @param thread_pool The thread pool to initialize.
+/// @param pool_config The thread pool configuration.
+/// @param arena The memory arena from which to allocate global memory.
+/// @return Zero if the thread pool is successfully created, or -1 if an error occurred.
+public_function int
+CreateThreadPool
+(
+    WIN32_THREAD_POOL              *thread_pool, 
+    WIN32_THREAD_POOL_CONFIG const *pool_config, 
+    MEMORY_ARENA                         *arena
+)
+{
+    size_t   mem_marker = ArenaMarker(arena);
+    size_t mem_required = CalculateMemoryForThreadPool(pool_config->MaxThreads);
+    if (!ArenaCanAllocate(arena, mem_required, std::alignment_of<void*>::value))
+    {
+        ConsoleError("ERROR: Not enough free memory to initialize thread pool; need %zu bytes.\n", mem_required);
+        return -1;
+    }
+
+    // initialize the thread pool state and allocate memory for variable-length arrays.
+    thread_pool->MaxThreads               = pool_config->MaxThreads;
+    thread_pool->ActiveThreads            = 0;
+    thread_pool->WorkerArenaSize          = pool_config->WorkerArenaSize;
+    thread_pool->StartSignal              = pool_config->StartSignal;
+    thread_pool->ErrorSignal              = pool_config->ErrorSignal;
+    thread_pool->TerminateSignal          = pool_config->TerminateSignal;
+    thread_pool->MainThreadArgs           = pool_config->MainThreadArgs;
+    thread_pool->OSThreadIds              = PushArray<unsigned int       >(arena, pool_config->MaxThreads);
+    thread_pool->OSThreadHandle           = PushArray<HANDLE             >(arena, pool_config->MaxThreads);
+    thread_pool->OSThreadArena            = PushArray<WIN32_MEMORY_ARENA >(arena, pool_config->MaxThreads);
+    thread_pool->WorkerState              = PushArray<WIN32_WORKER_THREAD>(arena, pool_config->MaxThreads);
+    thread_pool->WorkerSource             = PushArray<WIN32_TASK_SOURCE *>(arena, pool_config->MaxThreads);
+    thread_pool->WorkerArena              = PushArray<MEMORY_ARENA       >(arena, pool_config->MaxThreads);
+    thread_pool->WorkerFreeList           = PushArray<uint32_t           >(arena, pool_config->MaxThreads);
+    thread_pool->WorkerFreeCount          = 0;
+    thread_pool->WorkerMain               = pool_config->ThreadMain;
+    thread_pool->TaskScheduler            = pool_config->TaskScheduler;
+    thread_pool->FlagsTransient           = pool_config->FlagsTransient;
+    thread_pool->FlagsPersistent          = pool_config->FlagsPersistent & ~WORKER_FLAGS_TRANSIENT;
+    ZeroMemory(thread_pool->OSThreadIds   , pool_config->MaxThreads * sizeof(unsigned int));
+    ZeroMemory(thread_pool->OSThreadHandle, pool_config->MaxThreads * sizeof(HANDLE));
+    ZeroMemory(thread_pool->OSThreadArena , pool_config->MaxThreads * sizeof(WIN32_MEMORY_ARENA));
+    ZeroMemory(thread_pool->WorkerState   , pool_config->MaxThreads * sizeof(WIN32_WORKER_THREAD));
+    ZeroMemory(thread_pool->WorkerSource  , pool_config->MaxThreads * sizeof(WIN32_TASK_SOURCE *));
+    ZeroMemory(thread_pool->WorkerArena   , pool_config->MaxThreads * sizeof(MEMORY_ARENA));
+
+    // initialize the thread-local memory arenas.
+    if (pool_config->WorkerArenaSize > 0)
+    {
+        for (size_t i = 0; i < pool_config->MaxThreads; ++i)
+        {
+            WIN32_MEMORY_ARENA *os_arena = &thread_pool->OSThreadArena[i];
+            MEMORY_ARENA       *tl_arena = &thread_pool->WorkerArena[i];
+
+            if (CreateMemoryArena(os_arena, pool_config->WorkerArenaSize, true, true) < 0)
+            {   // the physical address space could not be reserved or committed.
+                goto cleanup_and_fail;
+            }
+            if (CreateArena(tl_arena, pool_config->WorkerArenaSize, std::alignment_of<void*>::value, os_arena) < 0)
+            {   // this should never happen - there's an implementation error.
+                goto cleanup_and_fail;
+            }
+        }
+    }
+
+    // initialize the array of pointers to TASK_SOURCE objects.
+    // the pointers point back into the scheduler's SourceList.
+    for (size_t i = 0; i < pool_config->MaxThreads; ++i)
+    {
+        thread_pool->WorkerSource[i] = &scheduler->SourceList[pool_config->WorkerSourceIndex + i];
+    }
+
+    // spawn workers until the minimum thread count is reached.
+    for (size_t i = 0; i < pool_config->MinThreads; ++i)
+    {
+        WIN32_WORKER_ENTRYPOINT entry = pool_config->WorkerMain;
+        WIN32_TASK_SCHEDULER   *sched = pool_config->TaskScheduler;
+        WIN32_THREAD_ARGS       *args = pool_config->MainThreadArgs;
+        uint32_t                flags = pool_config->FlagsPersistent;
+        uint32_t                index = uint32_t(i);
+        
+        if (SpawnWorkerThread(thread_pool, index, flags, args, NULL, 0) < 0)
+        {   // unable to spawn the worker thread; the minimum pool size cannot be met.
+            goto cleanup_and_fail;
+        }
+    }
+
+    // initialize the transient worker free list.
+    for (size_t i = pool_config->MaxThreads; i > pool_config->MinThreads; --i)
+    {
+        thread_pool->WorkerFreeList[thread_pool->WorkerFreeCount++] = uint32_t(i-1);
+    }
+
+    return 0;
+
+cleanup_and_fail:
+    if (thread_pool->ActiveThreads > 0)
+    {   // signal all threads in the pool to die.
+        SetEvent(pool_config->ErrorSignal);
+        WaitForMultipleObjects((DWORD) thread_pool->ActiveThreads, thread_pool->OSThreadHandle, TRUE, INFINITE);
+    }
+    if (pool_config->WorkerArenaSize > 0 && thread_pool->OSThreadArena != NULL)
+    {   // free the reserved and committed address space for thread-local arenas.
+        for (size_t i = 0; i < pool_config->MaxThreads; ++i)
+        {   // no cleanup needs to be performed for the 'user-facing' arena.
+            DeleteMemoryArena(&thread_pool->OSThreadArena[i]);
+        }
+    }
+    ArenaResetToMarker(mem_marker);
+    return -1;
+}
+
+/// @summary Signal all threads in a thread pool to terminate, and block the calling thread until all workers have exited.
+/// @param thread_pool The thread pool to terminate.
+public_function void
+TerminateThreadPool
+(
+    WIN32_THREAD_POOL *thread_pool
+)
+{
+    if (thread_pool->TerminateSignal != NULL)
+    {   // technically, there's a race between TerminateThreadPool and spawning a thread.
+        // if this happens, TerminateThreadPool reads a too-small ActiveThreads value.
+        // the new thread will still correctly be signaled to terminate, but might be 
+        // missed during the WaitForMultipleObjects call.
+        DWORD n = (DWORD) thread_pool->ActiveThreads;
+        // signal all threads in the pool to terminate. this may take some time
+        // if the worker threads are currently executing blocking tasks.
+        SetEvent(thread_pool->TerminateSignal);
+        // block the calling thread until all threads in the pool have terminated.
+        WaitForMultipleObjects(n, thread_pool->OSThreadHandle, TRUE, INFINITE);
+    }
 }
 
 /// @summary Calculate the amount of memory required for a given scheduler configuration.
@@ -1761,12 +1798,14 @@ NewTaskSource
         ConsoleError("ERROR: NewTaskSource - failed to create work-stealing semaphore (%08X).\n", GetLastError());
         return NULL;
     }
-    source->SourceIndex    = scheduler->SourceCount;
-    source->SourceCount    = scheduler->MaxSources;
-    source->TaskSources    = scheduler->SourceList;
-    source->TasksPerBuffer = buffer_size;
-    source->BufferIndex    = 0;
-    source->TaskCount      = 0;
+    source->GeneralWorkQueue =&scheduler->GeneralWorkQueue;
+    source->SourceIndex      = scheduler->SourceCount;
+    source->SourceCount      = scheduler->MaxSources;
+    source->TaskSources      = scheduler->SourceList;
+    source->TasksPerBuffer   = buffer_size;
+    source->BufferCount      = 2;
+    source->BufferIndex      = 0;
+    source->TaskCount        = 0;
     for (size_t i = 0; i < buffer_count; ++i)
     {
         source->WorkItems [i] = PushArray<COMPUTE_TASK_DATA>(arena, buffer_size);
@@ -1802,20 +1841,18 @@ CreateScheduler
     WIN32_TASK_SCHEDULER_CONFIG const    *config,
     MEMORY_ARENA                          *arena
 )
-{   // zero the scheduler object to prevent double-free errors.
-    ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
-
-    // validate the scheduler configuration.
+{   // validate the scheduler configuration.
     WIN32_TASK_SCHEDULER_CONFIG valid_config = {};
     bool                performance_warnings = false;
     if (CheckSchedulerConfiguration(&valid_config, config, performance_warnings) < 0)
-    {
+    {   // no valid configuration can be obtained - some system limit was exceeded.
         ConsoleError("ERROR: CreateScheduler - invalid scheduler configuration.\n");
+        ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
         return -1;
     }
     if (performance_warnings)
-    {
-        ConsoleOutput("WARNING: CreateScheduler - one or more performance warnings. Check console.\n");
+    {   // spit out an extra console message to try and get programmer attention.
+        ConsoleOutput("PERFORMANCE WARNING (CreateScheduler): Check console output above.\n");
     }
 
     size_t mem_marker   = ArenaMarker(arena);
@@ -1823,66 +1860,40 @@ CreateScheduler
     if (!ArenaCanAllocate(arena, mem_required, std::alignment_of<WIN32_TASK_SCHEDULER>::value))
     {
         ConsoleError("ERROR: CreateScheduler - insufficient memory; %zu bytes required.\n", mem_required);
+        ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
         return -1;
     }
 
-    HANDLE ev_error     = CreateEvent(NULL, TRUE, FALSE, NULL);
-    HANDLE ev_launch    = CreateEvent(NULL, TRUE, FALSE, NULL);
-    HANDLE ev_terminate = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (ev_error == NULL || ev_launch == NULL || ev_terminate == NULL)
-    {   // the scheduler cannot control worker threads without synchronization objects.
-        ConsoleError("ERROR: CreateScheduler - unable to create synchronization events (%08X).\n", GetLastError());
-        if (ev_terminate != NULL) CloseHandle(ev_terminate);
-        if (ev_launch    != NULL) CloseHandle(ev_launch);
-        if (ev_error     != NULL) CloseHandle(ev_error);
-        return -1;
-    }
-
-    // initialize, but do not launch, the general task thread pool.
+    HANDLE ev_error        = NULL;
+    HANDLE ev_launch       = NULL;
+    HANDLE ev_terminate    = NULL;
+    size_t general_threads = valid_config.PoolSize[TASK_POOL_GENERAL].MaxThreads;
+    size_t general_tasks   = valid_config.PoolSize[TASK_POOL_GENERAL].MaxTasks;
+    size_t compute_threads = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxThreads;
+    size_t compute_tasks   = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxTasks;
+    size_t max_max_tasks   = compute_tasks > general_tasks ? compute_tasks : general_tasks;
     WIN32_THREAD_POOL_CONFIG general_config = {};
-    general_config.TaskScheduler   = scheduler;
-    general_config.ThreadMain      = GeneralWorkerMain;
-    general_config.MainThreadArgs  = valid_config.MainThreadArgs;
-    general_config.MinThreads      = valid_config.PoolSize[TASK_POOL_GENERAL].MinThreads;
-    general_config.MaxThreads      = valid_config.PoolSize[TASK_POOL_GENERAL].MaxThreads;
-    general_config.WorkerArenaSize = valid_config.PoolSize[TASK_POOL_GENERAL].ArenaSize;
-    general_config.StartSignal     = ev_launch;
-    general_config.ErrorSignal     = ev_error;
-    general_config.TerminateSignal = ev_terminate;
-    general_config.FlagsTransient  = WORKER_FLAGS_GENERAL | WORKER_FLAGS_TRANSIENT;
-    general_config.FlagsPersistent = WORKER_FLAGS_GENERAL;
-    if (CreateThreadPool(&scheduler->GeneralPool, &general_config, arena) < 0)
-    {
-        ConsoleError("ERROR: CreateScheduler - unable to create general thread pool.\n");
-        CloseHandle(ev_terminate);
-        CloseHandle(ev_launch);
-        CloseHandle(ev_error);
-        return -1;
-    }
-
-    // initialize, but do not launch, the compute task thread pool.
     WIN32_THREAD_POOL_CONFIG compute_config = {};
-    compute_config.TaskScheduler   = scheduler;
-    compute_config.ThreadMain      = ComputeWorkerMain;
-    compute_config.MainThreadArgs  = valid_config.MainThreadArgs;
-    compute_config.MinThreads      = valid_config.PoolSize[TASK_POOL_COMPUTE].MinThreads;
-    compute_config.MaxThreads      = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxThreads;
-    compute_config.WorkerArenaSize = valid_config.PoolSize[TASK_POOL_COMPUTE].ArenaSize;
-    compute_config.StartSignal     = ev_launch;
-    compute_config.ErrorSignal     = ev_error;
-    compute_config.TerminateSignal = ev_terminate;
-    compute_config.FlagsTransient  = WORKER_FLAGS_COMPUTE | WORKER_FLAGS_TRANSIENT;
-    compute_config.FlagsPersistent = WORKER_FLAGS_COMPUTE;
-    if (CreateThreadPool(&scheduler->ComputePool, &compute_config, arena) < 0)
-    {   // the general task thread pool shares synchronization events, so it was told to exit.
-        ConsoleError("ERROR: CreateScheduler - unable to create compute thread pool.\n");
-        CloseHandle(ev_terminate);
-        CloseHandle(ev_launch);
-        CloseHandle(ev_error);
-        return -1;
+    ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
+
+    // create scheduler worker thread synchronization objects.
+    if ((ev_error = CreateEvent(NULL, TRUE, FALSE, NULL)) == NULL)
+    {   // worker threads would have no way to signal a fatal error.
+        ConsoleError("ERROR (%s): Failed to create worker error signal (%08X).\n", __FUNCTION__, GetLastError());
+        goto cleanup_and_fail;
+    }
+    if ((ev_launch = CreateEvent(NULL, TRUE, FALSE, NULL)) == NULL)
+    {   // worker threads would have no way to coordinate launching.
+        ConsoleError("ERROR (%s): Failed to create worker launch signal (%08X).\n", __FUNCTION__, GetLastError());
+        goto cleanup_and_fail;
+    }
+    if ((ev_terminate = CreateEvent(NULL, TRUE, FALSE, NULL)) == NULL)
+    {   // worker threads would have no way to coordinate shutdown.
+        ConsoleError("ERROR (%s): Failed to create worker shutdown signal (%08X).\n", __FUNCTION__, GetLastError());
+        goto cleanup_and_fail;
     }
 
-    // primary scheduler initialization is finished:
+    // initialize the various coordination events and task source list.
     scheduler->MaxSources      = valid_config.MaxTaskSources;
     scheduler->SourceCount     = 0;
     scheduler->SourceList      = PushArray<WIN32_TASK_SOURCE>(valid_config.MaxTaskSources);
@@ -1891,22 +1902,106 @@ CreateScheduler
     scheduler->TerminateSignal = ev_terminate;
     ZeroMemory(scheduler->SourceList, valid_config.MaxTaskSources * sizeof(WIN32_TASK_SOURCE));
 
+    // task sources must be allocated for worker threads before the threads are spawned
+    // (which happens when the thread pools are created, below.)
+    // the assignment of the task sources is as follows:
+    // [root][compute_workers][general_workers][user_threads]
+
     // allocate task source index 0 to the 'root' thread.
-    size_t general_tasks = valid_config.PoolSize[TASK_POOL_GENERAL].MaxTasks;
-    size_t compute_tasks = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxTasks;
-    size_t max_max_tasks = compute_tasks > general_tasks ? compute_tasks : general_tasks;
     if (NewTaskSource(scheduler, arena, max_max_tasks) == NULL)
+    {   // the main thread would have no way to submit the root work tasks.
+        ConsoleError("ERROR (%s): Failed to create the root task source.\n", __FUNCTION__);
+        goto cleanup_and_fail;
+    }
+
+    // allocate task sources to the compute pool worker threads.
+    for (size_t i = 0; i < compute_threads; ++i)
     {
-        SetEvent(ev_terminate); // signal all worker threads to die.
-        // TODO(rlk): wait for worker threads to terminate fully.
-        ArenaResetToMarker(arena, mem_marker);
-        CloseHandle(ev_terminate);
-        CloseHandle(ev_launch);
-        CloseHandle(ev_error);
-        return -1;
+        WIN32_TASK_SOURCE *worker_source = NewTaskSource(scheduler, arena, compute_tasks);
+        if (worker_source == NULL)
+        {   // the worker thread would have no way to submit compute tasks.
+            ConsoleError("ERROR (%s): Failed to create the task source for compute worker %zu.\n", __FUNCTION__, i);
+            goto cleanup_and_fail;
+        }
+    }
+
+    // allocate task sources to the general pool worker threads.
+    for (size_t i = 0; i < general_threads; ++i)
+    {
+        WIN32_TASK_SOURCE *worker_source = NewTaskSource(scheduler, arena, general_tasks);
+        if (worker_source == NULL)
+        {   // the worker thread would have no way to submit compute tasks.
+            ConsoleError("ERROR (%s): Failed to create the task source for general worker %zu.\n", __FUNCTION__, i);
+            goto cleanup_and_fail;
+        }
+    }
+
+    // initialize, but do not launch, the general task thread pool.
+    general_config.TaskScheduler     = scheduler;
+    general_config.ThreadMain        = GeneralWorkerMain;
+    general_config.MainThreadArgs    = valid_config.MainThreadArgs;
+    general_config.MinThreads        = valid_config.PoolSize[TASK_POOL_GENERAL].MinThreads;
+    general_config.MaxThreads        = valid_config.PoolSize[TASK_POOL_GENERAL].MaxThreads;
+    general_config.WorkerArenaSize   = valid_config.PoolSize[TASK_POOL_GENERAL].ArenaSize;
+    general_config.WorkerSourceIndex = compute_threads + 1; // see above
+    general_config.StartSignal       = ev_launch;
+    general_config.ErrorSignal       = ev_error;
+    general_config.TerminateSignal   = ev_terminate;
+    general_config.FlagsTransient    = WORKER_FLAGS_GENERAL | WORKER_FLAGS_TRANSIENT;
+    general_config.FlagsPersistent   = WORKER_FLAGS_GENERAL;
+    if (CreateThreadPool(&scheduler->GeneralPool, &general_config, arena) < 0)
+    {   // the scheduler would have no pool in which to execute general tasks.
+        ConsoleError("ERROR (%s): Failed to create the general thread pool.\n", __FUNCTION__);
+        goto cleanup_and_fail;
+    }
+
+    // initialize, but do not launch, the compute task thread pool.
+    compute_config.TaskScheduler     = scheduler;
+    compute_config.ThreadMain        = ComputeWorkerMain;
+    compute_config.MainThreadArgs    = valid_config.MainThreadArgs;
+    compute_config.MinThreads        = valid_config.PoolSize[TASK_POOL_COMPUTE].MinThreads;
+    compute_config.MaxThreads        = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxThreads;
+    compute_config.WorkerArenaSize   = valid_config.PoolSize[TASK_POOL_COMPUTE].ArenaSize;
+    compute_config.WorkerSourceIndex = 1; // see above
+    compute_config.StartSignal       = ev_launch;
+    compute_config.ErrorSignal       = ev_error;
+    compute_config.TerminateSignal   = ev_terminate;
+    compute_config.FlagsTransient    = WORKER_FLAGS_COMPUTE | WORKER_FLAGS_TRANSIENT;
+    compute_config.FlagsPersistent   = WORKER_FLAGS_COMPUTE;
+    if (CreateThreadPool(&scheduler->ComputePool, &compute_config, arena) < 0)
+    {   // the scheduler would have no pool in which to execute compute tasks.
+        ConsoleError("ERROR (%s): Failed to create the compute thread pool.\n", __FUNCTION__);
+        goto cleanup_and_fail;
+    }
+
+    // create the work queue and associated synchronization objects for general pool tasks.
+    if (CreateSemaphore(&scheduler->GeneralWorkSignal, 0, 1024) < 0)
+    {   // general pool worker threads would have no way to know that work is waiting.
+        ConsoleError("ERROR (%s): Failed to create the general work queue semaphore.\n", __FUNCTION__);
+        goto cleanup_and_fail;
+    }
+    if (CreateGeneralTaskQueue(&scheduler->GeneralWorkQueue, general_tasks, arena) < 0)
+    {   // general pool worker threads would have no way to get work to execute.
+        ConsoleError("ERROR (%s): Failed to create the general work queue.\n", __FUNCTION__);
+        goto cleanup_and_fail;
     }
 
     return 0;
+
+cleanup_and_fail:
+    TerminateThreadPool(&scheduler->ComputePool);
+    TerminateThreadPool(&scheduler->GeneralPool);
+    for (size_t i = 0, n = scheduler->SourceCount; i < n; ++i)
+    {   // clean up the semaphore for any allocated task sources.
+        DeleteSemaphore(&scheduler->SourceList[i].StartSignal);
+    }
+    if (ev_terminate != NULL) CloseHandle(ev_terminate);
+    if (ev_launch != NULL) CloseHandle(ev_launch);
+    if (ev_error != NULL) CloseHandle(ev_error);
+    DeleteSemaphore(&scheduler->GeneralWorkSignal);
+    ArenaResetToMarker(arena, mem_marker);
+    ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
+    return -1;
 }
 
 /// @summary Notify all task scheduler worker threads to start monitoring work queues.
@@ -1917,20 +2012,32 @@ LaunchScheduler
     WIN32_TASK_SCHEDULER *scheduler
 )
 {
-    SetEvent(scheduler->StartSignal);
+    if (scheduler->StartSignal != NULL)
+    {   // start all of the worker threads looking for work.
+        SetEvent(scheduler->StartSignal);
+    }
 }
 
-/// @summary Notify all task scheduler worker threads to shutdown.
+/// @summary Notify all task scheduler worker threads to shutdown, and clean up scheduler resources. Ensure that no more tasks will be created prior to calling this function.
 /// @param scheduler The task scheduler to halt.
 public_function void
 HaltScheduler
 (
     WIN32_TASK_SCHEDULER *scheduler
 )
-{
-    // signal all worker threads to exit, and wait for them.
-    SetEvent(scheduler->TerminateSignal);
-    // TODO(rlk): this is done differently now because of the separate thread pools.
+{   // signal all worker threads to exit, and wait for them.
+    TerminateThreadPool(&scheduler->ComputePool);
+    TerminateThreadPool(&scheduler->GeneralPool);
+    // clean up the resources allocated to any task sources.
+    for (size_t i = 0, n = scheduler->SourceCount; i < n; ++i)
+    {   // clean up the semaphore allocated to the task source.
+        DeleteSemaphore(&scheduler->SourceList[i].StartSignal);
+    }
+    if (scheduler->TerminateSignal != NULL) CloseHandle(scheduler->TerminateSignal);
+    if (scheduler->StartSignal     != NULL) CloseHandle(scheduler->StartSignal);
+    if (scheduler->ErrorSignal     != NULL) CloseHandle(scheduler->ErrorSignal);
+    DeleteSemaphore(&scheduler->GeneralWorkSignal);
+    ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
 }
 
 /// @summary Retrieve the task source for the root thread. This function should only ever be called from the root thread (the thread that submits the root tasks.)
