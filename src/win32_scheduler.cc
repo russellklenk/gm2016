@@ -149,107 +149,106 @@ typedef void (*COMPUTE_TASK_ENTRYPOINT)
 /// @summary Define bitflags controlling worker thread behavior.
 enum WORKER_FLAGS : uint32_t
 {
-    WORKER_FLAGS_NONE       = (0UL << 0),        /// The worker thread has the default behavior.
-    WORKER_FLAGS_TRANSIENT  = (1UL << 0),        /// The worker thread is transient; that is, it self-terminates after a fixed interval with no work.
-    WORKER_FLAGS_GENERAL    = (1UL << 1),        /// The worker thread can execute general tasks.
-    WORKER_FLAGS_COMPUTE    = (1UL << 2),        /// The worker thread can execute compute tasks.
+    WORKER_FLAGS_NONE        = (0UL << 0),       /// The worker thread has the default behavior.
+    WORKER_FLAGS_GENERAL     = (1UL << 0),       /// The worker thread can execute general tasks.
+    WORKER_FLAGS_COMPUTE     = (1UL << 1),       /// The worker thread can execute compute tasks.
 };
 
 /// @summary Define identifiers for task ID validity. An ID can only be valid or invalid.
 enum TASK_ID_TYPE : uint32_t
 {
-    TASK_ID_TYPE_INVALID    = 0,                 /// The task identifier specifies an invalid task.
-    TASK_ID_TYPE_VALID      = 1,                 /// The task identifier specifies a valid task.
+    TASK_ID_TYPE_INVALID     = 0,                /// The task identifier specifies an invalid task.
+    TASK_ID_TYPE_VALID       = 1,                /// The task identifier specifies a valid task.
 };
 
 /// @summary Define identifiers for supported task pools. A task is either blocking or non-blocking.
 enum TASK_POOL : uint32_t
 {
-    TASK_POOL_COMPUTE       = 0,                 /// The task executes on the compute thread pool, designed for non-blocking, work-heavy tasks.
-    TASK_POOL_GENERAL       = 1,                 /// The task executes on the general thread pool, designed for blocking, light-CPU tasks.
-    TASK_POOL_COUNT         = 2                  /// The number of thread pools defined by the scheduler.
+    TASK_POOL_COMPUTE        = 0,                /// The task executes on the compute thread pool, designed for non-blocking, work-heavy tasks.
+    TASK_POOL_GENERAL        = 1,                /// The task executes on the general thread pool, designed for blocking, light-CPU tasks.
+    TASK_POOL_COUNT          = 2                 /// The number of thread pools defined by the scheduler.
 };
 
 /// @summary Define the data associated with a spinning semaphore, which is guaranteed to remain in user mode unless a thread must be put to sleep or woken.
 struct SEMAPHORE
-{   static size_t const     PAD                    = CACHELINE_SIZE - sizeof(std::atomic<int32_t>);
-    std::atomic<int32_t>    Count;               /// The current count of the semaphore.
-    uint8_t                 Padding[PAD];        /// Unused padding out to the next cacheline boundary.
-    int32_t                 SpinCount;           /// The spin count assigned to the semaphore at creation time.
-    HANDLE                  KSem;                /// The handle of the kernel semaphore object.
+{   static size_t const      PAD                   = CACHELINE_SIZE - sizeof(std::atomic<int32_t>);
+    std::atomic<int32_t>     Count;              /// The current count of the semaphore.
+    uint8_t                  Padding[PAD];       /// Unused padding out to the next cacheline boundary.
+    int32_t                  SpinCount;          /// The spin count assigned to the semaphore at creation time.
+    HANDLE                   KSem;               /// The handle of the kernel semaphore object.
 };
 
 /// @summary Define a structure specifying the constituent parts of a task ID.
 struct TASK_ID_PARTS
 {
-    uint32_t                ValidTask;           /// One of TASK_ID_TYPE specifying whether the task is valid.
-    uint32_t                PoolType;            /// One of TASK_POOL specifying the thread pool that executes the task.
-    uint32_t                ThreadIndex;         /// The zero-based index of the thread that defines the task.
-    uint32_t                BufferIndex;         /// The zero-based index of the thread-local buffer that defines the task.
-    uint32_t                TaskIndex;           /// The zero-based index of the task within the thread-local buffer.
+    uint32_t                 ValidTask;          /// One of TASK_ID_TYPE specifying whether the task is valid.
+    uint32_t                 PoolType;           /// One of TASK_POOL specifying the thread pool that executes the task.
+    uint32_t                 ThreadIndex;        /// The zero-based index of the thread that defines the task.
+    uint32_t                 BufferIndex;        /// The zero-based index of the thread-local buffer that defines the task.
+    uint32_t                 TaskIndex;          /// The zero-based index of the task within the thread-local buffer.
 };
 
 /// @summary Define the data associated with a task that runs on the general thread pool.
 /// These tasks are expected to have a light CPU work load, and may perform blocking, long-running operations.
 struct GENERAL_TASK_DATA
-{   static size_t const     ALIGNMENT              = CACHELINE_SIZE;
-    static size_t const     MAX_DATA               = 48;
-    std::atomic<uint32_t>   Sequence;            /// A sequence value assigned by the GENERAL_TASK_QUEUE.
-    task_id_t               TaskId;              /// The task identifier.
-    GENERAL_TASK_ENTRYPOINT TaskMain;            /// The task entry point.
+{   static size_t const      ALIGNMENT             = CACHELINE_SIZE;
+    static size_t const      MAX_DATA              = 48;
+    std::atomic<uint32_t>    Sequence;           /// A sequence value assigned by the GENERAL_TASK_QUEUE.
+    task_id_t                TaskId;             /// The task identifier.
+    GENERAL_TASK_ENTRYPOINT  TaskMain;           /// The task entry point.
 #if TARGET_ARCHITECTURE == ARCHITECTURE_X86_32 || TARGET_ARCHITECTURE == ARCHITECTURE_ARM_32
-    uint32_t                Reserved1;           /// Padding; unused.
+    uint32_t                 Reserved1;          /// Padding; unused.
 #endif
-    uint8_t                 Data[MAX_DATA];      /// User-supplied argument data associated with the work item.
+    uint8_t                  Data[MAX_DATA];     /// User-supplied argument data associated with the work item.
 };
 
 /// @summary Define the data associated with a task that runs on the compute thread pool.
 /// These tasks are expected to be CPU-heavy and not perform any blocking or long-running operations.
 struct COMPUTE_TASK_DATA
-{   static size_t const     ALIGNMENT              = CACHELINE_SIZE;
-    static size_t const     MAX_DATA               = 48;
-    task_id_t               TaskId;              /// The task identifier.
-    task_id_t               ParentTask;          /// The identifier of the parent task, or INVALID_TASK_ID.
-    COMPUTE_TASK_ENTRYPOINT TaskMain;            /// The task entry point.
+{   static size_t const      ALIGNMENT             = CACHELINE_SIZE;
+    static size_t const      MAX_DATA              = 48;
+    task_id_t                TaskId;             /// The task identifier.
+    task_id_t                ParentTask;         /// The identifier of the parent task, or INVALID_TASK_ID.
+    COMPUTE_TASK_ENTRYPOINT  TaskMain;           /// The task entry point.
 #if TARGET_ARCHITECTURE == ARCHITECTURE_X86_32 || TARGET_ARCHITECTURE == ARCHITECTURE_ARM_32
-    uint32_t                Reserved1;           /// Padding; unused.
+    uint32_t                 Reserved1;          /// Padding; unused.
 #endif
-    uint8_t                 Data[MAX_DATA];      /// User-supplied argument data associated with the work item.
+    uint8_t                  Data[MAX_DATA];     /// User-supplied argument data associated with the work item.
 };
 
 /// @summary Define the data representing a work queue safe for access by multiple concurrent producers and multiple concurrent consumers.
 /// The work item data is stored directly within the queue. All tasks in the queue are in the ready-to-run state. A single queue feeds all workers.
 struct GENERAL_TASK_QUEUE
-{   static size_t const     ALIGNMENT              = CACHELINE_SIZE;
-    static size_t const     PAD                    = CACHELINE_SIZE - sizeof(std::atomic<uint32_t>);
-    std::atomic<uint32_t>   Tail;                /// The index at which items are enqueued, representing the tail of the queue.
-    uint8_t                 Pad0[PAD];           /// Padding separating producer data from consumer data.
-    std::atomic<uint32_t>   Head;                /// The index at which items are dequeued, representing the head of the queue.
-    uint8_t                 Pad1[PAD];           /// Padding separating consumer data from shared data.
-    uint32_t                Mask;                /// The bitmask used to map the Head and Tail indices into the storage array.
-    GENERAL_TASK_DATA      *WorkItems;           /// The data associated with each ready-to-run work item.
+{   static size_t const      ALIGNMENT             = CACHELINE_SIZE;
+    static size_t const      PAD                   = CACHELINE_SIZE - sizeof(std::atomic<uint32_t>);
+    std::atomic<uint32_t>    Tail;               /// The index at which items are enqueued, representing the tail of the queue.
+    uint8_t                  Pad0[PAD];          /// Padding separating producer data from consumer data.
+    std::atomic<uint32_t>    Head;               /// The index at which items are dequeued, representing the head of the queue.
+    uint8_t                  Pad1[PAD];          /// Padding separating consumer data from shared data.
+    uint32_t                 Mask;               /// The bitmask used to map the Head and Tail indices into the storage array.
+    GENERAL_TASK_DATA       *WorkItems;          /// The data associated with each ready-to-run work item.
 };
 
 /// @summary Define the data representing a work-stealing deque of task identifiers. Each compute worker thread maintains its own queue.
 /// The worker thread can perform push and take operations. Other worker threads can perform concurrent steal operations.
 struct COMPUTE_TASK_QUEUE
-{   static size_t const     ALIGNMENT              = CACHELINE_SIZE;
-    static size_t const     PAD                    = CACHELINE_SIZE - sizeof(std::atomic<int64_t>);
-    std::atomic<int64_t>    Public;              /// The public end of the deque, updated by steal operations (Top).
-    uint8_t                 Pad0[PAD];           /// Padding separating the public data from the private data.
-    std::atomic<int64_t>    Private;             /// The private end of the deque, updated by push and take operations (Bottom).
-    uint8_t                 Pad1[PAD];           /// Padding separating the private data from the storage data.
-    int64_t                 Mask;                /// The bitmask used to map the Top and Bottom indices into the storage array.
-    task_id_t              *Tasks;               /// The identifiers for the tasks in the queue.
+{   static size_t const      ALIGNMENT             = CACHELINE_SIZE;
+    static size_t const      PAD                   = CACHELINE_SIZE - sizeof(std::atomic<int64_t>);
+    std::atomic<int64_t>     Public;             /// The public end of the deque, updated by steal operations (Top).
+    uint8_t                  Pad0[PAD];          /// Padding separating the public data from the private data.
+    std::atomic<int64_t>     Private;            /// The private end of the deque, updated by push and take operations (Bottom).
+    uint8_t                  Pad1[PAD];          /// Padding separating the private data from the storage data.
+    int64_t                  Mask;               /// The bitmask used to map the Top and Bottom indices into the storage array.
+    task_id_t               *Tasks;              /// The identifiers for the tasks in the queue.
 };
 
 /// @summary Defines the data associated with a set of tasks waiting on another task to complete.
 /// Only tasks in the compute queue support dependencies and permits.
 struct PERMITS_LIST
-{   static size_t const     ALIGNMENT              = CACHELINE_SIZE;
-    static size_t const     MAX_TASKS              = 15;
-    std::atomic<int32_t>    Count;               /// The number of items in the permits list.
-    task_id_t               Tasks[MAX_TASKS];    /// The task IDs in the permits list. This is the set of tasks to launch when the owning task completes.
+{   static size_t const      ALIGNMENT             = CACHELINE_SIZE;
+    static size_t const      MAX_TASKS             = 15;
+    std::atomic<int32_t>     Count;              /// The number of items in the permits list.
+    task_id_t                Tasks[MAX_TASKS];   /// The task IDs in the permits list. This is the set of tasks to launch when the owning task completes.
 };
 
 /// @summary Define the signals that can be sent to or set by a worker thread.
@@ -272,10 +271,6 @@ struct WIN32_WORKER_THREAD
     uint32_t                 WorkerFlags;        /// WORKER_FLAGS controlling worker thread behavior.
     WIN32_WORKER_SIGNAL      Signals;            /// The signals that can be sent to or set by a worker thread.
     WIN32_THREAD_ARGS       *MainThreadArgs;     /// The global data managed by the main thread and available to all threads.
-#if TARGET_ARCHITECTURE == ARCHITECTURE_X86_32 || TARGET_ARCHITECTURE == ARCHITECTURE_ARM_32
-    uint8_t                  Padding[20];        /// Padding out to the end of the 64-byte cacheline.
-#endif
-    uint8_t                  StartData[64];      /// Additional data to be passed to the thread at startup, for example, a task to execute.
 };
 
 /// @summary Define the state data associated with a pool of threads.
@@ -294,12 +289,9 @@ struct WIN32_THREAD_POOL
     WIN32_WORKER_THREAD     *WorkerState;        /// The state data for each worker thread.
     WIN32_TASK_SOURCE      **WorkerSource;       /// The TASK_SOURCE assigned to each worker thread.
     MEMORY_ARENA            *WorkerArena;        /// The thread-local memory arena assigned to each worker thread.
-    uint32_t                *WorkerFreeList;     /// The list of indices of available worker threads.
-    uint32_t                 WorkerFreeCount;    /// The number of pool indices in the transient worker free list.
     WIN32_WORKER_ENTRYPOINT  WorkerMain;         /// The entry point for all threads in the pool.
     WIN32_TASK_SCHEDULER    *TaskScheduler;      /// The scheduler that owns the thread pool, or NULL.
-    uint32_t                 FlagsTransient;     /// The WORKER_FLAGS to apply to transient worker threads.
-    uint32_t                 FlagsPersistent;    /// The WORKER_FLAGS to apply to persistent worker threads.
+    uint32_t                 WorkerFlags;        /// The WORKER_FLAGS to apply to worker threads in the pool.
 };
 
 /// @summary Define configuration options for a thread pool.
@@ -315,8 +307,7 @@ struct WIN32_THREAD_POOL_CONFIG
     HANDLE                   StartSignal;        /// Signal set by the coordinator to allow all active worker threads to start running.
     HANDLE                   ErrorSignal;        /// Signal set by any thread to indicate that a fatal error has occurred.
     HANDLE                   TerminateSignal;    /// Signal set by the coordinator to stop all active worker threads.
-    uint32_t                 FlagsTransient;     /// The WORKER_FLAGS to apply to transient threads (WORKER_FLAGS_TRANSIENT is implied.)
-    uint32_t                 FlagsPersistent;    /// The WORKER_FLAGS to apply to persistent threads.
+    uint32_t                 WorkerFlags;        /// The WORKER_FLAGS to apply to worker threads in the pool.
 };
 
 /// @summary Define the data associated with a thread that can produce compute tasks (but not necessarily execute them.)
@@ -334,13 +325,13 @@ struct cacheline_align WIN32_TASK_SOURCE
     WIN32_TASK_SOURCE       *TaskSources;        /// The list of per-source state for each task source. Managed by the scheduler.
     
     uint32_t                 TasksPerBuffer;     /// The allocation capacity of a single task buffer.
-    uint32_t                 BufferCount;        /// The number of buffers defined for the source. Constant.
     uint32_t                 BufferIndex;        /// The zero-based index of the task buffer being written to.
-    uint32_t                 TaskCount;          /// The zero-based index of the next available task in the current buffer.
+    uint32_t                 ComputeTaskCount;   /// The zero-based index of the next available task in the current compute task buffer.
+    uint32_t                 GeneralTaskCount;   /// The zero-based index of the next available task in the general queue.
 
-    COMPUTE_TASK_DATA       *WorkItems [2];      /// The work item definitions for each task, for each buffer.
-    int32_t                 *WorkCounts[2];      /// The outstanding work counter for each task, for each buffer.
-    PERMITS_LIST            *PermitList[2];      /// The permits list for each task, for each buffer.
+    COMPUTE_TASK_DATA       *WorkItems [2];      /// The work item definitions for each compute task, for each buffer.
+    int32_t                 *WorkCounts[2];      /// The outstanding work counter for each compute task, for each buffer.
+    PERMITS_LIST            *PermitList[2];      /// The permits list for each compute task, for each buffer.
 };
 
 /// @summary Define the data associated with a compute-oriented task scheduler.
@@ -800,31 +791,17 @@ CalculateMemoryForThreadPool
 /// @param thread_pool The thread pool that owns the worker thread.
 /// @param pool_index The zero-based index of the worker within the thread pool.
 /// @param worker_flags The WORKER_FLAGS to assign to the new worker thread.
-/// @param start_data Optional data to copy to the thread, typically specifying a work item to execute.
-/// @param data_size The number of bytes of data in the start_data buffer. The maximum size is 64 bytes.
 /// @return Zero if the worker thread was successfully started, or -1 if an error occurred.
 internal_function int
 SpawnWorkerThread
 (
     WIN32_THREAD_POOL *thread_pool, 
     uint32_t            pool_index,
-    uint32_t          worker_flags,
-    void   const       *start_data, 
-    size_t const         data_size
+    uint32_t          worker_flags
 )
 {
     if (pool_index >= thread_pool->MaxThreads)
     {   // an invalid pool index was specified. this is a silent error.
-        return -1;
-    }
-    if (data_size > 0 && task_data == NULL)
-    {   // no task data was specified.
-        ConsoleError("ERROR: Cannot SpawnWorkerThread; specified %zu bytes of data but specified NULL data array.\n", data_size);
-        return -1;
-    }
-    if (data_size > CACHELINE_SIZE)
-    {   // too much task data was specified.
-        ConsoleError("ERROR: Cannot SpawnWorkerThread; specified %zu bytes of data, max is %u bytes.\n", data_size, CACHELINE_SIZE);
         return -1;
     }
 
@@ -837,7 +814,7 @@ SpawnWorkerThread
     // create a manual-reset event, signaled by the new worker, to indicate that thread initialization is complete.
     if ((worker_ready = CreateEvent(NULL, TRUE, FALSE, NULL)) == NULL)
     {   // without an event to signal, the calling thread could deadlock.
-        ConsoleError("ERROR: Cannot SpawnWorkerThread; creation of thread ready event failed (%08X).\n", GetLastError());
+        ConsoleError("ERROR (%s): Creation of thread ready event failed (%08X).\n", GetLastError());
         return -1;
     }
 
@@ -861,7 +838,7 @@ SpawnWorkerThread
     // spawn the worker thread. _beginthreadex ensures the CRT is properly initialized.
     if ((thread_handle = (HANDLE)_beginthreadex(NULL, 0, thread_pool->ThreadMain, thread_state, 0, &thread_id)) == NULL)
     {   // unable to spawn the worker thread. let the caller decide if they want to terminate everybody.
-        ConsoleError("ERROR: Cannot SpawnWorkerThread; thread creation failed (errno = %d).\n", errno);
+        ConsoleError("ERROR (%s): Thread creation failed (errno = %d).\n", errno);
         CloseHandle(worker_ready);
         return -1;
     }
@@ -1065,24 +1042,24 @@ DefineComputeTask
 {
     if (args_size > COMPUTE_TASK_DATA::MAX_DATA)
     {   // there's too much data being passed. the caller should allocate storage elsewhere and pass us the pointer.
-        ConsoleError("ERROR: Argument data too large when defining task (parent %08X). Passing %zu bytes, max is %zu bytes.\n", parent_id, args_size, COMPUTE_TASK::MAX_DATA); 
+        ConsoleError("ERROR (%s): Argument data too large when defining task (parent %08X). Passing %zu bytes, max is %zu bytes.\n", __FUNCTION__, parent_id, args_size, COMPUTE_TASK::MAX_DATA); 
         return INVALID_TASK_ID;
     }
-    if (source->TaskCount  == source->TasksPerBuffer)
+    if (source->ComputeTaskCount == source->TasksPerBuffer)
     {   // bump the buffer index to the next buffer.
-        source->TaskCount   = 0; // reset the task counter for the new "current" buffer.
-        source->BufferIndex =(source->BufferIndex + 1) % source->BufferCount;
-        int32_t *work_count =&source->WorkCounts[source->BufferIndex][0];
+        source->ComputeTaskCount  = 0;
+        source->BufferIndex = (source->BufferIndex + 1) & 1; // % 2
+        int32_t *work_count = &source->WorkCounts[source->BufferIndex][0];
         if (InterlockedAdd((volatile LONG*) work_count, 0) > 0)
         {   // Defining a new task would overwrite an active task. This check isn't thorough, but it's quick.
-            ConsoleError("ERROR: Active task overwrite when defining task (parent %08X). Increase WIN32_TASK_SOURCE::TasksPerBuffer.\n", parent_id);
+            ConsoleError("ERROR (%s): Active task overwrite when defining task (parent %08X). Increase WIN32_TASK_SOURCE::TasksPerBuffer.\n", __FUNCTION__, parent_id);
             return INVALID_TASK_ID;
         }
     }
 
     int32_t     *dep_wcount;
     uint32_t   buffer_index = source->BufferIndex;
-    uint32_t     task_index = source->TaskCount++;
+    uint32_t     task_index = source->ComputeTaskCount++;
     task_id_t       task_id = MakeTaskId(buffer_index, TASK_POOL_COMPUTE, task_index, source->SourceIndex);
     int32_t     &work_count = source->WorkCounts[buffer_index][task_index];
     COMPUTE_TASK_DATA &task = source->WorkItems [buffer_index][task_index];
@@ -1111,7 +1088,7 @@ DefineComputeTask
             {   // attempt to append the ID of the new task to the permits list of wait_task.
                 if ((n = p->Count) == PERMITS_LIST::MAX_TASKS)
                 {   // the best thing to do in this case is re-think your task breakdown.
-                    ConsoleError("ERROR: Exceeded max permits on task %08X when defining task %08X (parent %08X).\n", wait_task, task_id, parent_id);
+                    ConsoleError("ERROR (%s): Exceeded max permits on task %08X when defining task %08X (parent %08X).\n", __FUNCTION__, wait_task, task_id, parent_id);
                     return task_id;
                 }
                 if (n < 0)
@@ -1306,7 +1283,7 @@ CreateThreadPool
     size_t mem_required = CalculateMemoryForThreadPool(pool_config->MaxThreads);
     if (!ArenaCanAllocate(arena, mem_required, std::alignment_of<void*>::value))
     {
-        ConsoleError("ERROR: Not enough free memory to initialize thread pool; need %zu bytes.\n", mem_required);
+        ConsoleError("ERROR (%s): Insufficient memory to initialize thread pool; need %zu bytes.\n", __FUNCTION__, mem_required);
         return -1;
     }
 
@@ -1328,8 +1305,7 @@ CreateThreadPool
     thread_pool->WorkerFreeCount          = 0;
     thread_pool->WorkerMain               = pool_config->ThreadMain;
     thread_pool->TaskScheduler            = pool_config->TaskScheduler;
-    thread_pool->FlagsTransient           = pool_config->FlagsTransient;
-    thread_pool->FlagsPersistent          = pool_config->FlagsPersistent & ~WORKER_FLAGS_TRANSIENT;
+    thread_pool->WorkerFlags              = pool_config->WorkerFlags;
     ZeroMemory(thread_pool->OSThreadIds   , pool_config->MaxThreads * sizeof(unsigned int));
     ZeroMemory(thread_pool->OSThreadHandle, pool_config->MaxThreads * sizeof(HANDLE));
     ZeroMemory(thread_pool->OSThreadArena , pool_config->MaxThreads * sizeof(WIN32_MEMORY_ARENA));
@@ -1363,8 +1339,11 @@ CreateThreadPool
         thread_pool->WorkerSource[i] = &scheduler->SourceList[pool_config->WorkerSourceIndex + i];
     }
 
-    // spawn workers until the minimum thread count is reached.
-    for (size_t i = 0; i < pool_config->MinThreads; ++i)
+    // spawn workers until the maximum thread count is reached.
+    // it might be nice to re-introduce the concept of transient threads, which 
+    // die after some period of idle-ness, but that may not be work the implementation complexity.
+    // idle workers will just sit in a wait state until there's work for them to do.
+    for (size_t i = 0; i < pool_config->MaxThreads; ++i)
     {
         WIN32_WORKER_ENTRYPOINT entry = pool_config->WorkerMain;
         WIN32_TASK_SCHEDULER   *sched = pool_config->TaskScheduler;
@@ -1377,13 +1356,6 @@ CreateThreadPool
             goto cleanup_and_fail;
         }
     }
-
-    // initialize the transient worker free list.
-    for (size_t i = pool_config->MaxThreads; i > pool_config->MinThreads; --i)
-    {
-        thread_pool->WorkerFreeList[thread_pool->WorkerFreeCount++] = uint32_t(i-1);
-    }
-
     return 0;
 
 cleanup_and_fail:
@@ -1412,10 +1384,7 @@ TerminateThreadPool
 )
 {
     if (thread_pool->TerminateSignal != NULL)
-    {   // technically, there's a race between TerminateThreadPool and spawning a thread.
-        // if this happens, TerminateThreadPool reads a too-small ActiveThreads value.
-        // the new thread will still correctly be signaled to terminate, but might be 
-        // missed during the WaitForMultipleObjects call.
+    {
         DWORD n = (DWORD) thread_pool->ActiveThreads;
         // signal all threads in the pool to terminate. this may take some time
         // if the worker threads are currently executing blocking tasks.
@@ -1531,19 +1500,19 @@ CheckSchedulerConfiguration
 {
     if (dst_config == NULL)
     {
-        ConsoleError("ERROR: A destination scheduler configuration (dst_config) must be supplied to CheckSchedulerConfiguration.\n");
+        ConsoleError("ERROR (%s): A destination scheduler configuration must be supplied.\n", __FUNCTION__);
         performance_warnings = false;
         return -1;
     }
     if (src_config == NULL)
     {
-        ConsoleError("ERROR: A source scheduler configuration (src_config) must be supplied to CheckSchedulerConfiguration.\n");
+        ConsoleError("ERROR (%s): A source scheduler configuration must be supplied.\n", __FUNCTION__);
         performance_warnings = false;
         return -1;
     }
     if (src_config->MainThreadArgs == NULL || src_config->MainThreadArgs->HostCPUInfo == NULL)
     {
-        ConsoleError("ERROR: Host CPU information must be supplied to CheckSchedulerConfiguration.\n");
+        ConsoleError("ERROR (%s): Host CPU information must be supplied to on WIN32_TASK_SCHEDULER_CONFIG::MainThreadArgs.\n", __FUNCTION__);
         performance_warnings = false;
         return -1;
     }
@@ -1679,25 +1648,25 @@ CheckSchedulerConfiguration
         if ((dst_config->PoolSize[TASK_POOL_GENERAL].MaxThreads  + 
              dst_config->PoolSize[TASK_POOL_COMPUTE].MaxThreads) > MAX_WORKER_THREADS)
         {   // there are too many worker threads for the software to support.
-            ConsoleError("ERROR: Too many worker threads for this scheduler implementation. Max is %u.\n", MAX_WORKER_THREADS);
+            ConsoleError("ERROR (%s): Too many worker threads for this scheduler implementation. Max is %u.\n", __FUNCTION__, MAX_WORKER_THREADS);
             performance_warnings = false;
             return -1;
         }
         if (dst_config->PoolSize[TASK_POOL_GENERAL].MaxTasks > MAX_TASKS_PER_BUFFER)
         {   // there are too many tasks for the scheduler to suport.
-            ConsoleError("ERROR: Too many tasks per-worker in the general pool. Max is %u.\n", MAX_TASKS_PER_BUFFER);
+            ConsoleError("ERROR (%s): Too many tasks per-worker in the general pool. Max is %u.\n", __FUNCTION__, MAX_TASKS_PER_BUFFER);
             performance_warnings = false;
             return -1;
         }
         if (dst_config->PoolSize[TASK_POOL_COMPUTE].MaxTasks > MAX_TASKS_PER_BUFFER)
         {   // there are too many tasks for the scheduler to suport.
-            ConsoleError("ERROR: Too many tasks per-worker in the compute pool. Max is %u.\n", MAX_TASKS_PER_BUFFER);
+            ConsoleError("ERROR (%s): Too many tasks per-worker in the compute pool. Max is %u.\n", __FUNCTION__, MAX_TASKS_PER_BUFFER);
             performance_warnings = false;
             return -1;
         }
         if ((general_memory + compute_memory) >= memory.ullAvailPhys)
         {   // too much per-thread memory is requested; allocation will never succeed.
-            ConsoleError("ERROR: Too much thread-local memory requested. Requested %zu bytes, but only %zu bytes available.\n", (general_memory+compute_memory), memory.ullAvailPhys);
+            ConsoleError("ERROR (%s): Too much thread-local memory requested. Requested %zu bytes, but only %zu bytes available.\n", __FUNCTION__, (general_memory+compute_memory), memory.ullAvailPhys);
             performance_warnings = false;
             return -1;
         }
@@ -1707,7 +1676,7 @@ CheckSchedulerConfiguration
         }
         else
         {   // a valid WIN32_THREAD_ARGS must be supplied.
-            ConsoleError("ERROR: No WIN32_THREAD_ARGS specified in scheduler configuration.\n");
+            ConsoleError("ERROR (%s): No WIN32_THREAD_ARGS specified in scheduler configuration.\n", __FUNCTION__);
             performance_warnings = false;
             return -1;
         }
@@ -1716,12 +1685,12 @@ CheckSchedulerConfiguration
     {   // validate configuration performance against available resources.
         if ((double) (general_memory + compute_memory) >= (memory.ullAvailPhys * 0.8))
         {   // dangerously close to consuming all available physical memory in the system.
-            ConsoleOutput("WARNING: Scheduler will consume >= 80 percent of available physical memory. Swapping may occur.\n");
+            ConsoleOutput("PERFORMANCE WARNING (%s): Scheduler will consume >= 80 percent of available physical memory. Swapping may occur.\n", __FUNCTION__);
             performance_warnings = true;
         }
         if (dst_config->PoolSize[TASK_POOL_COMPUTE].MaxThreads > host_cpu_info->HardwareThreads)
         {   // the host CPU is probably over-subscribed.
-            ConsoleOutput("WARNING: Compute pool has more threads than host CPU(s). Performance may be degraded.\n");
+            ConsoleOutput("PERFORMANCE WARNING (%s): Compute pool has more threads than host CPU(s). Performance may be degraded.\n", __FUNCTION__);
             performance_warnings = true;
         }
     }
@@ -1739,7 +1708,7 @@ CheckSchedulerConfiguration
     }
     if (dst_config->MaxTaskSources > MAX_SCHEDULER_THREADS)
     {   // the global scheduler limit has been exceeded.
-        ConsoleError("ERROR: Too many task sources. Max is %u.\n", MAX_SCHEDULER_THREADS);
+        ConsoleError("ERROR (%s): Too many task sources. Max is %u.\n", __FUNCTION__, MAX_SCHEDULER_THREADS);
         return -1;
     }
     return 0;
@@ -1770,12 +1739,12 @@ NewTaskSource
     }
     if (buffer_size > MAX_TASKS_PER_BUFFER)
     {   // consider this to be an error; it's easily trapped during development.
-        ConsoleError("ERROR: NewTaskSource - requested buffer size %zu exceeds maximum %u.\n", buffer_size, MAX_TASKS_PER_BUFFER);
+        ConsoleError("ERROR (%s): Requested buffer size %zu exceeds maximum %u.\n", __FUNCTION__, buffer_size, MAX_TASKS_PER_BUFFER);
         return NULL;
     }
     if (scheduler->SourceCount == scheduler->MaxSources)
     {   // no additional sources can be allocated from the scheduler.
-        ConsoleError("ERROR: NewTaskSource - max sources exceeded; increase limit WIN32_TASK_SCHEDULER_CONFIG::MaxTaskSources.\n");
+        ConsoleError("ERROR (%s): Max sources exceeded; increase limit WIN32_TASK_SCHEDULER_CONFIG::MaxTaskSources.\n", __FUNCTION__);
         return NULL;
     }
     size_t buffer_count = 2;
@@ -1783,19 +1752,19 @@ NewTaskSource
     size_t    alignment = std::alignment_of<WIN32_TASK_SOURCE>::value;
     if (!ArenaCanAllocate(arena, bytes_needed, alignment))
     {   // the arena doesn't have sufficient memory to initialize a source with the requested attributes.
-        ConsoleError("ERROR: NewTaskSource - insufficient memory in global arena; need %zu bytes.\n", bytes_needed);
+        ConsoleError("ERROR (%s): Insufficient memory in global arena; need %zu bytes.\n", __FUNCTION__, bytes_needed);
         return NULL;
     }
 
     WIN32_TASK_SOURCE *source =&scheduler->SourceList[scheduler->SourceCount];
     if (CreateComputeTaskQueue(&source->WorkQueue, buffer_size, arena) < 0)
     {   // unable to initialize the work-stealing dequeue for the source.
-        ConsoleError("ERROR: NewTaskSource - failed to create compute task queue.\n");
+        ConsoleError("ERROR (%s): Failed to create compute task queue.\n", __FUNCTION__);
         return NULL;
     }
     if (CreateSemaphore(&source->StealSignal , 0, 1024) < 0)
     {   // unable to allocate the semaphore used for waking worker threads.
-        ConsoleError("ERROR: NewTaskSource - failed to create work-stealing semaphore (%08X).\n", GetLastError());
+        ConsoleError("ERROR (%s): Failed to create work-stealing semaphore (%08X).\n", __FUNCTION__, GetLastError());
         return NULL;
     }
     source->GeneralWorkQueue =&scheduler->GeneralWorkQueue;
@@ -1803,9 +1772,9 @@ NewTaskSource
     source->SourceCount      = scheduler->MaxSources;
     source->TaskSources      = scheduler->SourceList;
     source->TasksPerBuffer   = buffer_size;
-    source->BufferCount      = 2;
     source->BufferIndex      = 0;
-    source->TaskCount        = 0;
+    source->ComputeTaskCount = 0;
+    source->GeneralTaskCount = 0;
     for (size_t i = 0; i < buffer_count; ++i)
     {
         source->WorkItems [i] = PushArray<COMPUTE_TASK_DATA>(arena, buffer_size);
@@ -1823,10 +1792,10 @@ public_function void
 SignalWaitingWorkers
 (
     WIN32_TASK_SOURCE *source, 
-    size_t              count
+    int                 count
 )
 {
-    PostSemaphore(source->StealSignal, int32_t(count));
+    PostSemaphore(source->StealSignal, count);
 }
 
 /// @summary Create a new asynchronous task scheduler instance. The scheduler worker threads are launched separately.
@@ -1846,20 +1815,20 @@ CreateScheduler
     bool                performance_warnings = false;
     if (CheckSchedulerConfiguration(&valid_config, config, performance_warnings) < 0)
     {   // no valid configuration can be obtained - some system limit was exceeded.
-        ConsoleError("ERROR: CreateScheduler - invalid scheduler configuration.\n");
+        ConsoleError("ERROR (%s): Invalid scheduler configuration.\n", __FUNCTION__);
         ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
         return -1;
     }
     if (performance_warnings)
     {   // spit out an extra console message to try and get programmer attention.
-        ConsoleOutput("PERFORMANCE WARNING (CreateScheduler): Check console output above.\n");
+        ConsoleOutput("PERFORMANCE WARNING (%s): Check console output above.\n", __FUNCTION__);
     }
 
     size_t mem_marker   = ArenaMarker(arena);
     size_t mem_required = CalculateMemoryForScheduler(&valid_config);
     if (!ArenaCanAllocate(arena, mem_required, std::alignment_of<WIN32_TASK_SCHEDULER>::value))
     {
-        ConsoleError("ERROR: CreateScheduler - insufficient memory; %zu bytes required.\n", mem_required);
+        ConsoleError("ERROR (%s): Insufficient memory; %zu bytes required.\n", __FUNCTION__, mem_required);
         ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
         return -1;
     }
@@ -1947,8 +1916,7 @@ CreateScheduler
     general_config.StartSignal       = ev_launch;
     general_config.ErrorSignal       = ev_error;
     general_config.TerminateSignal   = ev_terminate;
-    general_config.FlagsTransient    = WORKER_FLAGS_GENERAL | WORKER_FLAGS_TRANSIENT;
-    general_config.FlagsPersistent   = WORKER_FLAGS_GENERAL;
+    general_config.WorkerFlags       = WORKER_FLAGS_GENERAL;
     if (CreateThreadPool(&scheduler->GeneralPool, &general_config, arena) < 0)
     {   // the scheduler would have no pool in which to execute general tasks.
         ConsoleError("ERROR (%s): Failed to create the general thread pool.\n", __FUNCTION__);
@@ -1966,8 +1934,7 @@ CreateScheduler
     compute_config.StartSignal       = ev_launch;
     compute_config.ErrorSignal       = ev_error;
     compute_config.TerminateSignal   = ev_terminate;
-    compute_config.FlagsTransient    = WORKER_FLAGS_COMPUTE | WORKER_FLAGS_TRANSIENT;
-    compute_config.FlagsPersistent   = WORKER_FLAGS_COMPUTE;
+    compute_config.WorkerFlags       = WORKER_FLAGS_COMPUTE;
     if (CreateThreadPool(&scheduler->ComputePool, &compute_config, arena) < 0)
     {   // the scheduler would have no pool in which to execute compute tasks.
         ConsoleError("ERROR (%s): Failed to create the compute thread pool.\n", __FUNCTION__);
@@ -2052,7 +2019,44 @@ RootTaskSource
     return &scheduler->SourceList[0];
 }
 
-/// @summary Spawn a new task. After spawning any child tasks, call FinishComputeTask to complete the task definition.
+/// @summary Spawn a new task to execute on the general pool.
+/// @param source The WIN32_TASK_SOURCE owned by the calling thread.
+/// @param task_main The entry point of the task.
+/// @param task_args User-supplied argument data for the task instance. This data is copied into the task.
+/// @param args_size The number of bytes of argument data to copy into the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function task_id_t
+NewGeneralTask
+(
+    WIN32_TASK_SOURCE         *source, 
+    GENERAL_TASK_ENTRYPOINT task_main, 
+    void   const           *task_args, 
+    size_t const            args_size
+)
+{
+    if (args_size > GENERAL_TASK_DATA::MAX_DATA)
+    {   // only create the task if the supplied data will fit.
+        ConsoleError("ERROR (%s): Task argument data exceeds maximum allowable (%zu bytes, max %zu bytes).\n", __FUNCTION__, args_size, GENERAL_TASK_DATA::MAX_DATA);
+        return INVALID_TASK_ID;
+    }
+    WIN32_TASK_SCHEDULER *scheduler = source->TaskScheduler;
+    WIN32_THREAD_POOL  *thread_pool =&scheduler->GeneralPool;
+    uint32_t             task_index = source->GeneralTaskCount;
+    task_id_t  task_id = MakeTaskId(0, TASK_POOL_GENERAL, task_index, source->SourceIndex);
+    if (GeneralTaskQueuePut(source->GeneralWorkQueue, task_id, task_main, task_args, task_size) == 0)
+    {   // wake up a waiting worker thread and return the task ID.
+        PostSemaphore(&scheduler->GeneralWorkSignal, 1);
+        source->GeneralTaskCount++;
+        return task_id;
+    }
+    else
+    {   // the work queue is full - fail to create the task.
+        ConsoleError("ERROR (%s): General work queue is full.\n", __FUNCTION__);
+        return INVALID_TASK_ID;
+    }
+}
+
+/// @summary Spawn a new task to execute on the compute pool. After spawning any child tasks, call FinishComputeTask to complete the task definition.
 /// @param source The WIN32_TASK_SOURCE owned by the calling thread. 
 /// @param task_main The entry point of the task.
 /// @param task_args User-supplied argument data for the task instance. This data is copied into the task.
@@ -2077,8 +2081,8 @@ NewComputeTask
 /// @param task_main The entry point of the task.
 /// @param task_args User-supplied argument data for the task instance. This data is copied into the task.
 /// @param args_size The number of bytes of argument data to copy into the task.
-/// @param parent_id The task ID of the parent task, as returned by the NewTask function used to create the parent task.
-/// @param wait_task The identifier of the task that must complete prior to executing this new task, or INVALID_TASK_ID.
+/// @param parent_id The task ID of the parent task, as returned by the New*Task function used to create the parent task.
+/// @param wait_task The identifier of the compute task that must complete prior to executing this new task, or INVALID_TASK_ID.
 /// @return The identifier of the new task, or INVALID_TASK_ID.
 public_function task_id_t
 NewChildTask
@@ -2093,19 +2097,28 @@ NewChildTask
 {
     COMPUTE_TASK_DATA *parent_task;  // read-only
     int32_t           *parent_count; // write-only
+    if (wait_task != INVALID_TASK_ID && IsGeneralTask(wait_task))
+    {   // general tasks do not support dependencies, and compute tasks cannot wait on general tasks.
+        ConsoleError("ERROR (%s): Compute tasks cannot wait on general tasks (id = %08X).\n", __FUNCTION__, wait_task);
+        return INVALID_TASK_ID;
+    }
     if (IsComputeTask(parent_id))
     {   // retrieve the information we need about the parent task.
         parent_task  = GetTaskWorkItem (parent_id, source->TaskSources);
         parent_count = GetTaskWorkCount(parent_id, source->TaskSources);
         // increment the outstanding work counter on the parent.
         InterlockedIncrement((volatile LONG*) parent_count);
+        // define the child task. the parent work counter will be decremented when the child finishes executing.
+        return DefineComputeTask(source, task_main, task_args, args_size, parent_id, wait_task);
+    }
+    else if (IsGeneralTask(parent_id))
+    {   // this is supported for convenience and identification purposes, but is otherwise meaningless.
+        return DefineComputeTask(source, task_main, task_args, args_size, parent_id, wait_task);
     }
     else
     {   // the parent ID isn't valid, so fail the child creation.
         return INVALID_TASK_ID;
     }
-
-    return DefineComputeTask(source, task_main, task_args, args_size, parent_id, wait_task);
 }
 
 /// @summary Indicate that a task (including any children) has been completely defined and allow it to finish execution.
@@ -2133,13 +2146,10 @@ FinishComputeTask
                 {
                     ComputeTaskQueuePush(&source->WorkQueue, p->Tasks[i]);
                 }
+                SignalWaitingWorkers(source, n);
             }
             // decrement the work counter on any parent task.
-            if ((n += FinishComputeTask(source, work_item->ParentTask)) > 0)
-            {   // wake up idle threads to help work.
-                SignalWaitingWorkers(source);
-            }
-            return n;
+            return n + FinishComputeTask(source, work_item->ParentTask);
         }
     }
     return 0;
