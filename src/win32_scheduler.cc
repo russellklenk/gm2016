@@ -878,10 +878,13 @@ ExecuteComputeTask
 {   
     COMPUTE_TASK_DATA *work_item;
     if (IsComputeTask(task) && (work_item = GetTaskWorkItem(task, worker_source->TaskSources)) != NULL)
-    {   // TODO(rlk): Flip all pages of task_arena back to PAGE_READWRITE.
+    {   // reset the arena for use during task execution. make the memory readable and writable.
+        // after the task has finished executing, disable access to the memory arena to help trap
+        // any references back into the arena which would be invalidated when the next task executes.
         ArenaReset(task_arena);
+        ArenaEnableAccess(task_arena);
         work_item->TaskMain(task, worker_source, work_item, task_arena, thread_args, scheduler);
-        // TODO(rlk): As a debugging feature, mark all pages of task_arena as PAGE_NOACCESS.
+        ArenaDisableAccess(task_arena);
         FinishComputeTask(worker_source, task);
     }
 }
@@ -939,10 +942,13 @@ GeneralWorkerMain
 
             // retrieve work items and execute them until none remain in the queue.
             while (GeneralTaskQueueGet(worker_source->GeneralWorkQueue, &task_data) == 0)
-            {   // TODO(rlk): Flip all pages of task_arena back to PAGE_READWRITE.
+            {   // reset the arena for use during task execution. make the memory readable and writable.
+                // after the task has finished executing, disable access to the memory arena to help trap
+                // any references back into the arena which would be invalidated when the next task executes.
                 ArenaReset(worker_arena);
+                ArenaEnableAccess(worker_arena);
                 task_data.TaskMain(task_data.TaskId, worker_source, &task_data, worker_arena, main_args, scheduler);
-                // TODO(rlk): As a debugging feature, mark all pages of task_arena as PAGE_NOACCESS.
+                ArenaDisableAccess(worker_arena);
             }
             // TODO(rlk): possibly spin briefly in case a new item gets enqueued?
             // maybe inline that portion of the SEMAPHORE implementation?
