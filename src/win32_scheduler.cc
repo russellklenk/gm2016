@@ -914,11 +914,12 @@ ExecuteGenericTask
 /// @param argp Pointer to the WIN32_WORKER_THREAD state associated with the thread.
 /// @return The thread exit code (unused).
 internal_function unsigned int __cdecl
-GenericWorkerMain
+GeneralWorkerMain
 (
     void *argp
 )
 {
+    GENERAL_TASK_DATA      task_data;
     WIN32_WORKER_THREAD *thread_args = (WIN32_WORKER_THREAD*)  argp;
     WIN32_THREAD_ARGS     *main_args =  thread_args->MainThreadArgs;
     WIN32_THREAD_POOL   *thread_pool =  tnread_args->ThreadPool;
@@ -927,9 +928,16 @@ GenericWorkerMain
     MEMORY_ARENA       *worker_arena =  thread_args->ThreadArena; 
     HANDLE            init_signal[3] =
     { 
-        thread_args->Signals.StartSignal,
-        thread_args->Signals.ErrorSignal,
-        thread_args->Signals.TerminateSignal
+        thread_args->Signals.StartSignal,     /* thread told to launch by coordinator  */
+        thread_args->Signals.ErrorSignal,     /* another thread reported a fatal error */
+        thread_args->Signals.TerminateSignal  /* thread told to exit by coordinator    */
+    };
+    DWORD  const      wait_count     =  3;
+    HANDLE            wake_signal[3] = 
+    {
+        thread_args->Signals.TerminateSignal, /* thread told to exit by coordinator    */
+        thread_args->Signals.ErrorSignal,     /* another thread reported a fatal error */
+        scheduler->GeneralWorkSignal.KSem,    /* work added to the work queue          */
     };
 
     // TODO(rlk): any thread-local initialization.
@@ -943,12 +951,36 @@ GenericWorkerMain
         goto terminate_worker;
     }
 
-    // TODO(rlk): need a counting semaphore on the work queue.
-    // scheduler->GeneralWorkSignal is a counting semaphore, but not suitable for use with WFMO.
-    // probably best to make it just a regular kernel semaphore.
+    for ( ; ; )
+    {   // put the thread to sleep until there's some work to do.
+        DWORD result  = WaitForMultipleObjects(wait_count, wake_signal, FALSE, INFINITE);
+        if   (result >= WAIT_OBJECT_0 && result < (WAIT_OBJECT_0 + wait_count))
+        {   // one of the events the thread was waiting on became signaled.
+            if (result == (WAIT_OBJECT_0 + 0) || result == (WAIT_OBJECT_0 + 1))
+            {   // this thread was told to exit, or another thread signaled a fatal error.
+                goto terminate_worker;
+            }
+
+            // retrieve work items and execute them until none remain in the queue.
+            while (GeneralTaskQueueGet(worker_source->GeneralWorkQueue, &task_data) == 0)
+            {   // TODO(rlk): Flip all pages of task_arena back to PAGE_READWRITE.
+                ArenaReset(worker_arena);
+                task_data.TaskMain(task_data.TaskId, worker_source, &task_data, worker_arena, main_args, scheduler);
+                // TODO(rlk): As a debugging feature, mark all pages of task_arena as PAGE_NOACCESS.
+            }
+            // TODO(rlk): possibly spin briefly in case a new item gets enqueued?
+            // maybe inline that portion of the SEMAPHORE implementation?
+        }
+        else
+        {   // some kind of error occurred while waiting. terminate the worker.
+            ConsoleError("ERROR (%s): WaitForMultipleObjects returned unexpected result %08X on worker %u.\n", __FUNCTION__, GetLastError(), thread_args->PoolIndex);
+            SetEvent(thread_args->Signals.ErrorSignal);
+            goto terminate_worker;
+        }
+    }
 
 terminate_worker:
-    ConsoleOutput("Generic task worker thread %u terminated.\n", thread_args->WorkerIndex);
+    ConsoleOutput("STATUS (%s): General pool worker thread %u terminated.\n", __FUNCTION__, thread_args->PoolIndex);
     return 0;
 }
 
