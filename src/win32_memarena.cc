@@ -551,6 +551,30 @@ ArenaReset
     arena->BytesUsed = 0;
 }
 
+/// @summary Enable read and write access to a memory arena.
+/// @param arena The memory arena for which access will be enabled.
+public_function void
+ArenaEnableAccess
+(
+    MEMORY_ARENA *arena
+)
+{
+    DWORD old_prot = 0;
+    VirtualProtect(arena->BaseAddress, arena->BytesTotal, PAGE_READWRITE, &old_prot);
+}
+
+/// @summary Disable access to a memory arena. Any attempt to read from or write to memory from the arena results in an access violation.
+/// @param arena The memory arena for which access will be disabled.
+public_function void
+ArenaDisableAccess
+(
+    MEMORY_ARENA *arena
+)
+{
+    DWORD old_prot = 0;
+    VirtualProtect(arena->BaseAddress, arena->BytesTotal, PAGE_NOACCESS, &old_prot);
+}
+
 /// @summary Retrieve an exact marker that can be used to reset the arena, preserving all current allocations.
 /// @param arena The memory arena to query.
 /// @return The marker representing the byte offset of the next allocation.
