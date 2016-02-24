@@ -886,30 +886,6 @@ ExecuteComputeTask
     }
 }
 
-/// @summary Execute a generic asynchronous task on the calling thread.
-/// @param worker_source The WIN32_TASK_SOURCE owned by the calling thread.
-/// @param work_item A thread-local copy of the task to execute.
-/// @param task_arena The memory arena to use for task-local memory allocations. The arena is reset prior to task execution.
-/// @param thread_args Global data and state managed by the main thread.
-/// @param scheduler The scheduler that owns the task.
-internal_function void
-ExecuteGenericTask
-(
-    WIN32_TASK_SOURCE   *worker_source,
-    GENERAL_TASK_DATA       *work_item,
-    MEMORY_ARENA           *task_arena, 
-    WIN32_THREAD_ARGS     *thread_args,
-    WIN32_TASK_SCHEDULER    *scheduler
-)
-{   
-    if (IsGeneralTask(work_item->TaskId))
-    {   // TODO(rlk): Flip all pages of task_arena back to PAGE_READWRITE.
-        ArenaReset(task_arena);
-        work_item->TaskMain(work_item->TaskId, worker_source, work_item, task_arena, thread_args, scheduler);
-        // TODO(rlk): As a debugging feature, mark all pages of task_arena as PAGE_NOACCESS.
-    }
-}
-
 /// @summary Implements the entry point of an asynchronous task worker thread.
 /// @param argp Pointer to the WIN32_WORKER_THREAD state associated with the thread.
 /// @return The thread exit code (unused).
