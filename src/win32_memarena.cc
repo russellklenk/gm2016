@@ -46,15 +46,6 @@ CreateMemoryArena
     SYSTEM_INFO sys_info = {};
     GetNativeSystemInfo(&sys_info);
 
-    // virtual memory allocations are rounded up to the next even multiple of the system
-    // page size, and have a starting address that is an even multiple of the system 
-    // allocation granularity (SYSTEM_INFO::dwAllocationGranularity).
-    arena_size = AlignUp(arena_size, size_t(sys_info.dwPageSize));
-    if (guard_page)
-    {   // add an extra page for use as a guard page.
-        extra = sys_info.dwPageSize;
-    }
-
     size_t   commit_size = 0;
     size_t   extra  = 0;
     DWORD    flags  = MEM_RESERVE;
@@ -62,6 +53,15 @@ CreateMemoryArena
     {   // commit the entire range of address space.
         commit_size = arena_size;
         flags      |= MEM_COMMIT;
+    }
+
+    // virtual memory allocations are rounded up to the next even multiple of the system
+    // page size, and have a starting address that is an even multiple of the system 
+    // allocation granularity (SYSTEM_INFO::dwAllocationGranularity).
+    arena_size = AlignUp(arena_size, size_t(sys_info.dwPageSize));
+    if (guard_page)
+    {   // add an extra page for use as a guard page.
+        extra = sys_info.dwPageSize;
     }
 
     // reserve (and optionally commit) contiguous virtual address space.
