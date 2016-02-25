@@ -169,15 +169,6 @@ enum TASK_POOL : uint32_t
     TASK_POOL_COUNT          = 2                 /// The number of thread pools defined by the scheduler.
 };
 
-/// @summary Define the data associated with a spinning semaphore, which is guaranteed to remain in user mode unless a thread must be put to sleep or woken.
-struct SEMAPHORE
-{   static size_t const      PAD                   = CACHELINE_SIZE - sizeof(std::atomic<int32_t>);
-    std::atomic<int32_t>     Count;              /// The current count of the semaphore.
-    uint8_t                  Padding[PAD];       /// Unused padding out to the next cacheline boundary.
-    int32_t                  SpinCount;          /// The spin count assigned to the semaphore at creation time.
-    HANDLE                   KSem;               /// The handle of the kernel semaphore object.
-};
-
 /// @summary Define a structure specifying the constituent parts of a task ID.
 struct TASK_ID_PARTS
 {
@@ -317,7 +308,7 @@ struct cacheline_align WIN32_TASK_SOURCE
 {   static size_t const      ALIGNMENT              = CACHELINE_SIZE;
 
     COMPUTE_TASK_QUEUE       ComputeWorkQueue;   /// The queue of ready-to-run task IDs in the compute pool.
-    SEMAPHORE                StealSignal;        /// A counting semaphore used to wake waiting threads when work can be stolen.
+    HANDLE                   StealSignal;        /// A counting semaphore used to wake waiting threads when work can be stolen.
 
     GENERAL_TASK_QUEUE      *GeneralWorkQueue;   /// The MPMC queue of general task data.
     size_t                   SourceIndex;        /// The zero-based index of the source within the source list.
@@ -345,7 +336,7 @@ struct WIN32_TASK_SCHEDULER
     WIN32_THREAD_POOL        ComputePool;        /// The thread pool used for running work-heavy, non-blocking tasks.
 
     GENERAL_TASK_QUEUE       GeneralWorkQueue;   /// The MPMC queue of tasks to execute in the general pool.
-    SEMAPHORE                GeneralWorkSignal;  /// A counting semaphore used to wake waiting threads when general tasks are waiting.
+    HANDLE                   GeneralWorkSignal;  /// A counting semaphore used to wake waiting threads when general tasks are waiting.
 
     HANDLE                   StartSignal;        /// Manual-reset event signaled when worker threads should start running tasks.
     HANDLE                   ErrorSignal;        /// Manual-reset event used by worker threads to signal a fatal error.
@@ -916,10 +907,8 @@ GeneralWorkerMain
     {
         thread_args->Signals.TerminateSignal, /* thread told to exit by coordinator    */
         thread_args->Signals.ErrorSignal,     /* another thread reported a fatal error */
-        scheduler->GeneralWorkSignal.KSem,    /* work added to the work queue          */
+        scheduler->GeneralWorkSignal,         /* work added to the work queue          */
     };
-
-    // TODO(rlk): any thread-local initialization.
 
     // signal to the scheduler that this worker thread is ready to go.
     SetEvent(thread_args->Signals.ReadySignal);
@@ -950,8 +939,6 @@ GeneralWorkerMain
                 task_data.TaskMain(task_data.TaskId, worker_source, &task_data, worker_arena, main_args, scheduler);
                 ArenaDisableAccess(worker_arena);
             }
-            // TODO(rlk): possibly spin briefly in case a new item gets enqueued?
-            // maybe inline that portion of the SEMAPHORE implementation?
         }
         else
         {   // some kind of error occurred while waiting. terminate the worker.
@@ -964,6 +951,45 @@ GeneralWorkerMain
 terminate_worker:
     ConsoleOutput("STATUS (%s): General pool worker thread %u terminated.\n", __FUNCTION__, thread_args->PoolIndex);
     return 0;
+}
+
+/// @summary Extract the set of TASK_SOURCE and semaphore objects for a compute worker to wait on.
+/// @param handle_array The array of handles to populate. Handles written to this array are Win32 semaphore objects.
+/// @param source_array An array of WIN32_TASK_SOURCE pointer to populate. Each task source corresponds to a handle.
+/// @param max_items The maximum number of items to write to handle_array and source_array.
+/// @param worker_source The TASK_SOURCE of the worker calling the function.
+/// @return The number of items written to the output arrays.
+internal_function DWORD
+BuildComputeWorkerWaitList
+(
+    HANDLE             *handle_array, 
+    WIN32_TASK_SOURCE **source_array,
+    size_t                 max_items,
+    WIN32_TASK_SOURCE *worker_source
+)
+{
+    if (worker_source->SourceCount < MAXIMUM_WAIT_OBJECTS)
+    {   // simple case; just include everything in the list.
+        size_t this_index = worker_source->SourceIndex;
+        DWORD  wait_count = 0;
+        for (size_t i = 0, n = worker_source->SourceCount; i < n && wait_count < max_items; ++i)
+        {
+            if (i != this_index)
+            {   // if you hit this assert, you need to ensure that all task sources
+                // have been allocated and initialized via NewTaskSource before 
+                // launching the scheduler. this ensures that all semaphores are initialized.
+                assert(worker_source->TaskSources[i].StealSignal != NULL);
+                handle_array[wait_count] = worker_source->TaskSources[i].StealSignal;
+                source_array[wait_count] =&worker_source->TaskSources[i];
+                wait_count++;
+            }
+        }
+        return wait_count;
+    }
+    else
+    {   // TODO(rlk): figure out how to make this case work.
+        return 0;
+    }
 }
 
 /// @summary Implements the entry point of an asynchronous task worker thread.
@@ -979,7 +1005,8 @@ ComputeWorkerMain
     WIN32_THREAD_ARGS         *main_args =  thread_args->MainThreadArgs;
     WIN32_TASK_SOURCE     *worker_source =  thread_args->ThreadSource;
     MEMORY_ARENA           *worker_arena =  thread_args->ThreadArena; 
-    COMPUTE_TASK_SOURCE *wait_source[64] = {};
+    WIN32_TASK_SCHEDULER      *scheduler =  thread_args->TaskScheduler;
+    WIN32_TASK_SOURCE   *wait_source[64] = {};
     HANDLE               wait_signal[64] = {};
     HANDLE               init_signal[3]  =
     { 
@@ -999,8 +1026,10 @@ ComputeWorkerMain
 
     // perform any initialization that must wait until all sources are prepared.
     wait_source[0]   = NULL;
-    wait_signal[0]   = thread_args->HaltSignal;
-    DWORD wait_count = BuildWorkerWaitList(&wait_signal[1], &wait_source[1], 63, worker_source);
+    wait_source[1]   = NULL;
+    wait_signal[0]   = thread_args->Signals.ErrorSignal;
+    wait_signal[1]   = thread_args->Signals.TerminateSignal;
+    DWORD wait_count = BuildWorkerWaitList(&wait_signal[2], &wait_source[2], 62, worker_source) + 2;
 
     // this thread is the only thread that can put things into its work queue.
     // everything else is stolen work from other threads.
@@ -1009,33 +1038,35 @@ ComputeWorkerMain
         DWORD result  = WaitForMultipleObjects(wait_count, wait_signal, FALSE, INFINITE);
         if   (result >= WAIT_OBJECT_0 && result < (WAIT_OBJECT_0 + wait_count))
         {   // one of the events we were waiting on was signaled.
-            if (result == WAIT_OBJECT_0)
-            {   // the scheduler HALT signal woke us up. terminate the thread.
+            if (result == (WAIT_OBJECT_0 + 0) || result == (WAIT_OBJECT_0 + 1))
+            {   // this thread was told to exit, or another thread signaled a fatal error.
                 goto terminate_worker;
             }
             // otherwise, this thread was woken because there's work to steal.
-            task_id_t task  = ComputeTaskQueueSteal(&wait_source[result - WAIT_OBJECT_0]->WorkQueue);
+            WIN32_TASK_SOURCE *steal_source = wait_source[result - WAIT_OBJECT_0];
+            task_id_t task  = ComputeTaskQueueSteal(&steal_source->ComputeWorkQueue);
             while    (task != INVALID_TASK_ID)
             {   // execute the task this thread just took or stole.
-                ExecuteComputeTask(task, worker_source, &thread_args->ThreadArena, main_args);
+                ExecuteComputeTask(task, worker_source, worker_arena, main_args, scheduler);
                 // that task may have generated additional work.
                 // keep working as long as we can grab work to do.
-                if ((task = ComputeTaskQueueTake(&worker_source->WorkQueue)) == INVALID_TASK_ID)
-                {   // nothing left in the local queue, try to steal from the source that woke us.
-                    task = ComputeTaskQueueSteal(&wait_source[result - WAIT_OBJECT_0]->WorkQueue);
-                    // TODO(rlk): try and steal from a random worker?
+                if((task = ComputeTaskQueueTake(&worker_source->ComputeWorkQueue)) == INVALID_TASK_ID)
+                {   // nothing left in the local queue, so try to steal from the source that woke us.
+                    task = ComputeTaskQueueSteal(&steal_source->ComputeWorkQueue);
                     // if task is INVALID_TASK_ID, this worker will go back to sleep.
                 }
             }
         }
         else
-        {   // some kind of error occurred while waiting. terminate the thread.
+        {   // some kind of error occurred while waiting. terminate the worker.
+            ConsoleError("ERROR (%s): WaitForMultipleObjects returned unexpected result %08X on worker %u.\n", __FUNCTION__, GetLastError(), thread_args->PoolIndex);
+            SetEvent(thread_args->Signals.ErrorSignal);
             goto terminate_worker;
         }
     }
 
 terminate_worker:
-    ConsoleOutput("Compute worker thread %zu terminated.\n", thread_args->ThreadIndex);
+    ConsoleOutput("STATUS (%s): Compute pool worker thread %u terminated.\n", __FUNCTION__, thread_args->PoolIndex);
     return 0;
 }
 
@@ -1135,126 +1166,6 @@ DefineComputeTask
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
-/// @summary Create a new semaphore object initialized with the specified resource count and spin count.
-/// @param sem The semaphore object to initialize.
-/// @param n The initial resource count of the semaphore.
-/// @param spin_count The spin count.'
-/// @return Zero if the semaphore is created successfully, or -1 if an error occurred.
-public_function inline int
-CreateSemaphore
-(
-    SEMAPHORE       *sem, 
-    int32_t            n, 
-    int32_t   spin_count
-)
-{
-    sem->Count.N.store(n, std::memory_order_relaxed);
-    sem->SpinCount = spin_count > 1 ? spin_count : 1;
-    sem->KSem = CreateSemaphore(NULL, 0, LONG_MAX, NULL);
-    return (sem->KSem != NULL) ? 0 : -1;
-}
-
-/// @summary Free resources associated with a semaphore object.
-/// @param sem The semaphore to delete.
-public_function inline void
-DeleteSemaphore
-(
-    SEMAPHORE *sem
-)
-{
-    if (sem->KSem != NULL)
-    {
-        CloseHandle(sem->KSem);
-        sem->KSem = NULL;
-    }
-}
-
-/// @summary Decrement a semaphore's internal counter and return whether or not a resource was available.
-/// @param sem The semaphore to decrement.
-/// @return true if a resource was available, or false if no resources are available.
-public_function inline bool
-TryWaitSemaphore
-(
-    SEMAPHORE *sem
-)
-{
-    int32_t count = sem->Count.N.load(std::memory_order_acquire);
-    while  (count > 0)
-    {
-        if (sem->Count.N.compare_exchange_weak(count, count - 1, std::memory_order_acq_rel, std::memory_order_relaxed))
-            return true;
-        // else, count was reloaded - optional backoff.
-    }
-    return false;
-}
-
-/// @summary Attempt to acquire a resource (decrement the semaphore's internal counter) and block the calling thread if none are available.
-/// @param sem The semaphore to decrement.
-public_function inline void
-WaitSemaphoreNoSpin
-(
-    SEMAPHORE *sem
-)
-{
-    if (sem->Count.N.fetch_add(-1, std::memory_order_acq_rel) < 1)
-        WaitForSingleObject(sem->KSem, INFINITE);
-}
-
-/// @summary Attempt to acquire a resource (decrement the semaphore's internal counter) and block the calling thread if none are available.
-/// @param sem The semaphore to decrement.
-public_function void
-WaitSemaphore
-(
-    SEMAPHORE *sem
-)
-{
-    int32_t spin_count = sem->SpinCount;
-    while  (spin_count--)
-    {   // attempt to acquire the resource.
-        int32_t count = sem->Count.N.load(std::memory_order_acquire);
-        while  (count > 0)
-        {
-            if (sem->Count.N.compare_exchange_weak(count, count-1, std::memory_order_acq_rel, std::memory_order_relaxed))
-                return; // successfully acquired a resource.
-            // else, count was reloaded - optional backoff?
-        }
-    }
-    // no additional spin cycles remaining; try one more time to acquire a resource and wait if none are available.
-    if (sem->Count.N.fetch_add(-1, std::memory_order_acq_rel) < 1)
-        WaitForSingleObject(sem->KSem, INFINITE);
-}
-
-/// @summary Make a resource available (increment the semaphore's internal counter) and unblock a single waiting thread.
-/// @param sem The semaphore to increment.
-public_function inline void
-PostSemaphore
-(
-    SEMAPHORE *sem
-)
-{   // only signal the underlying semaphore of there was at least one thread waiting.
-    if (sem->Count.N.fetch_add(1, std::memory_order_acq_rel) < 0)
-        ReleaseSemaphore(sem->KSem, 1, 0);
-}
-
-/// @summary Make one or more resources available (increment the semaphore's internal counter) and unblock one or more waiting threads.
-/// @param sem The semaphore to increment.
-/// @param n The number of resources to make available.
-public_function void
-PostSemaphore
-(
-    SEMAPHORE *sem, 
-    int32_t      n
-)
-{
-    int32_t old = sem->Count.N.fetch_add(n, std::memory_order_acq_rel);
-    if (old < 0)
-    {
-        int32_t min_waiters =-old;
-        int32_t num_to_wake = num_waiters < n ? num_waiters : n; // min(num_waiters, n)
-        ReleaseSemaphore(sem->KSem, num_to_wake, 0);
-    }
-}
-
 /// @summary Retrieve the zero-based index of the thread that created a task.
 /// @param id The task identifier.
 /// @return The zero-based index of the thread that created the task.
@@ -1765,6 +1676,7 @@ NewTaskSource
         ConsoleError("ERROR (%s): Max sources exceeded; increase limit WIN32_TASK_SCHEDULER_CONFIG::MaxTaskSources.\n", __FUNCTION__);
         return NULL;
     }
+    HANDLE    semaphore = NULL;
     size_t buffer_count = 2;
     size_t bytes_needed = CalculateMemoryForTaskSource(buffer_count, buffer_size);
     size_t    alignment = std::alignment_of<WIN32_TASK_SOURCE>::value;
@@ -1780,12 +1692,13 @@ NewTaskSource
         ConsoleError("ERROR (%s): Failed to create compute task queue.\n", __FUNCTION__);
         return NULL;
     }
-    if (CreateSemaphore(&source->StealSignal , 0, 1024) < 0)
+    if ((semaphore = CreateSemaphore(NULL, 0, LONG_MAX, NULL)) == NULL)
     {   // unable to allocate the semaphore used for waking worker threads.
         ConsoleError("ERROR (%s): Failed to create work-stealing semaphore (%08X).\n", __FUNCTION__, GetLastError());
         return NULL;
     }
     source->GeneralWorkQueue =&scheduler->GeneralWorkQueue;
+    source->StealSignal      = semaphore;
     source->SourceIndex      = scheduler->SourceCount;
     source->SourceCount      = scheduler->MaxSources;
     source->TaskSources      = scheduler->SourceList;
@@ -1851,6 +1764,7 @@ CreateScheduler
         return -1;
     }
 
+    HANDLE semaphore       = NULL;
     HANDLE ev_error        = NULL;
     HANDLE ev_launch       = NULL;
     HANDLE ev_terminate    = NULL;
@@ -1960,7 +1874,7 @@ CreateScheduler
     }
 
     // create the work queue and associated synchronization objects for general pool tasks.
-    if (CreateSemaphore(&scheduler->GeneralWorkSignal, 0, 1024) < 0)
+    if ((semaphore = CreateSemaphore(NULL, 0, LONG_MAX, NULL)) == NULL)
     {   // general pool worker threads would have no way to know that work is waiting.
         ConsoleError("ERROR (%s): Failed to create the general work queue semaphore.\n", __FUNCTION__);
         goto cleanup_and_fail;
@@ -1970,7 +1884,7 @@ CreateScheduler
         ConsoleError("ERROR (%s): Failed to create the general work queue.\n", __FUNCTION__);
         goto cleanup_and_fail;
     }
-
+    scheduler->GeneralWorkSignal = semaphore;
     return 0;
 
 cleanup_and_fail:
@@ -1978,12 +1892,16 @@ cleanup_and_fail:
     TerminateThreadPool(&scheduler->GeneralPool);
     for (size_t i = 0, n = scheduler->SourceCount; i < n; ++i)
     {   // clean up the semaphore for any allocated task sources.
-        DeleteSemaphore(&scheduler->SourceList[i].StartSignal);
+        if (scheduler->SourceList[i].StealSignal != NULL)
+        {
+            CloseHandle(scheduler->SourceList[i].StealSignal);
+            scheduler->SourceList[i].StealSignal = NULL;
+        }
     }
     if (ev_terminate != NULL) CloseHandle(ev_terminate);
-    if (ev_launch != NULL) CloseHandle(ev_launch);
-    if (ev_error != NULL) CloseHandle(ev_error);
-    DeleteSemaphore(&scheduler->GeneralWorkSignal);
+    if (ev_launch    != NULL) CloseHandle(ev_launch);
+    if (ev_error     != NULL) CloseHandle(ev_error);
+    if (semaphore    != NULL) CloseHandle(semaphore);
     ArenaResetToMarker(arena, mem_marker);
     ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
     return -1;
@@ -2016,12 +1934,16 @@ HaltScheduler
     // clean up the resources allocated to any task sources.
     for (size_t i = 0, n = scheduler->SourceCount; i < n; ++i)
     {   // clean up the semaphore allocated to the task source.
-        DeleteSemaphore(&scheduler->SourceList[i].StartSignal);
+        if (scheduler->SourceList[i].StealSignal != NULL)
+        {
+            CloseHandle(scheduler->SourceList[i].StealSignal);
+            scheduler->SourceList[i].StealSignal = NULL;
+        }
     }
-    if (scheduler->TerminateSignal != NULL) CloseHandle(scheduler->TerminateSignal);
-    if (scheduler->StartSignal     != NULL) CloseHandle(scheduler->StartSignal);
-    if (scheduler->ErrorSignal     != NULL) CloseHandle(scheduler->ErrorSignal);
-    DeleteSemaphore(&scheduler->GeneralWorkSignal);
+    if (scheduler->TerminateSignal   != NULL) CloseHandle(scheduler->TerminateSignal);
+    if (scheduler->StartSignal       != NULL) CloseHandle(scheduler->StartSignal);
+    if (scheduler->ErrorSignal       != NULL) CloseHandle(scheduler->ErrorSignal);
+    if (scheduler->GeneralWorkSignal != NULL) CloseHandle(scheduler->GeneralWorkSignal);
     ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
 }
 
