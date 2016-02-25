@@ -1,4 +1,4 @@
-/*/////////////////////////////////////////////////////////////////////////////
+
 /// @summary Implement the entry point of the client application. Initializes 
 /// the runtime and sets up the execution environment for the explicit 
 /// background threads. User input is handled on the main thread.
@@ -82,17 +82,19 @@ struct FENCE_TASK_DATA
 internal_function void
 TestTaskMain
 (
-    task_id_t                   id,
-    COMPUTE_TASK_SOURCE    *source, 
-    COMPUTE_TASK             *task, 
-    MEMORY_ARENA            *arena, 
-    WIN32_THREAD_ARGS *thread_args
+    task_id_t                    id,
+    WIN32_TASK_SOURCE       *source, 
+    COMPUTE_TASK_DATA         *task, 
+    MEMORY_ARENA             *arena, 
+    WIN32_THREAD_ARGS    *main_args,
+    WIN32_TASK_SCHEDULER *scheduler
 )
 {
     UNUSED_ARG(id);
     UNUSED_ARG(source);
     UNUSED_ARG(arena);
-    UNUSED_ARG(thread_args);
+    UNUSED_ARG(main_args);
+    UNUSED_ARG(scheduler);
 
     TEST_TASK_DATA *args = (TEST_TASK_DATA*) task->Data;
     for (size_t i = args->Index, e = args->Index + args->Count; i < e; ++i)
@@ -104,19 +106,22 @@ TestTaskMain
 internal_function void
 LaunchTaskMain
 (
-    task_id_t                   id,
-    COMPUTE_TASK_SOURCE    *source, 
-    COMPUTE_TASK             *task, 
-    MEMORY_ARENA            *arena, 
-    WIN32_THREAD_ARGS *thread_args
+    task_id_t                    id,
+    WIN32_TASK_SOURCE       *source, 
+    COMPUTE_TASK_DATA         *task, 
+    MEMORY_ARENA             *arena, 
+    WIN32_THREAD_ARGS    *main_args,
+    WIN32_TASK_SCHEDULER *scheduler
 )
 {
     UNUSED_ARG(arena);
-    UNUSED_ARG(thread_args);
+    UNUSED_ARG(main_args);
+    UNUSED_ARG(scheduler);
     
     LAUNCH_TASK_DATA *args = (LAUNCH_TASK_DATA*) task->Data;
     ZeroMemory(args->Array,args->Count * sizeof(uint8_t));
-    for (size_t i = 0, x = 0; i < args->Count; ++x)
+    int job_count = 0;
+    for (size_t i = 0; i < args->Count; ++job_count)
     {   // each child task will set up to 64 consecutive values to 1.
         // this should prevent cache contention between tasks.
         size_t         n = (args->Count- i) >= 64 ? 64 : (args->Count - i);
@@ -124,29 +129,26 @@ LaunchTaskMain
         task_id_t  child =  NewChildTask(source, TestTaskMain, &a, sizeof(TEST_TASK_DATA), id);
         FinishComputeTask(source, child);
         i += n;
-
-        // wake someone up to help after a few tasks have been added.
-        // this helps to distribute the workload between worker threads
-        // while avoiding constantly pinging the event, which is expensive.
-        if (x & 7) SignalWaitingWorkers(source);
     }
-    SignalWaitingWorkers(source);
+    SignalWaitingWorkers(source, job_count);
 }
 
 internal_function void
 FenceTaskMain
 (
-    task_id_t                   id,
-    COMPUTE_TASK_SOURCE    *source, 
-    COMPUTE_TASK             *task, 
-    MEMORY_ARENA            *arena, 
-    WIN32_THREAD_ARGS *thread_args
+    task_id_t                    id,
+    WIN32_TASK_SOURCE       *source, 
+    COMPUTE_TASK_DATA         *task, 
+    MEMORY_ARENA             *arena, 
+    WIN32_THREAD_ARGS    *main_args,
+    WIN32_TASK_SCHEDULER *scheduler
 )
 {
     UNUSED_ARG(id);
     UNUSED_ARG(source);
     UNUSED_ARG(arena);
-    UNUSED_ARG(thread_args);
+    UNUSED_ARG(main_args);
+    UNUSED_ARG(scheduler);
     
     FENCE_TASK_DATA *args = (FENCE_TASK_DATA*) task->Data;
     bool               ok =  true;
@@ -155,8 +157,8 @@ FenceTaskMain
         if (args->Array[i] != 1)
             ok = false;
     }
-    //if (ok) ConsoleOutput("All tasks completed successfully!\n");
-    //else ConsoleOutput("One or more tasks failed.\n");
+    if (ok) ConsoleOutput("All tasks completed successfully!\n");
+    else ConsoleOutput("One or more tasks failed.\n");
     SetEvent(args->Signal);
 }
 
@@ -464,10 +466,8 @@ WinMain
     WIN32_INPUT_SYSTEM               input_system = {};
     WIN32_CPU_INFO                       host_cpu = {};
     MEMORY_ARENA                       main_arena = {};
-    TASK_SCHEDULER_CONFIG            async_config = {};
-    TASK_SCHEDULER_CONFIG          compute_config = {};
-    WIN32_ASYNC_TASK_SCHEDULER    async_scheduler = {};   // scheduler for long-running, blocking tasks
-    WIN32_COMPUTE_TASK_SCHEDULER   task_scheduler = {};   // scheduler for non-blocking, compute-oriented tasks
+    WIN32_TASK_SCHEDULER_CONFIG  scheduler_config = {};
+    WIN32_TASK_SCHEDULER           task_scheduler = {};
     HANDLE                               ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_fence = CreateEvent(NULL, FALSE,FALSE, NULL); // auto-reset
@@ -527,7 +527,6 @@ WinMain
     thread_args.HostCPUInfo    = &host_cpu;
     thread_args.CommandLine    = &argv;
     thread_args.InputSystem    = &input_system;
-    thread_args.AsyncScheduler = &async_scheduler;
     thread_args.TaskScheduler  = &task_scheduler;
 
     // create the message window used to receive user input and messages from other threads.
@@ -548,22 +547,10 @@ WinMain
 
     // create the compute task scheduler first, and then the async scheduler.
     // the async scheduler may depend on the compute task scheduler.
-    compute_config.MaxActiveTicks   = 2;
-    compute_config.MaxWorkerThreads = host_cpu.HardwareThreads;
-    compute_config.MaxTasksPerTick  = 4096;
-    compute_config.MaxTaskArenaSize = Megabytes(2);
-    if (CreateComputeScheduler(&task_scheduler, &compute_config, &thread_args, &main_arena, 0) < 0)
+    DefaultSchedulerConfiguration(&scheduler_config, &thread_args, &host_cpu);
+    if (CreateScheduler(&task_scheduler, &scheduler_config, &main_arena) < 0)
     {   // no compute task scheduler is available.
         ConsoleError("ERROR: Unable to create the compute task scheduler.\n");
-        goto cleanup_and_shutdown;
-    }
-    async_config.MaxActiveTicks    = 1;
-    async_config.MaxWorkerThreads  = host_cpu.HardwareThreads * 2;
-    async_config.MaxTasksPerTick   = 512;
-    async_config.MaxTaskArenaSize  = Megabytes(2);
-    if (CreateAsyncScheduler(&async_scheduler, &async_config, &thread_args, &main_arena) < 0)
-    {   // no asynchronous task scheduler is available.
-        ConsoleError("ERROR: Unable to create the asynchronous task scheduler.\n");
         goto cleanup_and_shutdown;
     }
 
@@ -579,7 +566,6 @@ WinMain
 
     // start all of the worker threads running.
     LaunchScheduler(&task_scheduler);
-    LaunchScheduler(&async_scheduler);
 
     // grab an initial absolute timestamp and initialize global time values.
     previous_tick = TimestampInNanoseconds();
@@ -637,13 +623,14 @@ WinMain
         }
         // work work work
         ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(current_tick) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
+        WIN32_TASK_SOURCE      *root = RootTaskSource(&task_scheduler);
         LAUNCH_TASK_DATA launch_data = { workspace, workspace_size };
         FENCE_TASK_DATA   fence_data = { workspace, workspace_size, ev_fence };
-        task_id_t        launch_task = NewComputeTask(RootComputeSource(&task_scheduler), LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA));
-        task_id_t         fence_task = NewComputeTask(RootComputeSource(&task_scheduler), FenceTaskMain , &fence_data , sizeof(FENCE_TASK_DATA ) , launch_task);
-        FinishComputeTask(RootComputeSource(&task_scheduler), fence_task);
-        FinishComputeTask(RootComputeSource(&task_scheduler), launch_task);
-        SignalWaitingWorkers(RootComputeSource(&task_scheduler));
+        task_id_t        launch_task = NewComputeTask(root, LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA));
+        task_id_t         fence_task = NewComputeTask(root, FenceTaskMain ,  &fence_data, sizeof(FENCE_TASK_DATA), launch_task);
+        FinishComputeTask(root, fence_task);
+        FinishComputeTask(root, launch_task);
+        SignalWaitingWorkers(root, 2);
         WaitForSingleObject(ev_fence, INFINITE);
 
         // all work for the current tick has completed.
@@ -662,7 +649,6 @@ WinMain
 
 cleanup_and_shutdown:
     HaltScheduler(&task_scheduler);
-    HaltScheduler(&async_scheduler);
     if (ev_break        != NULL) SetEvent(ev_break);
     if (thread_draw     != NULL) WaitForSingleObject(thread_draw, INFINITE);
     if (thread_disk     != NULL) WaitForSingleObject(thread_disk, INFINITE);
