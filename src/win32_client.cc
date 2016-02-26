@@ -157,8 +157,8 @@ FenceTaskMain
         if (args->Array[i] != 1)
             ok = false;
     }
-    if (ok) ConsoleOutput("All tasks completed successfully!\n");
-    else ConsoleOutput("One or more tasks failed.\n");
+    //if (ok) ConsoleOutput("All tasks completed successfully!\n");
+    //else ConsoleOutput("One or more tasks failed.\n");
     SetEvent(args->Signal);
 }
 
@@ -474,15 +474,16 @@ WinMain
     HANDLE                            thread_draw = NULL; // frame composition thread and main UI thread
     HANDLE                            thread_disk = NULL; // asynchronous disk I/O thread
     HANDLE                            thread_net  = NULL; // network I/O thread
-    uint64_t                            next_tick = 0;    // the ideal launch time of the next tick
-    uint64_t                         current_tick = 0;    // the launch time of the current tick
-    uint64_t                        previous_tick = 0;    // the launch time of the previous tick
-    uint64_t                            miss_time = 0;    // number of nanoseconds over the launch time
+    uint64_t                predicted_tick_launch = 0;    // the ideal launch time of the next tick
+    uint64_t                   actual_tick_launch = 0;    // the actual launch time of the current tick
+    uint64_t                   actual_tick_finish = 0;    // the actual finish time of the current tick
+    int64_t                        tick_miss_time = 0;    // number of nanoseconds over the launch time
     DWORD                               wait_time = 0;    // number of milliseconds the timer thread will sleep for
     HWND                           message_window = NULL; // for receiving input and notification from other threads
     bool                             keep_running = true;
-    size_t const                  main_arena_size = Megabytes(128);
-    size_t const                default_alignment = std::alignment_of<void*>::value;
+    uint64_t const                  tick_interval = SliceOfSecond(60);
+    size_t   const                main_arena_size = Megabytes(128);
+    size_t   const              default_alignment = std::alignment_of<void*>::value;
 
     size_t const                   workspace_size = 65535;
     uint8_t             workspace[workspace_size] = {};
@@ -568,10 +569,11 @@ WinMain
     LaunchScheduler(&task_scheduler);
 
     // grab an initial absolute timestamp and initialize global time values.
-    previous_tick = TimestampInNanoseconds();
-    next_tick     = previous_tick;
-    miss_time     = 0;
-    wait_time     = 0;
+    predicted_tick_launch = TimestampInNanoseconds();
+    actual_tick_launch    = predicted_tick_launch;
+    actual_tick_finish    = predicted_tick_launch;
+    tick_miss_time        = 0;
+    wait_time             = 0;
 
     // enter the main game loop:
     while (keep_running)
@@ -609,20 +611,30 @@ WinMain
         }
 
         // immediately launch the current frame.
+        // so, this here is the tick launch. we have the predicted tick launch, and the actual tick launch.
+        // the difference between those two is the miss time, which may be positive or negative.
+        // the predicted (next) tick launch is the predicted (prev) tick launch + tick_interval.
+        // we also have the tick end time. the predicted (next) tick launch minus the tick end time (signed) is the wait time.
+        // if the wait time is > 1ms, then sleep.
         // TODO(rlk): miss_time can be used to calculate an interpolation factor, it tells us how far into the current tick we are.
-        current_tick  = TimestampInNanoseconds();
-        if (current_tick < next_tick)
-        {   // the tick is launching slightly early.
-            miss_time = next_tick - current_tick;
-            next_tick =(miss_time + current_tick) + SliceOfSecond(60);
+        actual_tick_launch = TimestampInNanoseconds();
+        tick_miss_time     = predicted_tick_launch - actual_tick_launch;
+        // if the thread woke up slightly early, burn CPU time to avoid launching early.
+        /*while (actual_tick_launch < predicted_tick_launch)
+        {   // too bad there's no way to see this bit in a profiler...
+            actual_tick_launch = TimestampInNanoseconds();
+        }*/
+        // account for the case where the wakeup missed its target by more than one tick.
+        while (tick_miss_time >= int64_t(tick_interval))
+        {   // fast-forward until we reach the 'current' tick.
+            predicted_tick_launch += tick_interval;
+            tick_miss_time        -= tick_interval;
         }
-        else
-        {   // the tick is launching slightly late.
-            miss_time = current_tick - next_tick;
-            next_tick =(current_tick - miss_time) + SliceOfSecond(60);
-        }
+        // calculate the predicted launch time of the following tick.
+        predicted_tick_launch = predicted_tick_launch + tick_interval;
+
         // work work work
-        ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %Iuns (%0.06fms).\n", NanosecondsToWholeMilliseconds(current_tick) / 1000.0, NanosecondsToWholeMilliseconds(next_tick) / 1000.0, miss_time, miss_time / 1000000.0);
+        ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %I64uns (%0.06fms).\n", NanosecondsToWholeMilliseconds(actual_tick_launch) / 1000.0, NanosecondsToWholeMilliseconds(predicted_tick_launch) / 1000.0, tick_miss_time, tick_miss_time / 1000000.0);
         WIN32_TASK_SOURCE      *root = RootTaskSource(&task_scheduler);
         LAUNCH_TASK_DATA launch_data = { workspace, workspace_size };
         FENCE_TASK_DATA   fence_data = { workspace, workspace_size, ev_fence };
@@ -633,10 +645,10 @@ WinMain
         SignalWaitingWorkers(root, 2);
         WaitForSingleObject(ev_fence, INFINITE);
 
-        // all work for the current tick has completed.
-        if ((previous_tick = TimestampInNanoseconds()) < next_tick)
+        // all of the work for this thread for the current tick has completed.
+        if ((actual_tick_finish = TimestampInNanoseconds()) < predicted_tick_launch)
         {   // this tick has finished early. how long should we sleep for?
-            if ((wait_time = NanosecondsToWholeMilliseconds(next_tick - previous_tick)) > 1)
+            if ((wait_time = NanosecondsToWholeMilliseconds(predicted_tick_launch - actual_tick_finish)) > 1)
             {   // put the thread to sleep for at least 1ms.
                 //ConsoleOutput("Sleep for at least %ums.\n", wait_time);
                 Sleep(wait_time);
