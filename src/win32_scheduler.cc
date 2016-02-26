@@ -885,10 +885,11 @@ ExecuteComputeTask
     {   // reset the arena for use during task execution. make the memory readable and writable.
         // after the task has finished executing, disable access to the memory arena to help trap
         // any references back into the arena which would be invalidated when the next task executes.
+        // TODO(rlk): Calling VirtualProtect is extremely expensive. Disable for now.
         ArenaReset(task_arena);
-        ArenaEnableAccess(task_arena);
+        //ArenaEnableAccess(task_arena);
         work_item->TaskMain(task, worker_source, work_item, task_arena, thread_args, scheduler);
-        ArenaDisableAccess(task_arena);
+        //ArenaDisableAccess(task_arena);
         FinishComputeTask(worker_source, task);
     }
 }
@@ -946,10 +947,11 @@ GeneralWorkerMain
             {   // reset the arena for use during task execution. make the memory readable and writable.
                 // after the task has finished executing, disable access to the memory arena to help trap
                 // any references back into the arena which would be invalidated when the next task executes.
+                // TODO(rlk): Calling VirtualProtect is extremely expensive. Disable for now.
                 ArenaReset(worker_arena);
-                ArenaEnableAccess(worker_arena);
+                //ArenaEnableAccess(worker_arena);
                 task_data.TaskMain(task_data.TaskId, worker_source, &task_data, worker_arena, main_args, scheduler);
-                ArenaDisableAccess(worker_arena);
+                //ArenaDisableAccess(worker_arena);
             }
         }
         else
