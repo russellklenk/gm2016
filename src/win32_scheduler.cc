@@ -326,6 +326,11 @@ struct cacheline_align WIN32_TASK_SOURCE
     COMPUTE_TASK_DATA       *WorkItems [2];      /// The work item definitions for each compute task, for each buffer.
     int32_t                 *WorkCounts[2];      /// The outstanding work counter for each compute task, for each buffer.
     PERMITS_LIST            *PermitList[2];      /// The permits list for each compute task, for each buffer.
+
+    // TODO(rlk): Get rid of the concept of buffers. It doesn't serve any purpose.
+    // TODO(rlk): Make task creation as efficient as possible. No locks, thread-local.
+    // TODO(rlk): Minimize context switches. Don't sleep the active thread and wake a new one if the current thread could do the work.
+    // TODO(rlk): Look into using IOCP to manage thread wakeups. It is LIFO.
 };
 #pragma warning (pop)                            /// structure was padded due to __declspec(align())
 
