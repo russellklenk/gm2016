@@ -56,6 +56,7 @@ struct LAUNCH_TASK_DATA
 {
     uint8_t *Array;
     size_t   Count;
+    size_t   Divisor;
 };
 
 struct TEST_TASK_DATA
@@ -69,6 +70,11 @@ struct FENCE_TASK_DATA
 {
     uint8_t *Array;
     size_t   Count;
+    HANDLE   Signal;
+};
+
+struct ASYNC_TASK_DATA
+{
     HANDLE   Signal;
 };
 
@@ -96,11 +102,12 @@ TestTaskMain
     UNUSED_ARG(main_args);
     UNUSED_ARG(scheduler);
 
-    TEST_TASK_DATA *args = (TEST_TASK_DATA*) task->Data;
+    /*TEST_TASK_DATA *args = (TEST_TASK_DATA*) task->Data;
     for (size_t i = args->Index, e = args->Index + args->Count; i < e; ++i)
     {
         args->Array[i] = 1;
-    }
+    }*/
+    UNUSED_ARG(task);
 }
 
 internal_function void
@@ -124,7 +131,7 @@ LaunchTaskMain
     for (size_t i = 0; i < args->Count; ++job_count)
     {   // each child task will set up to 64 consecutive values to 1.
         // this should prevent cache contention between tasks.
-        size_t         n = (args->Count- i) >= 64 ? 64 : (args->Count - i);
+        size_t         n = (args->Count- i) >= args->Divisor ? args->Divisor : (args->Count - i);
         TEST_TASK_DATA a = {args->Array, i, n};
         task_id_t  child =  NewChildTask(source, TestTaskMain, &a, sizeof(TEST_TASK_DATA), id);
         FinishComputeTask(source, child);
@@ -151,14 +158,84 @@ FenceTaskMain
     UNUSED_ARG(scheduler);
     
     FENCE_TASK_DATA *args = (FENCE_TASK_DATA*) task->Data;
-    bool               ok =  true;
+    /*bool               ok =  true;
     for (size_t i = 0,  n =  args->Count; i < n; ++i)
     {
         if (args->Array[i] != 1)
             ok = false;
-    }
+    }*/
     //if (ok) ConsoleOutput("All tasks completed successfully!\n");
     //else ConsoleOutput("One or more tasks failed.\n");
+    SetEvent(args->Signal);
+}
+
+internal_function void
+GeneralTaskMain
+(
+    task_id_t                    id,
+    WIN32_TASK_SOURCE       *source, 
+    GENERAL_TASK_DATA         *task, 
+    MEMORY_ARENA             *arena, 
+    WIN32_THREAD_ARGS    *main_args,
+    WIN32_TASK_SCHEDULER *scheduler
+)
+{
+    UNUSED_ARG(id);
+    UNUSED_ARG(source);
+    UNUSED_ARG(arena);
+    UNUSED_ARG(main_args);
+    UNUSED_ARG(scheduler);
+    ASYNC_TASK_DATA *args = (ASYNC_TASK_DATA*) task->Data;
+    SetEvent(args->Signal);
+}
+
+internal_function void
+AsyncLaunchesComputeTaskMain
+(
+    task_id_t                    id,
+    WIN32_TASK_SOURCE       *source, 
+    GENERAL_TASK_DATA         *task, 
+    MEMORY_ARENA             *arena, 
+    WIN32_THREAD_ARGS    *main_args,
+    WIN32_TASK_SCHEDULER *scheduler
+)
+{   UNUSED_ARG(id);
+    UNUSED_ARG(scheduler);
+    UNUSED_ARG(main_args);
+    // allocate some thread-local memory. up to 8MB are available.
+    // this memory is automatically freed when the task entrypoint exits.
+    // TODO(rlk): provide a function to get the maximum memory that can be allocated.
+    ASYNC_TASK_DATA *args = (ASYNC_TASK_DATA*) task->Data;
+    uint64_t  def_tss   = TimestampInTicks();
+    size_t    count     = Megabytes(5);
+    uint8_t  *array     = PushArray<uint8_t>(arena, count);
+    LAUNCH_TASK_DATA ld = { array, count, 1024 };
+    task_id_t launch_id = NewComputeTask(source, LaunchTaskMain, &ld, sizeof(ld));
+    HANDLE    finish_ev = CreateEvent(NULL, TRUE, FALSE, NULL);
+    FENCE_TASK_DATA  fd = { array, count, finish_ev };
+    task_id_t  fence_id = NewComputeTask(source, FenceTaskMain , &fd, sizeof(fd), launch_id);
+    FinishComputeTask(source, launch_id);
+    FinishComputeTask(source,  fence_id);
+    SignalWaitingWorkers(source, 2);
+    uint64_t  def_tse   = TimestampInTicks();
+
+    WaitForSingleObject(finish_ev, INFINITE);
+    uint64_t  work_tse  = TimestampInTicks();
+
+    ResetEvent(finish_ev);
+    ASYNC_TASK_DATA   ad = { finish_ev };
+    task_id_t general_id = NewGeneralTask(source, GeneralTaskMain, &ad, sizeof(ad));
+    UNUSED_LOCAL(general_id);
+
+    WaitForSingleObject(finish_ev, INFINITE);
+    uint64_t async_tse  = TimestampInTicks();
+
+    uint64_t def_ns = ElapsedNanoseconds(def_tss, def_tse);
+    uint64_t work_ns = ElapsedNanoseconds(def_tse, work_tse); // ish
+    uint64_t async_ns = ElapsedNanoseconds(work_tse, async_tse); // ish
+    ConsoleOutput("STATUS (%S): Define - %0.03fms Work - %0.03fms Async - %0.03f\n", __FUNCTION__, def_ns / 1000000.0, work_ns / 1000000.0, async_ns / 1000000.0);
+    CloseHandle(finish_ev);
+
     SetEvent(args->Signal);
 }
 
@@ -482,7 +559,7 @@ WinMain
     HWND                           message_window = NULL; // for receiving input and notification from other threads
     bool                             keep_running = true;
     uint64_t const                  tick_interval = SliceOfSecond(60);
-    size_t   const                main_arena_size = Megabytes(128);
+    size_t   const                main_arena_size = Megabytes(256);
     size_t   const              default_alignment = std::alignment_of<void*>::value;
 
     size_t const                   workspace_size = 65535;
@@ -549,6 +626,8 @@ WinMain
     // create the compute task scheduler first, and then the async scheduler.
     // the async scheduler may depend on the compute task scheduler.
     DefaultSchedulerConfiguration(&scheduler_config, &thread_args, &host_cpu);
+    scheduler_config.PoolSize[TASK_POOL_GENERAL].MaxTasks = 8192;
+    scheduler_config.PoolSize[TASK_POOL_COMPUTE].MaxTasks = 65536;
     if (CreateScheduler(&task_scheduler, &scheduler_config, &main_arena) < 0)
     {   // no compute task scheduler is available.
         ConsoleError("ERROR: Unable to create the compute task scheduler.\n");
@@ -634,9 +713,9 @@ WinMain
         predicted_tick_launch = predicted_tick_launch + tick_interval;
 
         // work work work
-        ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %I64uns (%0.06fms).\n", NanosecondsToWholeMilliseconds(actual_tick_launch) / 1000.0, NanosecondsToWholeMilliseconds(predicted_tick_launch) / 1000.0, tick_miss_time, tick_miss_time / 1000000.0);
+        ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %I64dns (%0.06fms).\n", NanosecondsToWholeMilliseconds(actual_tick_launch) / 1000.0, NanosecondsToWholeMilliseconds(predicted_tick_launch) / 1000.0, tick_miss_time, tick_miss_time / 1000000.0);
         WIN32_TASK_SOURCE      *root = RootTaskSource(&task_scheduler);
-        LAUNCH_TASK_DATA launch_data = { workspace, workspace_size };
+        LAUNCH_TASK_DATA launch_data = { workspace, workspace_size, 64 };
         FENCE_TASK_DATA   fence_data = { workspace, workspace_size, ev_fence };
         task_id_t        launch_task = NewComputeTask(root, LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA));
         task_id_t         fence_task = NewComputeTask(root, FenceTaskMain ,  &fence_data, sizeof(FENCE_TASK_DATA), launch_task);
@@ -644,6 +723,13 @@ WinMain
         FinishComputeTask(root, launch_task);
         SignalWaitingWorkers(root, 2);
         WaitForSingleObject(ev_fence, INFINITE);
+
+        //
+        ASYNC_TASK_DATA ad = { ev_fence };
+        task_id_t async_id = NewGeneralTask(root, AsyncLaunchesComputeTaskMain, &ad, sizeof(ad));
+        UNUSED_LOCAL(async_id);
+        WaitForSingleObject(ev_fence, INFINITE);
+        UNUSED_LOCAL(workspace);
 
         // all of the work for this thread for the current tick has completed.
         if ((actual_tick_finish = TimestampInNanoseconds()) < predicted_tick_launch)
