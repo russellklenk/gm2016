@@ -206,6 +206,30 @@ struct cacheline_align       PERMITS_LIST
 };
 #pragma warning (pop)                            /// Structure was padded due to __declspec(align())
 
+/// @summary Define the data associated with a thread that can produce compute tasks (but not necessarily execute them.)
+/// Each worker thread in the scheduler thread pool is a COMPUTE_TASK_SOURCE that can also execute tasks.
+/// The maximum number of task sources is fixed at scheduler creation time.
+#pragma warning (push)
+#pragma warning (disable:4324)                   /// Structure was padded due to __declspec(align())
+struct cacheline_align       TASK_SOURCE
+{
+    TASK_QUEUE               ComputeWorkQueue;   /// The queue of ready-to-run task IDs to execute on the compute pool.
+    TASK_QUEUE               GeneralWorkQueue;   /// The queue of ready-to-run task IDs to execute on the general pool.
+    HANDLE                   ComputePoolPort;    /// The I/O completion port used to wake threads in the compute pool.
+    HANDLE                   GeneralPoolPort;    /// The I/O completion port used to wake threads in the general pool.
+
+    uint32_t                 SourceIndex;        /// The zero-based index of this TASK_SOURCE in the scheduler source list. Constant.
+    uint32_t                 SourceCount;        /// The total number of task sources defined in the scheduler. Constant.
+    TASK_SOURCE             *TaskSources;        /// The list of per-source state for each task source. Managed by the scheduler.
+    
+    uint32_t                 MaxTasks;           /// The allocation capacity of the task buffers.
+    uint32_t                 TaskIndex;          /// The zero-based index of the next task to allocate.
+    TASK_DATA               *WorkItems;          /// The work item definition for each task.
+    int32_t                 *WorkCount;          /// The outstanding work counter for each task.
+    PERMITS_LIST            *PermitList;         /// The permits list for each task.
+};
+#pragma warning (pop)                            /// Structure was padded due to __declspec(align())
+
 /// @summary Define the state data associated with a single worker in a thread pool.
 struct WIN32_WORKER_THREAD
 {
@@ -213,6 +237,7 @@ struct WIN32_WORKER_THREAD
     MEMORY_ARENA            *ThreadArena;        /// The thread-local memory arena.
     TASK_SOURCE             *ThreadSource;       /// The TASK_SOURCE allocated to the worker thread.
     HANDLE                   ReadySignal;        /// A manual-reset event, created by the pool and signaled by the worker when the worker becomes ready-to-run.
+    std::atomic<int32_t>    *TerminateFlag;      /// An atomic integer that is set to non-zero when the worker thread should terminate.
     size_t                   PoolIndex;          /// The zero-based index of the thread in the owning thread pool.
     uint32_t                 WorkerFlags;        /// WORKER_FLAGS controlling worker thread behavior.
 };
@@ -234,6 +259,7 @@ struct WIN32_THREAD_POOL
     MEMORY_ARENA            *WorkerArena;        /// The thread-local memory arena assigned to each worker thread.
     WIN32_WORKER_ENTRYPOINT  WorkerMain;         /// The entry point for all threads in the pool.
     WIN32_TASK_SCHEDULER    *TaskScheduler;      /// The scheduler that owns the thread pool, or NULL.
+    std::atomic<int32_t>     TerminateFlag;      /// An integer value to be set to non-zero when worker threads should terminate.
     uint32_t                 WorkerFlags;        /// The WORKER_FLAGS to apply to worker threads in the pool.
 };
 
@@ -248,7 +274,6 @@ struct WIN32_THREAD_POOL_CONFIG
     size_t                   WorkerArenaSize;    /// The number of bytes of thread-local memory to allocate for each active thread.
     size_t                   WorkerSourceIndex;  /// The zero-based index of the first WIN32_TASK_SOURCE in the scheduler allocated to the pool.
     HANDLE                   LaunchSignal;       /// Signal set by the coordinator to allow all active worker threads to start running.
-    HANDLE                   TerminateSignal;    /// Signal set by the coordinator to stop all active worker threads.
     uint32_t                 WorkerFlags;        /// The WORKER_FLAGS to apply to worker threads in the pool.
 };
 
@@ -340,6 +365,99 @@ CleanupWorkerThread
     }
 }
 
+/// @summary Used by a worker thread to wait for work to be posted to its thread pool.
+/// @param thread_pool The thread pool that owns the worker thread entering the wait state.
+/// @param worker_index The zero-based index of the worker thread within its owning pool.
+/// @return The TASK_SOURCE that caused the wake, which may be NULL for general notifications.
+internal_function TASK_SOURCE*
+WorkerThreadWaitForWakeup
+(
+    WIN32_THREAD_POOL *thread_pool, 
+    size_t            worker_index
+)
+{
+    OVERLAPPED *ov_addr     = NULL;
+    ULONG_PTR   source_addr = 0;
+    DWORD       num_bytes   = 0;
+
+    if (GetQueuedCompletionStatus(thread_pool->CompletionPort, &num_bytes, &source_addr, &ov_addr, INFINITE))
+    {   // the completion key (source_addr) is the TASK_SOURCE that has work available.
+        // it may be NULL if this is just a general wakeup (to check status, etc.)
+        return (TASK_SOURCE*) source_addr;
+    }
+    else
+    {
+        ConsoleError("ERROR (%S): Wait-for-wakeup failed for worker %zu (%08X).\n", __FUNCTION__, worker_index, GetLastError());
+        return NULL;
+    }
+}
+
+/// @summary Wake one or more worker threads to process work items or receive a notification.
+/// @param completion_port The I/O completion port associated with the thread pool to notify.
+/// @param worker_source The TASK_SOURCE of the thread that has work available, or NULL for general notifications.
+/// @param thread_count The number of threads to wake up.
+internal_function void
+WakeWorkerThreads
+(
+    HANDLE      completion_port, 
+    TASK_SOURCE  *worker_source,
+    size_t         thread_count
+)
+{
+    DWORD error   = ERROR_SUCCESS;
+    for (size_t i = 0; i < thread_count; ++i)
+    {
+        if (!PostQueuedCompletionStatus(completion_port, 0, (ULONG_PTR) worker_source, NULL))
+        {   // only report the first failure.
+            if (error == ERROR_SUCCESS)
+            {   // save the error code.
+                error = GetLastError();
+            } break;
+        }
+    }
+    if (error != ERROR_SUCCESS)
+    {
+        ConsoleError("ERROR (%S): At least one wakeup notification failed (%08X).\n", __FUNCTION__, error);
+    }
+}
+
+/// @summary Wake up all worker threads in a thread pool.
+/// @param thread_pool The thread pool to wake.
+internal_function inline void
+WakeAllWorkerThreads
+(
+    WIN32_THREAD_POOL *thread_pool
+)
+{
+    WakeWorkerThreads(thread_pool->CompletionPort, NULL, thread_pool->MaxThreads);
+}
+
+/// @summary Wake up worker threads to process compute jobs.
+/// @param source The TASK_SOURCE of the thread that has available work in its compute queue.
+/// @param wake_count The number of worker threads to wake.
+internal_function inline void
+WakeComputePoolWorkers
+(
+    TASK_SOURCE    *source, 
+    size_t      wake_count
+)
+{
+    WakeWorkerThreads(source->ComputePoolPort, source, wake_count);
+}
+
+/// @summary Wake up worker threads to process general asynchronous jobs.
+/// @param source The TASK_SOURCE of the thread that has available work in its general queue.
+/// @param wake_count The number of worker threads to wake.
+internal_function inline void
+WakeGeneralPoolWorkers
+(
+    TASK_SOURCE    *source,
+    size_t      wake_count
+)
+{
+    WakeWorkerThreads(source->GeneralPoolPort, source, wake_count);
+}
+
 /// @summary Create a task ID from its constituient parts.
 /// @param task_size One of TASK_SIZE specifying the CPU workload of the task.
 /// @param pool_type One of TASK_POOL specifying the thread pool that will run the task.
@@ -400,6 +518,66 @@ RunsOnComputePool
 {
     return (((id & TASK_ID_MASK_VALID_P) >> TASK_ID_SHIFT_VALID) != 0) && 
            (((id & TASK_ID_MASK_POOL_P ) >> TASK_ID_SHIFT_POOL ) == TASK_POOL_COMPUTE);
+}
+
+/// @summary Retrieve the TASK_SIZE from a task ID.
+/// @param id The task identifier to parse.
+/// @return The TASK_SIZE value representing the relative compute workload of the task.
+internal_function inline uint32_t
+GetTaskWorkSize
+(
+    task_id_t id
+)
+{
+    return ((id & TASK_ID_MASK_SIZE_P) >> TASK_ID_SHIFT_SIZE);
+}
+
+/// @summary Retrieve the work item data for a given task ID.
+/// @param task The task identifier. This function does not validate the task ID.
+/// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::SourceList or TASK_SOURCE::TaskSources.
+/// @return A pointer to the work item data.
+internal_function inline TASK_DATA*
+GetTaskWorkItem
+(
+    task_id_t           task,
+    TASK_SOURCE *source_list
+)
+{
+    uint32_t const source_index = (task & TASK_ID_MASK_SOURCE_P) >> TASK_ID_SHIFT_SOURCE;
+    uint32_t const   task_index = (task & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
+    return &source_list[source_index].WorkItems[task_index];
+}
+
+/// @summary Retrieve the work counter for a given task ID.
+/// @param task The task identifier. This function does not validate the task ID.
+/// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::SourceList or TASK_SOURCE::TaskSources.
+/// @return A pointer to the work counter associated with the task.
+internal_function inline int32_t*
+GetTaskWorkCount
+(
+    task_id_t           task,
+    TASK_SOURCE *source_list
+)
+{
+    uint32_t const source_index = (task & TASK_ID_MASK_SOURCE_P) >> TASK_ID_SHIFT_SOURCE;
+    uint32_t const   task_index = (task & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
+    return &source_list[source_index].WorkCounts[task_index];
+}
+
+/// @summary Retrieve the list of permits for a given task ID.
+/// @param task The task identifier. This function does not validate the task ID.
+/// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::SourceList or TASK_SOURCE::TaskSources.
+/// @return A pointer to the permits list associated with the task.
+internal_function inline PERMITS_LIST*
+GetTaskPermitsList
+(
+    task_id_t                 task, 
+    WIN32_TASK_SOURCE *source_list
+)
+{
+    uint32_t const source_index = (task & TASK_ID_MASK_SOURCE_P) >> TASK_ID_SHIFT_SOURCE;
+    uint32_t const   task_index = (task & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
+    return &source_list[source_index].PermitList[task_index];
 }
 
 /// @summary Push an item onto the private end of a task queue. This function can only be called by the thread that owns the queue, and may execute concurrently with one or more steal operations.
@@ -523,12 +701,72 @@ NewTaskQueue
 /// @param capacity The capacity of the queue.
 /// @return The minimum number of bytes required to store the queue items, not including the size of the TASK_QUEUE instance.
 internal_function size_t
-CalculateMemoryForComputeTaskQueue
+CalculateMemoryForTaskQueue
 (
     size_t capacity
 )
 {
     return sizeof(task_id_t) * capacity;
+}
+
+/// @summary Implements the entry point of a thread pool worker thread that processes compute jobs.
+/// @param argp A pointer to the WIN32_WORKER_THREAD instance specifying thread state.
+/// @return The thread exit code (unused).
+internal_function unsigned int __cdecl
+CompueWorkerMain
+(
+    void *argp
+)
+{
+    WIN32_WORKER_THREAD *thread_data = (WIN32_WORKER_THREAD*) argp;
+    WIN32_THREAD_POOL   *thread_pool =  thread_data->ThreadPool;
+    MEMORY_ARENA       *thread_arena =  thread_data->ThreadArena;
+    TASK_SOURCE       *thread_source =  thread_data->ThreadSource;
+    std::atomic<int32_t>  *terminate =  thread_data->TerminateFlag;
+    size_t                pool_index =  thread_data->PoolIndex;
+
+    // indicate to the coordinator thread that this worker is ready-to-run.
+    SetEvent(thread_data->ReadySignal);
+
+    // wait for a signal to start executing tasks.
+    if (WaitForSingleObject(thread_pool->LaunchSignal, INFINITE) != WAIT_OBJECT_0)
+    {
+        ConsoleError("ERROR (%S): Wait for launch signal failed on compute worker %zu (%08X).\n", __FUNCTION__, pool_index, GetLastError());
+        goto terminate_worker;
+    }
+
+terminate_worker:
+    return 0;
+}
+
+/// @summary Implements the entry point of a thread pool worker thread that processes general asynchronous jobs.
+/// @param argp A pointer to the WIN32_WORKER_THREAD instance specifying thread state.
+/// @return The thread exit code (unused).
+internal_function unsigned int __cdecl
+GeneralWorkerMain
+(
+    void *argp
+)
+{
+    WIN32_WORKER_THREAD *thread_data = (WIN32_WORKER_THREAD*) argp;
+    WIN32_THREAD_POOL   *thread_pool =  thread_data->ThreadPool;
+    MEMORY_ARENA       *thread_arena =  thread_data->ThreadArena;
+    TASK_SOURCE       *thread_source =  thread_data->ThreadSource;
+    std::atomic<int32_t>  *terminate =  thread_data->TerminateFlag;
+    size_t                pool_index =  thread_data->PoolIndex;
+
+    // indicate to the coordinator thread that this worker is ready-to-run.
+    SetEvent(thread_data->ReadySignal);
+
+    // wait for a signal to start executing tasks.
+    if (WaitForSingleObject(thread_pool->LaunchSignal, INFINITE) != WAIT_OBJECT_0)
+    {
+        ConsoleError("ERROR (%S): Wait for launch signal failed on general worker %zu (%08X).\n", __FUNCTION__, pool_index, GetLastError());
+        goto terminate_worker;
+    }
+
+terminate_worker:
+    return 0;
 }
 
 /*////////////////////////
@@ -552,4 +790,160 @@ CalculateMemoryForThreadPool
     size_in_bytes += AllocationSizeForArray<MEMORY_ARENA>(max_threads);
     return size_in_bytes;
 }
+
+/// @summary Initialize a new thread pool. All worker threads will wait for a launch signal.
+/// @param thread_pool The thread pool to initialize.
+/// @param pool_config The thread pool configuration.
+/// @param arena The memory arena from which to allocate global memory.
+/// @return Zero if the thread pool is successfully created, or -1 if an error occurred.
+public_function int
+CreateThreadPool
+(
+    WIN32_THREAD_POOL              *thread_pool, 
+    WIN32_THREAD_POOL_CONFIG const *pool_config, 
+    MEMORY_ARENA                         *arena
+)
+{
+    size_t   mem_marker = ArenaMarker(arena);
+    size_t mem_required = CalculateMemoryForThreadPool(pool_config->MaxThreads);
+    if (!ArenaCanAllocate(arena, mem_required, std::alignment_of<WIN32_THREAD_POOL>::value))
+    {
+        ConsoleError("ERROR (%S): Insufficient memory to initialize thread pool; need %zu bytes.\n", __FUNCTION__, mem_required);
+        return -1;
+    }
+
+    // initialize the thread pool state and allocate memory for variable-length arrays.
+    thread_pool->MaxThreads               = pool_config->MaxThreads;
+    thread_pool->ActiveThreads            = 0;
+    thread_pool->WorkerArenaSize          = pool_config->WorkerArenaSize;
+    thread_pool->CompletionPort           = NULL;
+    thread_pool->LaunchSignal             = pool_config->LaunchSignal;
+    thread_pool->MainThreadArgs           = pool_config->MainThreadArgs;
+    thread_pool->OSThreadIds              = PushArray<unsigned int       >(arena, pool_config->MaxThreads);
+    thread_pool->OSThreadHandle           = PushArray<HANDLE             >(arena, pool_config->MaxThreads);
+    thread_pool->OSThreadArena            = PushArray<WIN32_MEMORY_ARENA >(arena, pool_config->MaxThreads);
+    thread_pool->WorkerState              = PushArray<WIN32_WORKER_THREAD>(arena, pool_config->MaxThreads);
+    thread_pool->WorkerSource             = PushArray<WIN32_TASK_SOURCE *>(arena, pool_config->MaxThreads);
+    thread_pool->WorkerArena              = PushArray<MEMORY_ARENA       >(arena, pool_config->MaxThreads);
+    thread_pool->WorkerMain               = pool_config->ThreadMain;
+    thread_pool->TaskScheduler            = pool_config->TaskScheduler;
+    thread_pool->WorkerFlags              = pool_config->WorkerFlags;
+    ZeroMemory(thread_pool->OSThreadIds   , pool_config->MaxThreads * sizeof(unsigned int));
+    ZeroMemory(thread_pool->OSThreadHandle, pool_config->MaxThreads * sizeof(HANDLE));
+    ZeroMemory(thread_pool->OSThreadArena , pool_config->MaxThreads * sizeof(WIN32_MEMORY_ARENA));
+    ZeroMemory(thread_pool->WorkerState   , pool_config->MaxThreads * sizeof(WIN32_WORKER_THREAD));
+    ZeroMemory(thread_pool->WorkerSource  , pool_config->MaxThreads * sizeof(WIN32_TASK_SOURCE *));
+    ZeroMemory(thread_pool->WorkerArena   , pool_config->MaxThreads * sizeof(MEMORY_ARENA));
+    thread_pool->TerminateFlag.store(0, std::memory_order_relaxed);
+
+    // create a new completion port used to wake the threads in the pool.
+    if ((thread_pool->CompletionPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, (DWORD) pool_config->MaxThreads)) == NULL)
+    {
+        ConsoleError("ERROR (%S): Unable to create I/O completion port for thread pool (%08X).\n", __FUNCTION__, GetLastError());
+        goto cleanup_and_fail;
+    }
+
+    // initialize the thread-local memory arenas.
+    if (pool_config->WorkerArenaSize > 0)
+    {
+        for (size_t i = 0; i < pool_config->MaxThreads; ++i)
+        {
+            WIN32_MEMORY_ARENA *os_arena = &thread_pool->OSThreadArena[i];
+            MEMORY_ARENA       *tl_arena = &thread_pool->WorkerArena[i];
+
+            if (CreateMemoryArena(os_arena, pool_config->WorkerArenaSize, true, true) < 0)
+            {   // the physical address space could not be reserved or committed.
+                goto cleanup_and_fail;
+            }
+            if (CreateArena(tl_arena, pool_config->WorkerArenaSize, std::alignment_of<void*>::value, os_arena) < 0)
+            {   // this should never happen - there's an implementation error.
+                goto cleanup_and_fail;
+            }
+        }
+    }
+
+    // initialize the array of pointers to TASK_SOURCE objects.
+    // the pointers point back into the scheduler's SourceList.
+    for (size_t i = 0; i < pool_config->MaxThreads; ++i)
+    {
+        size_t src_index = pool_config->WorkerSourceIndex + i;
+        thread_pool->WorkerSource[i] = &pool_config->TaskScheduler->SourceList[src_index];
+    }
+
+    // spawn workers until the maximum thread count is reached.
+    // it might be nice to re-introduce the concept of transient threads, which 
+    // die after some period of idle-ness, but that may not be work the implementation complexity.
+    // idle workers will just sit in a wait state until there's work for them to do.
+    for (size_t i = 0; i < pool_config->MaxThreads; ++i)
+    {
+        if (SpawnWorkerThread(thread_pool, i, pool_config->WorkerFlags) < 0)
+        {   // unable to spawn the worker thread; the minimum pool size cannot be met.
+            goto cleanup_and_fail;
+        }
+    }
+    return 0;
+
+cleanup_and_fail:
+    if (thread_pool->ActiveThreads > 0)
+    {   // signal all threads in the pool to die.
+        DWORD   n = (DWORD) thread_pool->ActiveThreads;
+        HANDLE *h =  thread_pool->OSThreadHandle;
+        thread_pool->TerminateFlag.store(0, std::memory_order_seq_cst);
+        WakeAllWorkerThreads(thread_pool);
+        WaitForMultipleObjects(n, h, TRUE, INFINITE);
+    }
+    if (thread_pool->CompletionPort != NULL)
+    {
+        CloseHandle(thread_pool->CompletionPort);
+        thread_pool->CompletionPort = NULL;
+    }
+    if (pool_config->WorkerArenaSize > 0 && thread_pool->OSThreadArena != NULL)
+    {   // free the reserved and committed address space for thread-local arenas.
+        for (size_t i = 0; i < pool_config->MaxThreads; ++i)
+        {   // no cleanup needs to be performed for the 'user-facing' arena.
+            DeleteMemoryArena(&thread_pool->OSThreadArena[i]);
+        }
+    }
+    ArenaResetToMarker(arena, mem_marker);
+    return -1;
+}
+
+/// @summary Signal all threads in a thread pool to terminate, and block the calling thread until all workers have exited.
+/// @param thread_pool The thread pool to terminate.
+public_function void
+TerminateThreadPool
+(
+    WIN32_THREAD_POOL *thread_pool
+)
+{
+    if (thread_pool->TerminateSignal != NULL)
+    {
+        DWORD   n = (DWORD) thread_pool->ActiveThreads;
+        HANDLE *h =  thread_pool->OSThreadHandle;
+        // signal all threads in the pool to terminate.
+        thread_pool->TerminateFlag.store(1, std::memory_order_seq_cst);
+        WakeAllWorkerThreads(thread_pool);
+        // block the calling thread until all threads in the pool have terminated.
+        WaitForMultipleObjects(n, h, TRUE, INFINITE);
+    }
+}
+
+/// @summary Calculate the amount of memory required to store task source data.
+/// @param max_tasks The maximum number of tasks that can be live at any one time.
+/// @return The minimum number of bytes required to store the task data, not including the size of the TASK_SOURCE instance.
+public_function size_t
+CalculateMemoryForTaskSource
+(
+    size_t max_tasks
+)
+{
+    size_t size_in_bytes = 0;
+    size_in_bytes += CalculateMemoryForTaskQueue(max_tasks);
+    size_in_bytes += CalculateMemoryForTaskQueue(max_tasks);
+    size_in_bytes += AllocationSizeForArray<TASK_DATA>(max_tasks);
+    size_in_bytes += AllocationSizeForArray<int32_t>(max_tasks);
+    size_in_bytes += AllocationSizeForArray<PERMITS_LIST>(max_tasks);
+    return size_in_bytes;
+}
+
 
