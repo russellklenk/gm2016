@@ -916,15 +916,45 @@ TerminateThreadPool
     WIN32_THREAD_POOL *thread_pool
 )
 {
-    if (thread_pool->TerminateSignal != NULL)
-    {
-        DWORD   n = (DWORD) thread_pool->ActiveThreads;
+    DWORD n = (DWORD) thread_pool->ActiveThreads;
+    
+    // signal all threads in the pool to terminate.
+    if (thread_pool->ActiveThreads > 0)
+    {   // signal the threads, which could be in the middle of executing jobs.
         HANDLE *h =  thread_pool->OSThreadHandle;
-        // signal all threads in the pool to terminate.
         thread_pool->TerminateFlag.store(1, std::memory_order_seq_cst);
         WakeAllWorkerThreads(thread_pool);
         // block the calling thread until all threads in the pool have terminated.
         WaitForMultipleObjects(n, h, TRUE, INFINITE);
+        thread_pool->ActiveThreads = 0;
+    }
+
+    // free the reserved and committed address space for thread-local arenas.
+    if (thread_pool->OSThreadArena != NULL)
+    {
+        for (size_t i = 0; i < thread_pool->MaxThreads; ++i)
+        {   // no cleanup needs to be performed for the 'user-facing' arena.
+            DeleteMemoryArena(&thread_pool->OSThreadArena[i]);
+        }
+        ZeroMemory(thread_pool->OSThreadArena, pool_config->MaxThreads * sizeof(WIN32_MEMORY_ARENA));
+        ZeroMemory(thread_pool->WorkerArena  , pool_config->MaxThreads * sizeof(MEMORY_ARENA));
+    }
+    // NOTE: intentionally not closing the completion port here.
+    // it's possible that another pool is still live, and that pool might post to this pool.
+}
+
+/// @summary Close the completion port associated with a thread pool. ALl worker threads must be stopped (with TerminateThreadPool) prior to calling this function.
+/// @param thread_pool The thread pool to delete.
+public_function void
+DeleteThreadPool
+(
+    WIN32_THREAD_POOL *thread_pool
+)
+{   assert(thread_pool->ActiveThreads == 0);
+    if (thread_pool->CompletionPort != NULL)
+    {   // also close the completion port at this point.
+        CloseHandle(thread_pool->CompletionPort);
+        thread_pool->CompletionPort = NULL;
     }
 }
 
