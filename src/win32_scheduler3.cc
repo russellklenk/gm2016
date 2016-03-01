@@ -727,7 +727,6 @@ CreatePermits
 )
 {
     TASK_SOURCE *slist = thread_source->TaskSources;
-    size_t num_permits = deps_count;
     work_item->Permits.store(-int32_t(deps_count), std::memory_order_relaxed);
     for (size_t i = 0; i < deps_count; ++i)
     {
@@ -742,7 +741,6 @@ CreatePermits
                 {   // all dependencies have been satisfied for this task.
                     return 0;
                 }
-                num_permits--;
             }
             if (n < PERMITS_LIST::MAX_TASKS)
             {   // append the task ID to the permits list of deps[i].
@@ -755,7 +753,7 @@ CreatePermits
             }
         } while (plist->Count.compare_exchange_weak(n, n+1, std::memory_order_acq_rel, std::memory_order_relaxed));
     }
-    return (num_permits > 0);
+    return (deps_count > 0);
 }
 
 /// @summary Process the permits list for a completed task and move any now-permitted tasks to the ready-to-run queue(s).
