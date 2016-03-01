@@ -169,7 +169,7 @@ struct TASK_ID_PARTS
 struct cacheline_align       TASK_DATA
 {   static size_t const      ALIGNMENT             = CACHELINE_SIZE;
     static size_t const      MAX_DATA              = 48;
-    task_id_t                TaskId;             /// The task identifier.
+    std::atomic<int32_t>     Permits;            /// The number of permits that must be satisfied before this task can run.
     task_id_t                ParentTask;         /// The identifier of the parent task, or INVALID_TASK_ID.
     TASK_ENTRYPOINT          TaskMain;           /// The task entry point.
 #if TARGET_ARCHITECTURE == ARCHITECTURE_X86_32 || TARGET_ARCHITECTURE == ARCHITECTURE_ARM_32
@@ -226,7 +226,7 @@ struct cacheline_align       TASK_SOURCE
     uint32_t                 TaskIndex;          /// The zero-based index of the next task to allocate.
     TASK_DATA               *WorkItems;          /// The work item definition for each task.
     int32_t                 *WorkCount;          /// The outstanding work counter for each task.
-    PERMITS_LIST            *PermitList;         /// The permits list for each task.
+    PERMITS_LIST            *PermitList;         /// The list of tasks that become permitted to run for each task.
 };
 #pragma warning (pop)                            /// Structure was padded due to __declspec(align())
 
@@ -571,8 +571,8 @@ GetTaskWorkCount
 internal_function inline PERMITS_LIST*
 GetTaskPermitsList
 (
-    task_id_t                 task, 
-    WIN32_TASK_SOURCE *source_list
+    task_id_t           task, 
+    TASK_SOURCE *source_list
 )
 {
     uint32_t const source_index = (task & TASK_ID_MASK_SOURCE_P) >> TASK_ID_SHIFT_SOURCE;
@@ -709,6 +709,101 @@ CalculateMemoryForTaskQueue
     return sizeof(task_id_t) * capacity;
 }
 
+/// @summary Create a set of permits from a task dependency list, such that when all dependencies have completed, a task is ready-to-run.
+/// @param thread_source The TASK_SOURCE of the thread creating the task @a task.
+/// @param task The task identifier of the task being created.
+/// @param work_item The work item data of the task being created.
+/// @param deps The list of tasks that must complete before the new task becomes ready-to-run.
+/// @param deps_count The number of task identifiers in the dependency list.
+/// @return true if there is at least one outstanding permit on the new task, or false if the new task is ready-to-run.
+internal_function bool
+CreatePermits
+(
+    TASK_SOURCE     *thread_source, 
+    task_id_t                 task, 
+    TASK_DATA           *work_item, 
+    task_id_t const           deps,
+    size_t    const     deps_count
+)
+{
+    TASK_SOURCE *slist = thread_source->TaskSources;
+    size_t num_permits = deps_count;
+    work_item->Permits.store(-int32_t(deps_count), std::memory_order_relaxed);
+    for (size_t i = 0; i < deps_count; ++i)
+    {
+        PERMITS_LIST *plist = GetTaskPermitsList(deps[i], slist);
+        int32_t           n = plist->Count.load(std::memory_order_relaxed);
+        do
+        {
+            if (n < 0)
+            {   // this dependency has completed.
+                // the fetch_add needs to be atomic because a permit added previously might complete.
+                if (work_item->Permits.fetch_add(1, std::memory_order_acq_rel) == -1)
+                {   // all dependencies have been satisfied for this task.
+                    return 0;
+                }
+                num_permits--;
+            }
+            if (n < PERMITS_LIST::MAX_TASKS)
+            {   // append the task ID to the permits list of deps[i].
+                plist->Tasks[n] = task;
+            }
+            else
+            {   // the best thing to do in this case is re-think your task breakdown.
+                ConsoleError("ERROR (%S): Exceeded max permits on task %08X when defining task %08X (parent %08X).\n", __FUNCTION__, deps[i], task, work_item->ParentTask);
+                assert(n < PERMITS_LIST::MAX_TASKS);
+            }
+        } while (plist->Count.compare_exchange_weak(n, n+1, std::memory_order_acq_rel, std::memory_order_relaxed));
+    }
+    return (num_permits > 0);
+}
+
+/// @summary Process the permits list for a completed task and move any now-permitted tasks to the ready-to-run queue(s).
+/// @param thread_source The TASK_SOURCE of the calling thread.
+/// @param task The identifier of the just-completed task.
+/// @param permitted_compute On return, this location is incremented by the number of now-permitted tasks added to the compute task RTR queue for the task source.
+/// @param permitted_general On return, this location is incremented by the number of now-permitted tasks added to the general task RTR queue for the task source.
+/// @return The total number of now-permitted tasks.
+internal_function size_t
+AllowPermits
+(
+    TASK_SOURCE     *thread_source, 
+    task_id_t                 task, 
+    size_t      &permitted_compute, 
+    size_t      &permitted_general
+)
+{
+    size_t           nc = 0;
+    size_t           ng = 0;
+    TASK_SOURCE  *slist = thread_source->TaskSources;
+    PERMITS_LIST *plist = GetTaskPermitsList(task, slist);
+    TASK_QUEUE  *cqueue =&thread_source->ComputeWorkQueue;
+    TASK_QUEUE  *gqueue =&thread_source->GeneralWorkQueue;
+    int32_t           n = plist->Count.exchange(-1, std::memory_order_acq_rel);
+    for (int32_t  i = 0;  i < n; ++i)
+    {
+        task_id_t  ref  = plist->Tasks[i];
+        uint32_t   refs = (ref & TASK_ID_MASK_SOURCE_P) >> TASK_ID_SHIFT_SOURCE;
+        uint32_t   refi = (ref & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
+        bool is_compute = (ref & TASK_ID_MASK_POOL_P  ) == TASK_POOL_COMPUTE;
+        TASK_DATA &refp = slist[refs].WorkItems[refi];
+        if (refp.Permits.fetch_add(1, std::memory_order_acq_rel) == -1)
+        {   // this task has no more outstanding permits and is ready-to-run.
+            if (is_compute)
+            {   // this task will run on the compute thread pool.
+                TaskQueuePush(cqueue, ref); ++nc;
+            }
+            else
+            {   // this task will run on the general thread pool.
+                TaskQueuePush(gqueue, ref); ++ng;
+            }
+        }
+    }
+    permitted_compute += nc;
+    permitted_general += ng;
+    return (nc + ng);
+}
+
 /// @summary Implements the entry point of a thread pool worker thread that processes compute jobs.
 /// @param argp A pointer to the WIN32_WORKER_THREAD instance specifying thread state.
 /// @return The thread exit code (unused).
@@ -730,9 +825,30 @@ CompueWorkerMain
 
     // wait for a signal to start executing tasks.
     if (WaitForSingleObject(thread_pool->LaunchSignal, INFINITE) != WAIT_OBJECT_0)
-    {
+    {   // the wait was abandoned, or some other error occurred.
         ConsoleError("ERROR (%S): Wait for launch signal failed on compute worker %zu (%08X).\n", __FUNCTION__, pool_index, GetLastError());
         goto terminate_worker;
+    }
+    // check for early termination by the coordinator thread.
+    if (terminate->load(std::memory_order_seq_cst) != 0)
+    {   // early termination was signaled, likely because of an error elsewhere.
+        ConsoleOutput("STATUS (%S): Early termination signal received on compute worker %zu.\n", __FUNCTION__, pool_index);
+        goto terminate_worker;
+    }
+
+    // enter the main work loop for the worker thread.
+    // note that this thread is the *only* thread that can put work in its own queue(s).
+    // other threads may wake this worker if they have work items that can be stolen.
+    for ( ; ; )
+    {   // wait until someone has work available for this thread to attempt to steal.
+        TASK_SOURCE *victim = WorkerThreadWaitForWakeup(thread_pool, pool_index);
+        if (victim == NULL)
+        {   // this is just a general notification. check for a termination signal.
+            if (terminate->load(std::memory_order_seq_cst) != 0)
+            {   // termination was signaled; shut down normally.
+                goto terminate_worker;
+            }
+        }
     }
 
 terminate_worker:
@@ -760,9 +876,30 @@ GeneralWorkerMain
 
     // wait for a signal to start executing tasks.
     if (WaitForSingleObject(thread_pool->LaunchSignal, INFINITE) != WAIT_OBJECT_0)
-    {
+    {   // the wait was abandoned, or some other error occurred.
         ConsoleError("ERROR (%S): Wait for launch signal failed on general worker %zu (%08X).\n", __FUNCTION__, pool_index, GetLastError());
         goto terminate_worker;
+    }
+    // check for early termination by the coordinator thread.
+    if (terminate->load(std::memory_order_seq_cst) != 0)
+    {   // early termination was signaled, likely because of an error elsewhere.
+        ConsoleOutput("STATUS (%S): Early termination signal received on general worker %zu.\n", __FUNCTION__, pool_index);
+        goto terminate_worker;
+    }
+
+    // enter the main work loop for the worker thread.
+    // note that this thread is the *only* thread that can put work in its own queue(s).
+    // other threads may wake this worker if they have work items that can be stolen.
+    for ( ; ; )
+    {   // wait until someone has work available for this thread to attempt to steal.
+        TASK_SOURCE *victim = WorkerThreadWaitForWakeup(thread_pool, pool_index);
+        if (victim == NULL)
+        {   // this is just a general notification. check for a termination signal.
+            if (terminate->load(std::memory_order_seq_cst) != 0)
+            {   // termination was signaled; shut down normally.
+                goto terminate_worker;
+            }
+        }
     }
 
 terminate_worker:
@@ -976,4 +1113,77 @@ CalculateMemoryForTaskSource
     return size_in_bytes;
 }
 
+/// @summary Allocate and initialize a TASK_SOURCE from a scheduler instance.
+/// @param scheduler The scheduler instance that will monitor the work source.
+/// @param max_tasks The maximum number of tasks that can be alive at any given time.
+/// @param arena The memory arena from which 'global' memory will be allocated.
+/// @return A pointer to the initialized WIN32_TASK_SOURCE, or NULL.
+public_function TASK_SOURCE*
+NewTaskSource
+(
+    WIN32_TASK_SCHEDULER  *scheduler, 
+    size_t                 max_tasks, 
+    MEMORY_ARENA              *arena
+)
+{
+    if (max_tasks < 1)
+    {   // inherit the default value from the scheduler.
+        max_tasks = scheduler->MaxTasks;
+    }
+    if ((max_tasks & (max_tasks - 1)) != 0)
+    {   // this value must be a power-of-two. round up to the next multiple.
+        size_t n = 1;
+        size_t m = max_tasks;
+        while (n < m)
+        {
+            n <<= 1;
+        }
+        max_tasks = n;
+    }
+    if (max_tasks > MAX_TASKS_PER_SOURCE)
+    {   // consider this to be an error; it's easily trapped during development.
+        ConsoleError("ERROR (%S): Requested task buffer size %zu exceeds maximum %u.\n", __FUNCTION__, max_tasks, MAX_TASKS_PER_SOURCE);
+        return NULL;
+    }
+    if (scheduler->SourceCount == scheduler->MaxSources)
+    {   // no additional sources can be allocated from the scheduler.
+        ConsoleError("ERROR (%S): Max sources exceeded; increase limit WIN32_TASK_SCHEDULER_CONFIG::MaxTaskSources.\n", __FUNCTION__);
+        return NULL;
+    }
+
+    size_t   mem_marker = ArenaMarker(arena);
+    size_t bytes_needed = CalculateMemoryForTaskSource(max_tasks);
+    size_t    alignment = std::alignment_of<TASK_SOURCE>::value;
+    if (!ArenaCanAllocate(arena, bytes_needed, alignment))
+    {   // the arena doesn't have sufficient memory to initialize a source with the requested attributes.
+        ConsoleError("ERROR (%S): Insufficient memory to allocate source; need %zu bytes.\n", __FUNCTION__, bytes_needed);
+        return NULL;
+    }
+
+    TASK_SOURCE      *source = &scheduler->SourceList[scheduler->SourceCount];
+    if (NewTaskQueue(&source->ComputeWorkQueue, max_tasks, arena) < 0)
+    {   // unable to initialize the compute task queue for the source.
+        ConsoleError("ERROR (%S): Failed to create compute task queue for source.\n", __FUNCTION__);
+        ArenaResetToMarker(arena, mem_marker);
+        return NULL;
+    }
+    if (NewTaskQueue(&source->GeneralWorkQueue, max_tasks, arena) < 0)
+    {   // unable to initialize the general task queue for the source.
+        ConsoleError("ERROR (%S): Failed to create general task queue for source.\n", __FUNCTION__);
+        ArenaResetToMarker(arena, mem_marker);
+        return NULL;
+    }
+    source->ComputePoolPort = scheduler->ComputePool.CompletionPort;
+    source->GeneralPoolPort = scheduler->GeneralPool.CompletionPort;
+    source->SourceIndex     = uint32_t(scheduler->SourceCount);
+    source->SourceCount     = uint32_t(scheduler->MaxSources);
+    source->TaskSources     = scheduler->SourceList;
+    source->MaxTasks        = uint32_t(max_tasks);
+    source->TaskIndex       = 0;
+    source->WorkItems       = PushArray<TASK_DATA   >(arena, max_tasks);
+    source->WorkCount       = PushArray<int32_t     >(arena, max_tasks);
+    source->PermitList      = PushArray<PERMITS_LIST>(arena, max_tasks);
+    scheduler->SourceCount++;
+    return source;
+}
 
