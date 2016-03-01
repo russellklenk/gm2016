@@ -225,7 +225,7 @@ struct cacheline_align       TASK_SOURCE
     uint32_t                 MaxTasks;           /// The allocation capacity of the task buffers.
     uint32_t                 TaskIndex;          /// The zero-based index of the next task to allocate.
     TASK_DATA               *WorkItems;          /// The work item definition for each task.
-    int32_t                 *WorkCount;          /// The outstanding work counter for each task.
+    std::atomic<int32_t>    *WorkCount;          /// The outstanding work counter for each task.
     PERMITS_LIST            *PermitList;         /// The list of tasks that become permitted to run for each task.
 };
 #pragma warning (pop)                            /// Structure was padded due to __declspec(align())
@@ -552,7 +552,7 @@ GetTaskWorkItem
 /// @param task The task identifier. This function does not validate the task ID.
 /// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::SourceList or TASK_SOURCE::TaskSources.
 /// @return A pointer to the work counter associated with the task.
-internal_function inline int32_t*
+internal_function inline std::atomic<int32_t>*
 GetTaskWorkCount
 (
     task_id_t           task,
@@ -715,7 +715,7 @@ CalculateMemoryForTaskQueue
 /// @param work_item The work item data of the task being created.
 /// @param deps The list of tasks that must complete before the new task becomes ready-to-run.
 /// @param deps_count The number of task identifiers in the dependency list.
-/// @return true if there is at least one outstanding permit on the new task, or false if the new task is ready-to-run.
+/// @return true if there are no outstanding permits on the new task and the new task is ready-to-run, or false if the new task has at least one outstanding permit.
 internal_function bool
 CreatePermits
 (
@@ -739,7 +739,7 @@ CreatePermits
                 // the fetch_add needs to be atomic because a permit added previously might complete.
                 if (work_item->Permits.fetch_add(1, std::memory_order_acq_rel) == -1)
                 {   // all dependencies have been satisfied for this task.
-                    return 0;
+                    return true;
                 }
             }
             if (n < PERMITS_LIST::MAX_TASKS)
@@ -753,7 +753,7 @@ CreatePermits
             }
         } while (plist->Count.compare_exchange_weak(n, n+1, std::memory_order_acq_rel, std::memory_order_relaxed));
     }
-    return (deps_count > 0);
+    return (deps_count == 0);
 }
 
 /// @summary Process the permits list for a completed task and move any now-permitted tasks to the ready-to-run queue(s).
@@ -800,6 +800,79 @@ AllowPermits
     permitted_compute += nc;
     permitted_general += ng;
     return (nc + ng);
+}
+
+internal_function task_id_t
+DefineTask
+(
+    TASK_SOURCE        *thread_source,
+    uint32_t  const         task_size, 
+    uint32_t  const         task_pool, 
+    TASK_ENTRYPOINT         task_main, 
+    void      const        *task_args, 
+    size_t    const         args_size, 
+    task_id_t               parent_id, 
+    task_id_t const     *dependencies, 
+    size_t    const  dependency_count
+)
+{
+    if (args_size > TASK_DATA::MAX_DATA)
+    {   // too much data being passed. allocate storage elsewhere and pass in pointers.
+        ConsoleError("ERROR (%S): Argument data too large (parent %08X); specified %zu bytes, max is %zu bytes.\n", __FUNCTION__, parent_id, args_size, TASK_DATA::MAX_DATA);
+        return INVALID_TASK_ID;
+    }
+
+    // search for an available slot. this should almost always be a very short search; just one item.
+    uint32_t const  mask = thread_source->MaxTasks - 1;
+    uint32_t start_index = thread_source->TaskIndex;
+    uint32_t  task_index = thread_source->TaskIndex;
+    bool      found_slot = false;
+    do
+    {   // take the first slot with an outstanding work count of 0.
+        // note that the calling thread is the only thread that can define tasks on this TASK_SOURCE.
+        if (thread_source->WorkCounts[task_index & mask].load(std::memory_order_acquire) == 0)
+        {   // this slot is currently unused; claim it.
+            thread_source->TaskIndex = (task_index + 1) & mask;
+            found_slot = true;
+            break;
+        }
+        else 
+        {   // check the next slot in line.
+            task_index = (task_index + 1) & mask;
+        }
+    } while (!found_slot && task_index != start_index);
+
+    // ensure that a slot was claimed prior to continuing.
+    if (task_index == start_index && !found_slot)
+    {   // there are no task definition slots available on this thread.
+        ConsoleError("ERROR (%S): Out of task buffer on source %u. Increase WIN32_TASK_SCHEDULER::TasksPerBuffer.\n", __FUNCTION__, thread_source->SourceIndex);
+        return INVALID_TASK_ID;
+    }
+
+    // create the task in the claimed slot.
+    task_id_t                task_id = MakeTaskId(task_size, task_pool, task_index, thread_source->SourceIndex);
+    TASK_DATA                  &task = thread_source->WorkItems [task_index];
+    std::atomic<int32_t> &work_count = thread_source->WorkCounts[task_index];
+    PERMITS_LIST              &plist = thread_source->PermitList[task_index];
+
+    task.ParentTask = parent_id;
+    task.TaskMain   = task_main;
+    CopyMemory(task.Data, task_args, args_size);
+    work_count.store(2, std::memory_order_relaxed);
+    plist.Count.store(0, std::memory_order_relaxed);
+    if (CreatePermits(thread_source, task_id, task, dependencies, dependency_count))
+    {   // the task is ready-to-run, push it onto the local RTR queue.
+        // TODO(rlk): possible race here? a completed task could push the new task during CreatePermits?
+        if (task_pool == TASK_POOL_COMPUTE)
+        {   // this task executes on the compute thread pool.
+            TaskQueuePush(&thread_source->ComputeWorkQueue, task_id);
+        }
+        else
+        {   // this task executes on the general thread pool.
+            TaskQueuePush(&thread_source->GeneralWorkQueue, task_id);
+        }
+    }
+    return task_id;
 }
 
 /// @summary Implements the entry point of a thread pool worker thread that processes compute jobs.
@@ -1106,7 +1179,7 @@ CalculateMemoryForTaskSource
     size_in_bytes += CalculateMemoryForTaskQueue(max_tasks);
     size_in_bytes += CalculateMemoryForTaskQueue(max_tasks);
     size_in_bytes += AllocationSizeForArray<TASK_DATA>(max_tasks);
-    size_in_bytes += AllocationSizeForArray<int32_t>(max_tasks);
+    size_in_bytes += AllocationSizeForArray<std::atomic<int32_t> >(max_tasks);
     size_in_bytes += AllocationSizeForArray<PERMITS_LIST>(max_tasks);
     return size_in_bytes;
 }
@@ -1178,9 +1251,9 @@ NewTaskSource
     source->TaskSources     = scheduler->SourceList;
     source->MaxTasks        = uint32_t(max_tasks);
     source->TaskIndex       = 0;
-    source->WorkItems       = PushArray<TASK_DATA   >(arena, max_tasks);
-    source->WorkCount       = PushArray<int32_t     >(arena, max_tasks);
-    source->PermitList      = PushArray<PERMITS_LIST>(arena, max_tasks);
+    source->WorkItems       = PushArray<TASK_DATA            >(arena, max_tasks);
+    source->WorkCount       = PushArray<std::atomic<int32_t> >(arena, max_tasks);
+    source->PermitList      = PushArray<PERMITS_LIST         >(arena, max_tasks);
     scheduler->SourceCount++;
     return source;
 }
