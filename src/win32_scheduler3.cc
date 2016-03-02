@@ -277,6 +277,34 @@ struct WIN32_THREAD_POOL_CONFIG
     uint32_t                 WorkerFlags;        /// The WORKER_FLAGS to apply to worker threads in the pool.
 };
 
+/// @summary Define the data associated with a task scheduler. Most of the actual work is handled per-thread by TASK_SOURCE.
+struct WIN32_TASK_SCHEDULER
+{
+    size_t                   MaxSources;         /// The maximum number of compute task sources.
+    size_t                   SourceCount;        /// The number of allocated compute task sources.
+    TASK_SOURCE             *TaskSources;        /// The data associated with each compute task source. SourceCount are currently valid.
+    HANDLE                   LaunchSignal;       /// Manual-reset event signaled when worker threads should start running tasks.
+    WIN32_THREAD_POOL        GeneralPool;        /// The thread pool used for running light-work asynchronous tasks.
+    WIN32_THREAD_POOL        ComputePool;        /// The thread pool used for running work-heavy, non-blocking tasks.
+};
+
+/// @summary Define the user-facing thread pool configuration data.
+struct WIN32_THREAD_POOL_SIZE
+{
+    size_t                   MinThreads;         /// The minimum number of threads in the thread pool.
+    size_t                   MaxThreads;         /// The maximum number of threads in the thread pool.
+    size_t                   MaxTasks;           /// The maximum number of tasks that any worker thread in the pool can have active at any given time.
+    size_t                   ArenaSize;          /// The size of the thread-local memory arena, in bytes.
+};
+
+/// @summary Define a structure used to specify data used to configure a task scheduler instance at creation time.
+struct WIN32_TASK_SCHEDULER_CONFIG
+{   static size_t const      NUM_POOLS             = TASK_POOL_COUNT;
+    WIN32_THREAD_ARGS       *MainThreadArgs;     /// The global data managed by the main thread and available to all threads.
+    size_t                   MaxTaskSources;     /// The maximum number of threads (task sources) that can create tasks.
+    WIN32_THREAD_POOL_SIZE   PoolSize[NUM_POOLS];/// The maximum number of worker threads in each type of thread pool.
+};
+
 /*//////////////////////////
 //   Internal Functions   //
 //////////////////////////*/
@@ -534,7 +562,7 @@ GetTaskWorkSize
 
 /// @summary Retrieve the work item data for a given task ID.
 /// @param task The task identifier. This function does not validate the task ID.
-/// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::SourceList or TASK_SOURCE::TaskSources.
+/// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::TaskSources or TASK_SOURCE::TaskSources.
 /// @return A pointer to the work item data.
 internal_function inline TASK_DATA*
 GetTaskWorkItem
@@ -550,7 +578,7 @@ GetTaskWorkItem
 
 /// @summary Retrieve the work counter for a given task ID.
 /// @param task The task identifier. This function does not validate the task ID.
-/// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::SourceList or TASK_SOURCE::TaskSources.
+/// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::TaskSources or TASK_SOURCE::TaskSources.
 /// @return A pointer to the work counter associated with the task.
 internal_function inline std::atomic<int32_t>*
 GetTaskWorkCount
@@ -566,7 +594,7 @@ GetTaskWorkCount
 
 /// @summary Retrieve the list of permits for a given task ID.
 /// @param task The task identifier. This function does not validate the task ID.
-/// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::SourceList or TASK_SOURCE::TaskSources.
+/// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::TaskSources or TASK_SOURCE::TaskSources.
 /// @return A pointer to the permits list associated with the task.
 internal_function inline PERMITS_LIST*
 GetTaskPermitsList
@@ -1086,11 +1114,11 @@ CreateThreadPool
     }
 
     // initialize the array of pointers to TASK_SOURCE objects.
-    // the pointers point back into the scheduler's SourceList.
+    // the pointers point back into the WIN32_TASK_SCHEDULER::TaskSources.
     for (size_t i = 0; i < pool_config->MaxThreads; ++i)
     {
         size_t src_index = pool_config->WorkerSourceIndex + i;
-        thread_pool->WorkerSource[i] = &pool_config->TaskScheduler->SourceList[src_index];
+        thread_pool->WorkerSource[i] = &pool_config->TaskScheduler->TaskSources[src_index];
     }
 
     // spawn workers until the maximum thread count is reached.
@@ -1246,7 +1274,8 @@ NewTaskSource
         return NULL;
     }
 
-    TASK_SOURCE      *source = &scheduler->SourceList[scheduler->SourceCount];
+    size_t        index =  scheduler->SourceCount;
+    TASK_SOURCE *source = &scheduler->TaskSources[index];
     if (NewTaskQueue(&source->ComputeWorkQueue, max_tasks, arena) < 0)
     {   // unable to initialize the compute task queue for the source.
         ConsoleError("ERROR (%S): Failed to create compute task queue for source.\n", __FUNCTION__);
@@ -1263,7 +1292,7 @@ NewTaskSource
     source->GeneralPoolPort = scheduler->GeneralPool.CompletionPort;
     source->SourceIndex     = uint32_t(scheduler->SourceCount);
     source->SourceCount     = uint32_t(scheduler->MaxSources);
-    source->TaskSources     = scheduler->SourceList;
+    source->TaskSources     = scheduler->TaskSources;
     source->MaxTasks        = uint32_t(max_tasks);
     source->TaskIndex       = 0;
     source->WorkItems       = PushArray<TASK_DATA            >(arena, max_tasks);
@@ -1271,5 +1300,510 @@ NewTaskSource
     source->PermitList      = PushArray<PERMITS_LIST         >(arena, max_tasks);
     scheduler->SourceCount++;
     return source;
+}
+
+/// @summary Calculate the amount of memory required for a given scheduler configuration.
+/// @param config The pre-validated scheduler configuration.
+/// @return The number of bytes required to create a compute task scheduler of the specified type with the given configuration.
+public_function size_t
+CalculateMemoryForScheduler
+(
+    WIN32_TASK_SCHEDULER_CONFIG const *config
+)
+{
+    size_t   size_in_bytes = 0;
+    size_t general_threads = config->PoolSize[TASK_POOL_GENERAL].MaxThreads;
+    size_t compute_threads = config->PoolSize[TASK_POOL_COMPUTE].MaxThreads;
+    size_t   general_tasks = config->PoolSize[TASK_POOL_GENERAL].MaxTasks;
+    size_t   compute_tasks = config->PoolSize[TASK_POOL_COMPUTE].MaxTasks;
+    size_t   max_max_tasks = general_tasks > compute_tasks ? general_tasks : compute_tasks;
+    // account for the size of the thread pools.
+    size_in_bytes += CalculateMemoryForThreadPool(general_threads);
+    size_in_bytes += CalculateMemoryForThreadPool(compute_threads);
+    // account for the size of the main thread task source.
+    size_in_bytes += CalculateMemoryForTaskSource(max_max_tasks);
+    // account for the size of the general pool worker threads.
+    size_in_bytes += CalculateMemoryForTaskSource(general_tasks) * general_threads;
+    // account for the size of the compute pool worker threads.
+    size_in_bytes += CalculateMemoryForTaskSource(compute_tasks) * compute_threads;
+    // ... 
+    return size_in_bytes;
+}
+
+/// @summary Retrieve a default scheduler configuration based on host CPU resources.
+/// @param config The scheduler configuration to populate.
+/// @param main_thread_args Global data managed by the main thread and available to all threads.
+/// @param host_cpu_info Information about the CPU resources of the host system.
+public_function void
+DefaultSchedulerConfiguration
+(
+    WIN32_TASK_SCHEDULER_CONFIG        *config, 
+    WIN32_THREAD_ARGS        *main_thread_args,
+    WIN32_CPU_INFO const        *host_cpu_info
+)
+{   // everything starts out as zero.
+    ZeroMemory(config, sizeof(WIN32_TASK_SCHEDULER_CONFIG));
+    // set up defaults for the general pool. tasks are expected to be created relatively 
+    // infrequently, and to be fairly long-running (one to several application ticks.) 
+    // having more software threads than hardware threads helps reduce latency.
+    WIN32_THREAD_POOL_SIZE &general_pool = config->PoolSize[TASK_POOL_GENERAL];
+    general_pool.MinThreads = 2;
+    general_pool.MaxThreads = host_cpu_info->HardwareThreads * 2;
+    general_pool.MaxTasks   = 256;
+    general_pool.ArenaSize  = 8 * 1024 * 1024; // 8MB
+    // set up defaults for the compute pool. tasks are expected to be created very 
+    // frequently, and to be short lived (less than one application tick.) limit 
+    // to the number of hardware threads to avoid over-subscribing CPU resources.
+    WIN32_THREAD_POOL_SIZE &compute_pool = config->PoolSize[TASK_POOL_COMPUTE];
+    compute_pool.MinThreads = 1;
+    compute_pool.MaxThreads = host_cpu_info->PhysicalCores;
+    compute_pool.MaxTasks   = 2048;
+    compute_pool.ArenaSize  = 2 * 1024 * 1024;  // 2MB
+    if (compute_pool.MaxThreads < 1)
+    {   // on a single-core system, limit to 1 thread.
+        compute_pool.MaxThreads = 1;
+    }
+    // scale up the maximum number of tasks per-pool based on hardware resources.
+    if (host_cpu_info->HardwareThreads > 8)
+    {   // six-core CPU or greater - allow more tasks to be created.
+        general_pool.MaxTasks = 512;
+        compute_pool.MaxTasks = 4096;
+    }
+    if (host_cpu_info->HardwareThreads > 16)
+    {   // more than six cores, allow even more tasks to be created.
+        general_pool.MaxTasks = 1024;
+        compute_pool.MaxTasks = 8192;
+    }
+    if (host_cpu_info->HardwareThreads > 32)
+    {   // and so on...
+        general_pool.MaxTasks = 2048;
+        compute_pool.MaxTasks = 16384;
+    }
+    if (host_cpu_info->HardwareThreads > 64)
+    {   // and so on...
+        general_pool.MaxTasks = 4096;
+        compute_pool.MaxTasks = 32768;
+    }
+    if (host_cpu_info->HardwareThreads > 128)
+    {   // and so on.
+        general_pool.MaxTasks = 8192;
+        compute_pool.MaxTasks = 65536;
+    }
+    // default the maximum number of task sources to the number of worker threads + 1 for the main thread.
+    config->MaxTaskSources = general_pool.MaxThreads + compute_pool.MaxThreads + 1;
+    config->MainThreadArgs = main_thread_args;
+}
+
+/// @summary Validates a given scheduler configuration.
+/// @param dst_config The configuration object to receive the validated configuration data.
+/// @param src_config The configuration object specifying the input configuration data.
+/// @param performance_warnings On return, set to true if one or more performance warnings were emitted.
+/// @return Zero if the configuration is valid, or -1 if the configuration is not valid.
+public_function int
+CheckSchedulerConfiguration
+(
+    WIN32_TASK_SCHEDULER_CONFIG       *dst_config, 
+    WIN32_TASK_SCHEDULER_CONFIG const *src_config,
+    bool                    &performance_warnings
+)
+{
+    if (dst_config == NULL)
+    {
+        ConsoleError("ERROR (%S): A destination scheduler configuration must be supplied.\n", __FUNCTION__);
+        performance_warnings = false;
+        return -1;
+    }
+    if (src_config == NULL)
+    {
+        ConsoleError("ERROR (%S): A source scheduler configuration must be supplied.\n", __FUNCTION__);
+        performance_warnings = false;
+        return -1;
+    }
+    if (src_config->MainThreadArgs == NULL || src_config->MainThreadArgs->HostCPUInfo == NULL)
+    {
+        ConsoleError("ERROR (%S): Host CPU information must be supplied to on WIN32_TASK_SCHEDULER_CONFIG::MainThreadArgs.\n", __FUNCTION__);
+        performance_warnings = false;
+        return -1;
+    }
+
+    // retrieve the current system memory usage.
+    WIN32_CPU_INFO const *host_cpu_info = src_config->MainThreadArgs->HostCPUInfo;
+    MEMORYSTATUSEX memory = {};
+    size_t general_memory = 0;
+    size_t compute_memory = 0;
+    ZeroMemory(&memory, sizeof(MEMORYSTATUSEX));
+    memory.dwLength   = sizeof(MEMORYSTATUSEX);
+    GlobalMemoryStatusEx(&memory);
+
+    {   // validation for the general thread pool.
+        // the general thread pool jobs are expected to be created relatively infrequently,
+        // and each job is expected to be relatively long-lived. having more threads than 
+        // hardware threads helps to keep CPU resources busy when there's no compute work.
+        WIN32_THREAD_POOL_SIZE const &src = src_config->PoolSize[TASK_POOL_GENERAL];
+        WIN32_THREAD_POOL_SIZE       &dst = dst_config->PoolSize[TASK_POOL_GENERAL];
+
+        if (src.MinThreads < 1)
+        {   // the general pool must have at least one background thread.
+            dst.MinThreads = 1;
+        }
+        else
+        {   // copy the value from the source configuration.
+            dst.MinThreads = src.MinThreads;
+        }
+        if (src.MaxThreads < 1)
+        {   // the general pool must have at least one background thread.
+            dst.MaxThreads = 1;
+        }
+        else
+        {   // copy the value from the source configuration.
+            dst.MaxThreads = src.MaxThreads;
+        }
+        if (dst.MinThreads > dst.MaxThreads)
+        {   // swap to ensure that max >= min.
+            size_t    temp = dst.MinThreads;
+            dst.MinThreads = dst.MaxThreads;
+            dst.MaxThreads = temp;
+        }
+        if (src.MaxTasks <= (dst.MaxThreads * 4))
+        {   // select a more reasonable value based on available hardware resources.
+            if (host_cpu_info->HardwareThreads <   8) dst.MaxTasks = 256;
+            if (host_cpu_info->HardwareThreads >   8) dst.MaxTasks = 512;
+            if (host_cpu_info->HardwareThreads >  16) dst.MaxTasks = 1024;
+            if (host_cpu_info->HardwareThreads >  32) dst.MaxTasks = 2048;
+            if (host_cpu_info->HardwareThreads >  64) dst.MaxTasks = 4096;
+            if (host_cpu_info->HardwareThreads > 128) dst.MaxTasks = 8192;
+        }
+        else
+        {   // copy the value from the source configuration.
+            dst.MaxTasks = src.MaxTasks;
+        }
+        // the maximum number of tasks per-tick should always be a power of two.
+        if ((dst.MaxTasks & (dst.MaxTasks-1)) != 0)
+        {   // round up to the next largest power-of-two.
+            size_t n = 1;
+            size_t m = dst.MaxTasks;
+            while (n < m)
+            {   // bump up to the next power-of-two.
+                n <<= 1;
+            }
+            dst.MaxTasks = m;
+        }
+        // there is no per-thread memory requirement, so copy the source value directly.
+        // calculate the amount of per-thread memory used in the general pool.
+        dst.ArenaSize   = src.ArenaSize;
+        general_memory  = dst.MaxThreads * dst.ArenaSize;
+        general_memory += dst.MaxThreads * CalculateMemoryForTaskSource(2, dst.MaxTasks);
+    }
+    {   // validation for the compute thread pool.
+        // the compute thread pool jobs are expected to be created very frequently, in large 
+        // numbers, and each job is expected to be very short-lived (one tick or less.)
+        // to avoid over-subscribing CPU resources, limit to the number of hardware threads.
+        WIN32_THREAD_POOL_SIZE const &src = src_config->PoolSize[TASK_POOL_COMPUTE];
+        WIN32_THREAD_POOL_SIZE       &dst = dst_config->PoolSize[TASK_POOL_COMPUTE];
+
+        if (src.MinThreads < 1)
+        {   // the compute pool must have at least one background thread.
+            dst.MinThreads = 1;
+        }
+        else
+        {   // copy the value from the source configuration.
+            dst.MinThreads = src.MinThreads;
+        }
+        if (src.MaxThreads < 1)
+        {   // the compute pool must have at least one background thread.
+            dst.MaxThreads = 1;
+        }
+        else
+        {   // copy the value from the source configuration.
+            dst.MaxThreads = src.MaxThreads;
+        }
+        if (dst.MinThreads > dst.MaxThreads)
+        {   // swap to ensure that max >= min.
+            size_t    temp = dst.MinThreads;
+            dst.MinThreads = dst.MaxThreads;
+            dst.MaxThreads = temp;
+        }
+        if (src.MaxTasks <= (dst.MaxThreads * 64))
+        {   // select a more reasonable value based on available hardware resources.
+            if (host_cpu_info->HardwareThreads <   8) dst.MaxTasks = 2048;
+            if (host_cpu_info->HardwareThreads >   8) dst.MaxTasks = 4096;
+            if (host_cpu_info->HardwareThreads >  16) dst.MaxTasks = 8192;
+            if (host_cpu_info->HardwareThreads >  32) dst.MaxTasks = 16384;
+            if (host_cpu_info->HardwareThreads >  64) dst.MaxTasks = 32768;
+            if (host_cpu_info->HardwareThreads > 128) dst.MaxTasks = 65536;
+        }
+        else
+        {   // copy the value from the source configuration.
+            dst.MaxTasks = src.MaxTasks;
+        }
+        // the maximum number of tasks per-tick should always be a power of two.
+        if ((dst.MaxTasks & (dst.MaxTasks-1)) != 0)
+        {   // round up to the next largest power-of-two.
+            size_t n = 1;
+            size_t m = dst.MaxTasks;
+            while (n < m)
+            {   // bump up to the next power-of-two.
+                n <<= 1;
+            }
+            dst.MaxTasks = m;
+        }
+        // there is no per-thread memory requirement, so copy the source value directly.
+        // calculate the amount of per-thread memory used in the general pool.
+        dst.ArenaSize   = src.ArenaSize;
+        compute_memory  = dst.MaxThreads * dst.ArenaSize;
+        compute_memory += dst.MaxThreads * CalculateMemoryForTaskSource(2, dst.MaxTasks);
+    }
+
+    {   // validate configuration against system limits.
+        if ((dst_config->PoolSize[TASK_POOL_GENERAL].MaxThreads  + 
+             dst_config->PoolSize[TASK_POOL_COMPUTE].MaxThreads) > MAX_WORKER_THREADS)
+        {   // there are too many worker threads for the software to support.
+            ConsoleError("ERROR (%S): Too many worker threads for this scheduler implementation. Max is %u.\n", __FUNCTION__, MAX_WORKER_THREADS);
+            performance_warnings = false;
+            return -1;
+        }
+        if (dst_config->PoolSize[TASK_POOL_GENERAL].MaxTasks > MAX_TASKS_PER_BUFFER)
+        {   // there are too many tasks for the scheduler to suport.
+            ConsoleError("ERROR (%S): Too many tasks per-worker in the general pool. Max is %u.\n", __FUNCTION__, MAX_TASKS_PER_BUFFER);
+            performance_warnings = false;
+            return -1;
+        }
+        if (dst_config->PoolSize[TASK_POOL_COMPUTE].MaxTasks > MAX_TASKS_PER_BUFFER)
+        {   // there are too many tasks for the scheduler to suport.
+            ConsoleError("ERROR (%S): Too many tasks per-worker in the compute pool. Max is %u.\n", __FUNCTION__, MAX_TASKS_PER_BUFFER);
+            performance_warnings = false;
+            return -1;
+        }
+        if ((general_memory + compute_memory) >= memory.ullAvailPhys)
+        {   // too much per-thread memory is requested; allocation will never succeed.
+            ConsoleError("ERROR (%S): Too much thread-local memory requested. Requested %zu bytes, but only %zu bytes available.\n", __FUNCTION__, (general_memory+compute_memory), memory.ullAvailPhys);
+            performance_warnings = false;
+            return -1;
+        }
+        if (src_config->MainThreadArgs != NULL)
+        {   // copy the value from the source configuration.
+            dst_config->MainThreadArgs  = src_config->MainThreadArgs;
+        }
+        else
+        {   // a valid WIN32_THREAD_ARGS must be supplied.
+            ConsoleError("ERROR (%S): No WIN32_THREAD_ARGS specified in scheduler configuration.\n", __FUNCTION__);
+            performance_warnings = false;
+            return -1;
+        }
+    }
+
+    {   // validate configuration performance against available resources.
+        if ((double) (general_memory + compute_memory) >= (memory.ullAvailPhys * 0.8))
+        {   // dangerously close to consuming all available physical memory in the system.
+            ConsoleOutput("PERFORMANCE WARNING (%S): Scheduler will consume >= 80 percent of available physical memory. Swapping may occur.\n", __FUNCTION__);
+            performance_warnings = true;
+        }
+        if (dst_config->PoolSize[TASK_POOL_COMPUTE].MaxThreads > host_cpu_info->HardwareThreads)
+        {   // the host CPU is probably over-subscribed.
+            ConsoleOutput("PERFORMANCE WARNING (%S): Compute pool has more threads than host CPU(s). Performance may be degraded.\n", __FUNCTION__);
+            performance_warnings = true;
+        }
+    }
+
+    size_t general_threads = dst_config->PoolSize[TASK_POOL_GENERAL].MaxThreads;
+    size_t compute_threads = dst_config->PoolSize[TASK_POOL_COMPUTE].MaxThreads;
+    size_t   total_threads = general_threads + compute_threads;
+    if (src_config->MaxTaskSources < (total_threads + 1))
+    {   // calculate an appropriate default value based on the thread pool sizes.
+        dst_config->MaxTaskSources = (total_threads + 1); // the minimum acceptable value.
+    }
+    else
+    {   // copy the value from the source configuration.
+        dst_config->MaxTaskSources =  src_config->MaxTaskSources;
+    }
+    if (dst_config->MaxTaskSources > MAX_SCHEDULER_THREADS)
+    {   // the global scheduler limit has been exceeded.
+        ConsoleError("ERROR (%S): Too many task sources. Max is %u.\n", __FUNCTION__, MAX_SCHEDULER_THREADS);
+        return -1;
+    }
+    return 0;
+}
+
+/// @summary Create a new asynchronous task scheduler instance. The scheduler worker threads are launched separately.
+/// @param scheduler The scheduler instance to initialize.
+/// @param config The scheduler configuration.
+/// @param arena The memory arena used to allocate scheduler memory. Per-worker memory is allocated directly from the OS.
+/// @return A pointer to the new scheduler instance, or NULL.
+public_function int
+CreateScheduler
+(
+    WIN32_TASK_SCHEDULER              *scheduler, 
+    WIN32_TASK_SCHEDULER_CONFIG const    *config,
+    MEMORY_ARENA                          *arena
+)
+{   // validate the scheduler configuration.
+    WIN32_TASK_SCHEDULER_CONFIG valid_config = {};
+    bool                performance_warnings = false;
+    if (CheckSchedulerConfiguration(&valid_config, config, performance_warnings) < 0)
+    {   // no valid configuration can be obtained - some system limit was exceeded.
+        ConsoleError("ERROR (%S): Invalid scheduler configuration.\n", __FUNCTION__);
+        ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
+        return -1;
+    }
+    if (performance_warnings)
+    {   // spit out an extra console message to try and get programmer attention.
+        ConsoleOutput("PERFORMANCE WARNING (%S): Check console output above.\n", __FUNCTION__);
+    }
+
+    size_t mem_marker   = ArenaMarker(arena);
+    size_t mem_required = CalculateMemoryForScheduler(&valid_config);
+    if (!ArenaCanAllocate(arena, mem_required, std::alignment_of<WIN32_TASK_SCHEDULER>::value))
+    {
+        ConsoleError("ERROR (%S): Insufficient memory; %zu bytes required.\n", __FUNCTION__, mem_required);
+        ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
+        return -1;
+    }
+
+    HANDLE ev_launch       = NULL;
+    size_t general_threads = valid_config.PoolSize[TASK_POOL_GENERAL].MaxThreads;
+    size_t general_tasks   = valid_config.PoolSize[TASK_POOL_GENERAL].MaxTasks;
+    size_t compute_threads = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxThreads;
+    size_t compute_tasks   = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxTasks;
+    size_t max_max_tasks   = compute_tasks > general_tasks ? compute_tasks : general_tasks;
+    WIN32_THREAD_POOL_CONFIG general_config = {};
+    WIN32_THREAD_POOL_CONFIG compute_config = {};
+    ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
+
+    // create scheduler worker thread synchronization objects.
+    if ((ev_launch = CreateEvent(NULL, TRUE, FALSE, NULL)) == NULL)
+    {   // worker threads would have no way to coordinate launching.
+        ConsoleError("ERROR (%S): Failed to create worker launch signal (%08X).\n", __FUNCTION__, GetLastError());
+        goto cleanup_and_fail;
+    }
+
+    // initialize the various coordination events and task source list.
+    scheduler->MaxSources   = valid_config.MaxTaskSources;
+    scheduler->SourceCount  = 0;
+    scheduler->TaskSources  = PushArray<TASK_SOURCE>(arena, valid_config.MaxTaskSources);
+    scheduler->LaunchSignal = ev_launch;
+    ZeroMemory(scheduler->TaskSources, valid_config.MaxTaskSources * sizeof(TASK_SOURCE));
+
+    // task sources must be allocated for worker threads before the threads are spawned
+    // (which happens when the thread pools are created, below.)
+    // the assignment of the task sources is as follows:
+    // [root][compute_workers][general_workers][user_threads]
+
+    // allocate task source index 0 to the 'root' thread.
+    if (NewTaskSource(scheduler, max_max_tasks, arena) == NULL)
+    {   // the main thread would have no way to submit the root work tasks.
+        ConsoleError("ERROR (%S): Failed to create the root task source.\n", __FUNCTION__);
+        goto cleanup_and_fail;
+    }
+
+    // allocate task sources to the compute pool worker threads.
+    for (size_t i = 0; i < compute_threads; ++i)
+    {
+        TASK_SOURCE *worker_source = NewTaskSource(scheduler, compute_tasks, arena);
+        if (worker_source == NULL)
+        {   // the worker thread would have no way to submit compute tasks.
+            ConsoleError("ERROR (%S): Failed to create the task source for compute worker %zu.\n", __FUNCTION__, i);
+            goto cleanup_and_fail;
+        }
+    }
+
+    // allocate task sources to the general pool worker threads.
+    for (size_t i = 0; i < general_threads; ++i)
+    {
+        TASK_SOURCE *worker_source = NewTaskSource(scheduler, general_tasks, arena);
+        if (worker_source == NULL)
+        {   // the worker thread would have no way to submit compute tasks.
+            ConsoleError("ERROR (%S): Failed to create the task source for general worker %zu.\n", __FUNCTION__, i);
+            goto cleanup_and_fail;
+        }
+    }
+
+    // initialize, but do not launch, the general task thread pool.
+    general_config.TaskScheduler     = scheduler;
+    general_config.ThreadMain        = GeneralWorkerMain;
+    general_config.MainThreadArgs    = valid_config.MainThreadArgs;
+    general_config.MinThreads        = valid_config.PoolSize[TASK_POOL_GENERAL].MinThreads;
+    general_config.MaxThreads        = valid_config.PoolSize[TASK_POOL_GENERAL].MaxThreads;
+    general_config.WorkerArenaSize   = valid_config.PoolSize[TASK_POOL_GENERAL].ArenaSize;
+    general_config.WorkerSourceIndex = compute_threads + 1; // see above
+    general_config.LaunchSignal      = ev_launch;
+    general_config.WorkerFlags       = WORKER_FLAGS_NONE;
+    if (CreateThreadPool(&scheduler->GeneralPool, &general_config, arena) < 0)
+    {   // the scheduler would have no pool in which to execute general tasks.
+        ConsoleError("ERROR (%S): Failed to create the general thread pool.\n", __FUNCTION__);
+        goto cleanup_and_fail;
+    }
+
+    // initialize, but do not launch, the compute task thread pool.
+    compute_config.TaskScheduler     = scheduler;
+    compute_config.ThreadMain        = ComputeWorkerMain;
+    compute_config.MainThreadArgs    = valid_config.MainThreadArgs;
+    compute_config.MinThreads        = valid_config.PoolSize[TASK_POOL_COMPUTE].MinThreads;
+    compute_config.MaxThreads        = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxThreads;
+    compute_config.WorkerArenaSize   = valid_config.PoolSize[TASK_POOL_COMPUTE].ArenaSize;
+    compute_config.WorkerSourceIndex = 1; // see above
+    compute_config.LaunchSignal      = ev_launch;
+    compute_config.WorkerFlags       = WORKER_FLAGS_NONE;
+    if (CreateThreadPool(&scheduler->ComputePool, &compute_config, arena) < 0)
+    {   // the scheduler would have no pool in which to execute compute tasks.
+        ConsoleError("ERROR (%S): Failed to create the compute thread pool.\n", __FUNCTION__);
+        goto cleanup_and_fail;
+    }
+
+    return 0;
+
+cleanup_and_fail:
+    TerminateThreadPool(&scheduler->ComputePool);
+    TerminateThreadPool(&scheduler->GeneralPool);
+    if(ev_launch != NULL) CloseHandle(ev_launch);
+    DeleteThreadPool(&scheduler->ComputePool);
+    DeleteThreadPool(&scheduler->GeneralPool);
+    ArenaResetToMarker(arena, mem_marker);
+    ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
+    return -1;
+}
+
+/// @summary Notify all task scheduler worker threads to start monitoring work queues.
+/// @param scheduler The task scheduler to launch.
+public_function void
+LaunchScheduler
+(
+    WIN32_TASK_SCHEDULER *scheduler
+)
+{
+    if (scheduler->StartSignal != NULL)
+    {   // start all of the worker threads looking for work.
+        SetEvent(scheduler->StartSignal);
+    }
+}
+
+/// @summary Notify all task scheduler worker threads to shutdown, and clean up scheduler resources. Ensure that no more tasks will be created prior to calling this function.
+/// @param scheduler The task scheduler to halt.
+public_function void
+HaltScheduler
+(
+    WIN32_TASK_SCHEDULER *scheduler
+)
+{   // signal all worker threads to exit, and wait for them.
+    TerminateThreadPool(&scheduler->ComputePool);
+    TerminateThreadPool(&scheduler->GeneralPool);
+    if (scheduler->LaunchSignal != NULL)
+    {
+        CloseHandle(scheduler->LaunchSignal);
+    }
+    DeleteThreadPool(&scheduler->ComputePool);
+    DeleteThreadPool(&scheduler->GeneralPool);
+    ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
+}
+
+/// @summary Retrieve the task source for the root thread. This function should only ever be called from the root thread (the thread that submits the root tasks.)
+/// @param scheduler The scheduler instance to query.
+/// @return A pointer to the worker state for the root thread, which can be used to spawn root tasks.
+public_function inline WIN32_TASK_SOURCE*
+RootTaskSource
+(
+    WIN32_TASK_SCHEDULER *scheduler
+)
+{
+    return &scheduler->SourceList[0];
 }
 
