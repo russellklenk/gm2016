@@ -725,9 +725,10 @@ CreatePermits
     task_id_t const           deps,
     size_t    const     deps_count
 )
-{
+{   // require an extra permit token, which is removed at the end of the function.
+    // this is not strictly necessary, but simplifies the function logic.
     TASK_SOURCE *slist = thread_source->TaskSources;
-    work_item->Permits.store(-int32_t(deps_count), std::memory_order_relaxed);
+    work_item->Permits.store(-int32_t(deps_count+1), std::memory_order_relaxed);
     for (size_t i = 0; i < deps_count; ++i)
     {
         PERMITS_LIST *plist = GetTaskPermitsList(deps[i], slist);
@@ -737,10 +738,8 @@ CreatePermits
             if (n < 0)
             {   // this dependency has completed.
                 // the fetch_add needs to be atomic because a permit added previously might complete.
-                if (work_item->Permits.fetch_add(1, std::memory_order_acq_rel) == -1)
-                {   // all dependencies have been satisfied for this task.
-                    return true;
-                }
+                work_item->Permits.fetch_add(1, std::memory_order_acq_rel);
+                break; // don't compare-exchange plist->Count.
             }
             if (n < PERMITS_LIST::MAX_TASKS)
             {   // append the task ID to the permits list of deps[i].
@@ -753,7 +752,13 @@ CreatePermits
             }
         } while (plist->Count.compare_exchange_weak(n, n+1, std::memory_order_acq_rel, std::memory_order_relaxed));
     }
-    return (deps_count == 0);
+    // remove the extra permit token that was added on function entry.
+    // if this returns -1, all dependencies have completed, and the function 
+    // returns true so that DefineTask moves the task to the ready-to-run queue.
+    // otherwise, there are still one or more outstanding dependencies, and the 
+    // new task will be moved to the ready-to-run queue when the final outstanding
+    // dependency completes. this is done by AllowPermits (via FinishTask.)
+    return (work_item->Permits.fetch_add(1, std::memory_order_acq_rel) == -1);
 }
 
 /// @summary Process the permits list for a completed task and move any now-permitted tasks to the ready-to-run queue(s).
@@ -802,6 +807,17 @@ AllowPermits
     return (nc + ng);
 }
 
+/// @summary Create a new task. If all dependencies have been satisfied, add the task to the ready-to-run queue.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the new task.
+/// @param task_size One of the values of the TASK_SIZE enumeration specifying the approximate CPU workload of the new task.
+/// @param task_pool One of the values of the TASK_POOL enumeration specifying the thread pool on which the task should run.
+/// @param task_main The entry point of the new task.
+/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
+/// @param args_size The size of the optional task data, in bytes.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID.
+/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
+/// @param dependency_count The number of valid task identifiers in the dependencies list.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
 internal_function task_id_t
 DefineTask
 (
@@ -862,7 +878,6 @@ DefineTask
     plist.Count.store(0, std::memory_order_relaxed);
     if (CreatePermits(thread_source, task_id, task, dependencies, dependency_count))
     {   // the task is ready-to-run, push it onto the local RTR queue.
-        // TODO(rlk): possible race here? a completed task could push the new task during CreatePermits?
         if (task_pool == TASK_POOL_COMPUTE)
         {   // this task executes on the compute thread pool.
             TaskQueuePush(&thread_source->ComputeWorkQueue, task_id);
