@@ -13,15 +13,15 @@
 ///////////////////////////////////////////////////////////////////////////80*/
 
 // TODO(rlk): Each pool has a separate IOCP so that threads in that pool can be woken separately.
-// When a task is definied, it signals the IOCP corresponding to its pool.
+// When a task is definied, it signals the IOCP corresponding to its pool. DONE.
 // TODO(rlk): In this revision, switch to using the same data for both types of tasks. This is 
 // possible because we'll switch to hunting for a free task in the TASK_SOURCE. This way, both
 // types of tasks support the same features and have the same data; they differ only in which 
-// pool they execute on.
+// pool they execute on. DONE.
 // TODO(rlk): Add explicit support for a 'batch push' mode, where new tasks are pushed to the 
-// TASK_SOURCE, but no signals are sent until all tasks have been defined.
+// TASK_SOURCE, but no signals are sent until all tasks have been defined. DONE.
 // TODO(rlk): Each TASK_SOURCE now has two dequeues, one for the compute pool and one for the 
-// general pool. The MPMC general task queue is no longer needed.
+// general pool. The MPMC general task queue is no longer needed. DONE.
 // TODO(rlk): Profiling can be completely stripped out using a #define.
 // TODO(rlk): Instead of using two bits for buffer index, use those bits to represent task size.
 // The task size information can be used by a worker thread to determine how many tasks to steal
