@@ -460,32 +460,6 @@ WakeAllWorkerThreads
     WakeWorkerThreads(thread_pool->CompletionPort, NULL, thread_pool->MaxThreads);
 }
 
-/// @summary Wake up worker threads to process compute jobs.
-/// @param source The TASK_SOURCE of the thread that has available work in its compute queue.
-/// @param wake_count The number of worker threads to wake.
-internal_function inline void
-WakeComputePoolWorkers
-(
-    TASK_SOURCE    *source, 
-    size_t      wake_count
-)
-{
-    WakeWorkerThreads(source->ComputePoolPort, source, wake_count);
-}
-
-/// @summary Wake up worker threads to process general asynchronous jobs.
-/// @param source The TASK_SOURCE of the thread that has available work in its general queue.
-/// @param wake_count The number of worker threads to wake.
-internal_function inline void
-WakeGeneralPoolWorkers
-(
-    TASK_SOURCE    *source,
-    size_t      wake_count
-)
-{
-    WakeWorkerThreads(source->GeneralPoolPort, source, wake_count);
-}
-
 /// @summary Create a task ID from its constituient parts.
 /// @param task_size One of TASK_SIZE specifying the CPU workload of the task.
 /// @param pool_type One of TASK_POOL specifying the thread pool that will run the task.
@@ -782,7 +756,7 @@ CreatePermits
     }
     // remove the extra permit token that was added on function entry.
     // if this returns -1, all dependencies have completed, and the function 
-    // returns true so that DefineTask moves the task to the ready-to-run queue.
+    // returns true so that NewTask moves the task to the ready-to-run queue.
     // otherwise, there are still one or more outstanding dependencies, and the 
     // new task will be moved to the ready-to-run queue when the final outstanding
     // dependency completes. this is done by AllowPermits (via FinishTask.)
@@ -835,87 +809,34 @@ AllowPermits
     return (nc + ng);
 }
 
-/// @summary Create a new task. If all dependencies have been satisfied, add the task to the ready-to-run queue.
-/// @param thread_source The TASK_SOURCE owned by the thread creating the new task.
-/// @param task_size One of the values of the TASK_SIZE enumeration specifying the approximate CPU workload of the new task.
-/// @param task_pool One of the values of the TASK_POOL enumeration specifying the thread pool on which the task should run.
-/// @param task_main The entry point of the new task.
-/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
-/// @param args_size The size of the optional task data, in bytes.
-/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID.
-/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
-/// @param dependency_count The number of valid task identifiers in the dependencies list.
-/// @return The identifier of the new task, or INVALID_TASK_ID.
-internal_function task_id_t
-DefineTask
+/// @summary Indicate that a task has been completely defined (including any child tasks) or that it has finished executing.
+/// @param thread_source The TASK_SOURCE of the calling thread.
+/// @param task The identifier of the just-completed task.
+/// @param permitted_compute On return, this location is incremented by the number of now-permitted tasks added to the compute task RTR queue for the task source.
+/// @param permitted_general On return, this location is incremented by the number of now-permitted tasks added to the general task RTR queue for the task source.
+/// @return The total number of now-permitted tasks.
+internal_function size_t
+FinishTask
 (
-    TASK_SOURCE        *thread_source,
-    uint32_t  const         task_size, 
-    uint32_t  const         task_pool, 
-    TASK_ENTRYPOINT         task_main, 
-    void      const        *task_args, 
-    size_t    const         args_size, 
-    task_id_t               parent_id, 
-    task_id_t const     *dependencies, 
-    size_t    const  dependency_count
+    TASK_SOURCE *thread_source, 
+    task_id_t             task, 
+    size_t  &permitted_compute, 
+    size_t  &permitted_general
 )
 {
-    if (args_size > TASK_DATA::MAX_DATA)
-    {   // too much data being passed. allocate storage elsewhere and pass in pointers.
-        ConsoleError("ERROR (%S): Argument data too large (parent %08X); specified %zu bytes, max is %zu bytes.\n", __FUNCTION__, parent_id, args_size, TASK_DATA::MAX_DATA);
-        return INVALID_TASK_ID;
-    }
-
-    // search for an available slot. this should almost always be a very short search; just one item.
-    uint32_t const  mask = thread_source->MaxTasks - 1;
-    uint32_t start_index = thread_source->TaskIndex;
-    uint32_t  task_index = thread_source->TaskIndex;
-    bool      found_slot = false;
-    do
-    {   // take the first slot with an outstanding work count of 0.
-        // note that the calling thread is the only thread that can define tasks on this TASK_SOURCE.
-        if (thread_source->WorkCounts[task_index & mask].load(std::memory_order_acquire) == 0)
-        {   // this slot is currently unused; claim it.
-            thread_source->TaskIndex = (task_index + 1) & mask;
-            found_slot = true;
-            break;
-        }
-        else 
-        {   // check the next slot in line.
-            task_index = (task_index + 1) & mask;
-        }
-    } while (!found_slot && task_index != start_index);
-
-    // ensure that a slot was claimed prior to continuing.
-    if (task_index == start_index && !found_slot)
-    {   // there are no task definition slots available on this thread.
-        ConsoleError("ERROR (%S): Out of task buffer on source %u. Increase WIN32_TASK_SCHEDULER::TasksPerBuffer.\n", __FUNCTION__, thread_source->SourceIndex);
-        return INVALID_TASK_ID;
-    }
-
-    // create the task in the claimed slot.
-    task_id_t                task_id = MakeTaskId(task_size, task_pool, task_index, thread_source->SourceIndex);
-    TASK_DATA                  &task = thread_source->WorkItems [task_index];
-    std::atomic<int32_t> &work_count = thread_source->WorkCounts[task_index];
-    PERMITS_LIST              &plist = thread_source->PermitList[task_index];
-
-    task.ParentTask = parent_id;
-    task.TaskMain   = task_main;
-    CopyMemory(task.Data, task_args, args_size);
-    work_count.store(2, std::memory_order_relaxed);
-    plist.Count.store(0, std::memory_order_relaxed);
-    if (CreatePermits(thread_source, task_id, task, dependencies, dependency_count))
-    {   // the task is ready-to-run, push it onto the local RTR queue.
-        if (task_pool == TASK_POOL_COMPUTE)
-        {   // this task executes on the compute thread pool.
-            TaskQueuePush(&thread_source->ComputeWorkQueue, task_id);
-        }
-        else
-        {   // this task executes on the general thread pool.
-            TaskQueuePush(&thread_source->GeneralWorkQueue, task_id);
+    if ((task & TASK_ID_MASK_VALID_P) != 0)
+    {   // decrement the outstanding work counter on the task.
+        std::atomic<int32_t> *work_count = GetTaskWorkCount(task, thread_source->TaskSources);
+        if (GetTaskWorkCount(task, thread_source->TaskSources)->fetch_add(-1, std::memory_order_acq_rel) == 1)
+        {   // the task (and all of its children) have finished executing. 
+            // this also completes a single outstanding work item on the parent task.
+            // this may transition one or more additional tasks to a ready-to-run state.
+            TASK_DATA *t = GetTaskWorkItem(task, thread_source->TaskSources);
+            size_t count = AllowPermits(thread_source, task, permitted_compute, permitted_general);
+            return count + FinishTask(thread_source, t->ParentTask, permitted_compute, permitted_general);
         }
     }
-    return task_id;
+    return 0;
 }
 
 /// @summary Implements the entry point of a thread pool worker thread that processes compute jobs.
@@ -1783,27 +1704,496 @@ HaltScheduler
 (
     WIN32_TASK_SCHEDULER *scheduler
 )
-{   // signal all worker threads to exit, and wait for them.
-    TerminateThreadPool(&scheduler->ComputePool);
-    TerminateThreadPool(&scheduler->GeneralPool);
+{
     if (scheduler->LaunchSignal != NULL)
-    {
+    {   // signal all worker threads to exit, and wait for them.
+        TerminateThreadPool(&scheduler->ComputePool);
+        TerminateThreadPool(&scheduler->GeneralPool);
+        DeleteThreadPool(&scheduler->ComputePool);
+        DeleteThreadPool(&scheduler->GeneralPool);
         CloseHandle(scheduler->LaunchSignal);
+        ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
     }
-    DeleteThreadPool(&scheduler->ComputePool);
-    DeleteThreadPool(&scheduler->GeneralPool);
-    ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
 }
 
 /// @summary Retrieve the task source for the root thread. This function should only ever be called from the root thread (the thread that submits the root tasks.)
 /// @param scheduler The scheduler instance to query.
 /// @return A pointer to the worker state for the root thread, which can be used to spawn root tasks.
-public_function inline WIN32_TASK_SOURCE*
+public_function inline TASK_SOURCE*
 RootTaskSource
 (
     WIN32_TASK_SCHEDULER *scheduler
 )
 {
     return &scheduler->SourceList[0];
+}
+
+/// @summary Create a new task. If all dependencies have been satisfied, add the task to the ready-to-run queue.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the new task.
+/// @param task_pool One of the values of the TASK_POOL enumeration specifying the thread pool on which the task should run.
+/// @param task_main The entry point of the new task.
+/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
+/// @param args_size The size of the optional task data, in bytes.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID.
+/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
+/// @param dependency_count The number of valid task identifiers in the dependencies list.
+/// @param task_size One of the values of the TASK_SIZE enumeration specifying the approximate CPU workload of the new task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function task_id_t
+NewTask
+(
+    TASK_SOURCE       *thread_source,
+    uint32_t  const        task_pool, 
+    TASK_ENTRYPOINT        task_main, 
+    void      const       *task_args, 
+    size_t    const        args_size, 
+    task_id_t const        parent_id, 
+    task_id_t const    *dependencies, 
+    size_t    const dependency_count,
+    uint32_t  const        task_size 
+)
+{
+    if (args_size > TASK_DATA::MAX_DATA)
+    {   // too much data being passed. allocate storage elsewhere and pass in pointers.
+        ConsoleError("ERROR (%S): Argument data too large (parent %08X); specified %zu bytes, max is %zu bytes.\n", __FUNCTION__, parent_id, args_size, TASK_DATA::MAX_DATA);
+        return INVALID_TASK_ID;
+    }
+
+    // search for an available slot. this should almost always be a very short search; just one item.
+    uint32_t const  mask = thread_source->MaxTasks - 1;
+    uint32_t start_index = thread_source->TaskIndex;
+    uint32_t  task_index = thread_source->TaskIndex;
+    bool      found_slot = false;
+    do
+    {   // take the first slot with an outstanding work count of 0.
+        // note that the calling thread is the only thread that can define tasks on this TASK_SOURCE.
+        if (thread_source->WorkCounts[task_index & mask].load(std::memory_order_acquire) == 0)
+        {   // this slot is currently unused; claim it.
+            thread_source->TaskIndex = (task_index + 1) & mask;
+            found_slot = true;
+            break;
+        }
+        else 
+        {   // check the next slot in line.
+            task_index = (task_index + 1) & mask;
+        }
+    } while (!found_slot && task_index != start_index);
+
+    // ensure that a slot was claimed prior to continuing.
+    if (task_index == start_index && !found_slot)
+    {   // there are no task definition slots available on this thread.
+        ConsoleError("ERROR (%S): Out of task buffer on source %u. Increase WIN32_TASK_SCHEDULER::TasksPerBuffer.\n", __FUNCTION__, thread_source->SourceIndex);
+        return INVALID_TASK_ID;
+    }
+
+    // update parent task if creating a child task.
+    if ((parent_id & TASK_ID_MASK_VALID_P) != 0)
+    {   // increment the outstanding work counter on the parent task.
+        GetTaskWorkCount(parent_id, thread_source->TaskSources)->fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    // create the task in the claimed slot.
+    task_id_t                task_id = MakeTaskId(task_size, task_pool, task_index, thread_source->SourceIndex);
+    TASK_DATA                  &task = thread_source->WorkItems [task_index];
+    std::atomic<int32_t> &work_count = thread_source->WorkCounts[task_index];
+    PERMITS_LIST              &plist = thread_source->PermitList[task_index];
+
+    task.ParentTask = parent_id;
+    task.TaskMain   = task_main;
+    CopyMemory(task.Data, task_args, args_size);
+    work_count.store(2, std::memory_order_relaxed);
+    plist.Count.store(0, std::memory_order_relaxed);
+    if (CreatePermits(thread_source, task_id, task, dependencies, dependency_count))
+    {   // the task is ready-to-run, push it onto the local RTR queue.
+        if (task_pool == TASK_POOL_COMPUTE)
+        {   // this task executes on the compute thread pool.
+            TaskQueuePush(&thread_source->ComputeWorkQueue, task_id);
+        }
+        else
+        {   // this task executes on the general thread pool.
+            TaskQueuePush(&thread_source->GeneralWorkQueue, task_id);
+        }
+    }
+    return task_id;
+}
+
+/// @summary Creates a new task to execute on the compute thread pool.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function inline task_id_t
+NewComputeTask
+(
+    TASK_SOURCE     *thread_source, 
+    TASK_ENTRYPOINT      task_main, 
+    uint32_t const       task_size
+)
+{
+    return NewTask(thread_source, TASK_POOL_COMPUTE, task_main, NULL, 0, INVALID_TASK_ID, NULL, 0, task_size);
+}
+
+/// @summary Creates a new task to execute on the compute thread pool. The task is created as a child of another task. The parent task does not complete until all children have completed.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function inline task_id_t
+NewComputeTask
+(
+    TASK_SOURCE     *thread_source, 
+    TASK_ENTRYPOINT      task_main, 
+    task_id_t const      parent_id,
+    uint32_t  const      task_size
+)
+{
+    return NewTask(thread_source, TASK_POOL_COMPUTE, task_main, NULL, 0, parent_id, NULL, 0, task_size);
+}
+
+/// @summary Create a new task to execute on the compute thread pool. The task will not execute until all of its dependencies have completed.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
+/// @param dependency_count The number of valid task identifiers in the dependencies list.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function inline task_id_t
+NewComputeTask
+(
+    TASK_SOURCE       *thread_source, 
+    TASK_ENTRYPOINT        task_main, 
+    task_id_t const    *dependencies, 
+    size_t    const dependency_count,
+    uint32_t  const        task_size 
+)
+{
+    return NewTask(thread_source, TASK_POOL_COMPUTE, task_main, NULL, 0, INVALID_TASK_ID, dependencies, dependency_count, task_size);
+}
+
+/// @summary Create a new task to execute on the compute thread pool. The task will not execute until all of its dependencies have completed. The task is created as the child of another task. The parent task does not complete until all children have completed.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
+/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
+/// @param dependency_count The number of valid task identifiers in the dependencies list.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function inline task_id_t
+NewComputeTask
+(
+    TASK_SOURCE       *thread_source, 
+    TASK_ENTRYPOINT        task_main,
+    task_id_t const        parent_id,
+    task_id_t const    *dependencies, 
+    size_t    const dependency_count,
+    uint32_t  const        task_size 
+)
+{
+    return NewTask(thread_source, TASK_POOL_COMPUTE, task_main, NULL, 0, parent_id, dependencies, dependency_count, task_size);
+}
+
+/// @summary Create a new task to execute on the compute thread pool.
+/// @typeparam ArgsType The type of the data specifying per-task arguments.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+template <typename ArgsType>
+public_function inline task_id_t
+NewComputeTask
+(
+    TASK_SOURCE     *thread_source, 
+    TASK_ENTRYPOINT      task_main, 
+    ArgsType const      *task_args, 
+    uint32_t const       task_size
+)
+{   assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
+    return NewTask(thread_source, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, NULL, 0, task_size);
+}
+
+/// @summary Creates a new task to execute on the compute thread pool. The task is created as a child of another task. The parent task does not complete until all children have completed.
+/// @typeparam ArgsType The type of the data specifying per-task arguments.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+template <typename ArgsType>
+public_function inline task_id_t
+NewComputeTask
+(
+    TASK_SOURCE     *thread_source, 
+    TASK_ENTRYPOINT      task_main, 
+    ArgsType  const     *task_args, 
+    task_id_t const      parent_id, 
+    uint32_t  const      task_size
+)
+{   assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
+    return NewTask(thread_source, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), parent_id, NULL, 0, task_size);
+}
+
+/// @summary Create a new task to execute on the compute thread pool. The task will not execute until all of its dependencies have completed.
+/// @typeparam ArgsType The type of the data specifying per-task arguments.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
+/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
+/// @param dependency_count The number of valid task identifiers in the dependencies list.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+template <typename ArgsType>
+public_function inline task_id_t
+NewComputeTask
+(
+    TASK_SOURCE       *thread_source, 
+    TASK_ENTRYPOINT        task_main, 
+    ArgsType  const       *task_args, 
+    task_id_t const    *dependencies, 
+    size_t    const dependency_count,
+    uint32_t  const        task_size
+)
+{   assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
+    return NewTask(thread_source, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, dependencies, dependency_count, task_size);
+}
+
+/// @summary Create a new task to execute on the compute thread pool. The task will not execute until all of its dependencies have completed. The task is created as the child of another task. The parent task does not complete until all children have completed.
+/// @typeparam ArgsType The type of the data specifying per-task arguments.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
+/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
+/// @param dependency_count The number of valid task identifiers in the dependencies list.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+template <typename ArgsType>
+public_function inline task_id_t
+NewComputeTask
+(
+    TASK_SOURCE       *thread_source, 
+    TASK_ENTRYPOINT        task_main, 
+    ArgsType  const       *task_args, 
+    task_id_t const        parent_id,
+    task_id_t const    *dependencies, 
+    size_t    const dependency_count,
+    uint32_t  const        task_size
+)
+{   assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
+    return NewTask(thread_source, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), parent_id, dependencies, dependency_count, task_size);
+}
+
+/// @summary Creates a new task to execute on the general thread pool.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function inline task_id_t
+NewGeneralTask
+(
+    TASK_SOURCE     *thread_source, 
+    TASK_ENTRYPOINT      task_main, 
+    uint32_t const       task_size=TASK_SIZE_SMALL
+)
+{
+    return NewTask(thread_source, TASK_POOL_GENERAL, task_main, NULL, 0, INVALID_TASK_ID, NULL, 0, task_size);
+}
+
+/// @summary Creates a new task to execute on the general thread pool. The task is created as a child of another task. The parent task does not complete until all children have completed.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function inline task_id_t
+NewGeneralTask
+(
+    TASK_SOURCE     *thread_source, 
+    TASK_ENTRYPOINT      task_main, 
+    task_id_t const      parent_id,
+    uint32_t  const      task_size=TASK_SIZE_SMALL
+)
+{
+    return NewTask(thread_source, TASK_POOL_GENERAL, task_main, NULL, 0, parent_id, NULL, 0, task_size);
+}
+
+/// @summary Create a new task to execute on the general thread pool. The task will not execute until all of its dependencies have completed.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
+/// @param dependency_count The number of valid task identifiers in the dependencies list.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function inline task_id_t
+NewGeneralTask
+(
+    TASK_SOURCE       *thread_source, 
+    TASK_ENTRYPOINT        task_main, 
+    task_id_t const    *dependencies, 
+    size_t    const dependency_count,
+    uint32_t  const        task_size=TASK_SIZE_SMALL
+)
+{
+    return NewTask(thread_source, TASK_POOL_GENERAL, task_main, NULL, 0, INVALID_TASK_ID, dependencies, dependency_count, task_size);
+}
+
+/// @summary Create a new task to execute on the general thread pool. The task will not execute until all of its dependencies have completed. The task is created as the child of another task. The parent task does not complete until all children have completed.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
+/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
+/// @param dependency_count The number of valid task identifiers in the dependencies list.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+public_function inline task_id_t
+NewGeneralTask
+(
+    TASK_SOURCE       *thread_source, 
+    TASK_ENTRYPOINT        task_main,
+    task_id_t const        parent_id,
+    task_id_t const    *dependencies, 
+    size_t    const dependency_count,
+    uint32_t  const        task_size=TASK_SIZE_SMALL
+)
+{
+    return NewTask(thread_source, TASK_POOL_GENERAL, task_main, NULL, 0, parent_id, dependencies, dependency_count, task_size);
+}
+
+/// @summary Create a new task to execute on the general thread pool.
+/// @typeparam ArgsType The type of the data specifying per-task arguments.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+template <typename ArgsType>
+public_function inline task_id_t
+NewGeneralTask
+(
+    TASK_SOURCE     *thread_source, 
+    TASK_ENTRYPOINT      task_main, 
+    ArgsType const      *task_args, 
+    uint32_t const       task_size=TASK_SIZE_SMALL
+)
+{   assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
+    return NewTask(thread_source, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, NULL, 0, task_size);
+}
+
+/// @summary Creates a new task to execute on the general thread pool. The task is created as a child of another task. The parent task does not complete until all children have completed.
+/// @typeparam ArgsType The type of the data specifying per-task arguments.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+template <typename ArgsType>
+public_function inline task_id_t
+NewGeneralTask
+(
+    TASK_SOURCE     *thread_source, 
+    TASK_ENTRYPOINT      task_main, 
+    ArgsType  const     *task_args, 
+    task_id_t const      parent_id, 
+    uint32_t  const      task_size=TASK_SIZE_SMALL
+)
+{   assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
+    return NewTask(thread_source, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), parent_id, NULL, 0, task_size);
+}
+
+/// @summary Create a new task to execute on the general thread pool. The task will not execute until all of its dependencies have completed.
+/// @typeparam ArgsType The type of the data specifying per-task arguments.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
+/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
+/// @param dependency_count The number of valid task identifiers in the dependencies list.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+template <typename ArgsType>
+public_function inline task_id_t
+NewGeneralTask
+(
+    TASK_SOURCE       *thread_source, 
+    TASK_ENTRYPOINT        task_main, 
+    ArgsType  const       *task_args, 
+    task_id_t const    *dependencies, 
+    size_t    const dependency_count,
+    uint32_t  const        task_size=TASK_SIZE_SMALL
+)
+{   assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
+    return NewTask(thread_source, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, dependencies, dependency_count, task_size);
+}
+
+/// @summary Create a new task to execute on the general thread pool. The task will not execute until all of its dependencies have completed. The task is created as the child of another task. The parent task does not complete until all children have completed.
+/// @typeparam ArgsType The type of the data specifying per-task arguments.
+/// @param thread_source The TASK_SOURCE owned by the thread creating the task.
+/// @param task_main The function to execute representing the task entry point.
+/// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
+/// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
+/// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
+/// @param dependency_count The number of valid task identifiers in the dependencies list.
+/// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
+/// @return The identifier of the new task, or INVALID_TASK_ID.
+template <typename ArgsType>
+public_function inline task_id_t
+NewGeneralTask
+(
+    TASK_SOURCE       *thread_source, 
+    TASK_ENTRYPOINT        task_main, 
+    ArgsType  const       *task_args, 
+    task_id_t const        parent_id,
+    task_id_t const    *dependencies, 
+    size_t    const dependency_count,
+    uint32_t  const        task_size=TASK_SIZE_SMALL
+)
+{   assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
+    return NewTask(thread_source, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), parent_id, dependencies, dependency_count, task_size);
+}
+
+/// @summary Indicate that a task and all of its children have been fully defined, and allow the task to finish execution. This function must be called for each task created using NewTask or New*Task.
+/// @param thread_source The TASK_SOURCE owned by the calling thread.
+/// @param task The task identifier returned by the call to NewTask.
+/// @param permitted_compute On return, this value is incremented by the number of compute tasks that were made ready-to-run.
+/// @param permitted_general On return, this value is incremented by the number of general tasks that were made ready-to-run.
+/// @return The total number of tasks made ready-to-run.
+public_function size_t
+FinishTaskDefinition
+(
+    TASK_SOURCE *thread_source, 
+    task_id_t             task,
+    size_t  &permitted_compute, 
+    size_t  &permitted_general
+)
+{
+    return FinishTask(thread_source, task, permitted_compute, permitted_general);
+}
+
+/// @summary Wake up worker threads to process compute jobs available on a thread.
+/// @param thread_source The TASK_SOURCE of the thread that has available work in its compute work queue.
+/// @param wake_count The number of worker threads to wake.
+public_function inline void
+WakeComputePoolWorkers
+(
+    TASK_SOURCE *thread_source, 
+    size_t          wake_count
+)
+{
+    WakeWorkerThreads(thread_source->ComputePoolPort, thread_source, wake_count);
+}
+
+/// @summary Wake up worker threads to process general asynchronous jobs available on a thread.
+/// @param thread_source The TASK_SOURCE of the thread that has available work in its general work queue.
+/// @param wake_count The number of worker threads to wake.
+public_function inline void
+WakeGeneralPoolWorkers
+(
+    TASK_SOURCE *thread_source,
+    size_t          wake_count
+)
+{
+    WakeWorkerThreads(thread_source->GeneralPoolPort, thread_source, wake_count);
 }
 
