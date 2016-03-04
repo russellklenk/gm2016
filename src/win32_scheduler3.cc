@@ -12,23 +12,6 @@
 /// fixed space and time overhead (you lose a thread in the compute pool.)
 ///////////////////////////////////////////////////////////////////////////80*/
 
-// TODO(rlk): Each pool has a separate IOCP so that threads in that pool can be woken separately.
-// When a task is definied, it signals the IOCP corresponding to its pool. DONE.
-// TODO(rlk): In this revision, switch to using the same data for both types of tasks. This is 
-// possible because we'll switch to hunting for a free task in the TASK_SOURCE. This way, both
-// types of tasks support the same features and have the same data; they differ only in which 
-// pool they execute on. DONE.
-// TODO(rlk): Add explicit support for a 'batch push' mode, where new tasks are pushed to the 
-// TASK_SOURCE, but no signals are sent until all tasks have been defined. DONE.
-// TODO(rlk): Each TASK_SOURCE now has two dequeues, one for the compute pool and one for the 
-// general pool. The MPMC general task queue is no longer needed. DONE.
-// TODO(rlk): Profiling can be completely stripped out using a #define.
-// TODO(rlk): Instead of using two bits for buffer index, use those bits to represent task size.
-// The task size information can be used by a worker thread to determine how many tasks to steal
-// when the thread is woken; for example, a worker may wake and be able to steal 16 points worth
-// of work up-front to reduce queue contention. Perhaps it's worth it to steal N tasks, and if 
-// the worker actually filled its workload, post a notification to wake another thread?
-
 /*/////////////////
 //   Constants   //
 /////////////////*/
@@ -1014,16 +997,22 @@ ComputeWorkerMain
                 } while (work_load < 4);
 
                 if (more_work && work_load >= 4)
-                {   // TODO(rlk): wake another compute worker?
+                {   // there's more work remaining in our thread-local queue.
+                    // wake up another compute pool worker to start on it.
+                    DWORD error = ERROR_SUCCESS; UNUSED_LOCAL(error);
+                    WakeWorkerThreads(thread_source->ComputePoolPort, thread_source, 1, error);
                 }
             }
             if (permitted_general > 0)
-            {   // TODO(rlk): should we wake one or more general workers?
+            {   // wake up a general pool worker to process queued tasks.
+                DWORD error = ERROR_SUCCESS; UNUSED_LOCAL(error);
+                WakeWorkerThreads(thread_source->GeneralPoolPort, thread_source, 1, error);
             }
         };
     }
 
 terminate_worker:
+    ConsoleOutput("STATUS (%S): Compute worker %zu terminating.\n", __FUNCTION__, pool_index);
     return 0;
 }
 
@@ -1093,13 +1082,13 @@ GeneralWorkerMain
             }
             else
             {   // the steal attempt was unsuccessful.
+                // this could be because another thread won the race to steal.
                 steal_attempts++;
             }
-        } while (steal_attempts < 1024);
+        } while (steal_attempts < 32);
 
-        // if there's another item waiting in the victim's queue, launch another worker.
         if (more_work)
-        {
+        {   // launch another worker to pick up the next task.
             DWORD error = ERROR_SUCCESS; UNUSED_LOCAL(error);
             WakeWorkerThreads(victim->GeneralPoolPort, victim, 1, error);
         }
@@ -1116,22 +1105,24 @@ GeneralWorkerMain
             FinishTask(thread_source, task_id, permitted_compute, permitted_general);
 
             if (permitted_compute > 0)
-            {   // wake a compute worker.
-                // TODO(rlk): do it
+            {   // wake a compute worker to start any compute workload.
+                DWORD error = ERROR_SUCCESS; UNUSED_LOCAL(error);
+                WakeWorkerThreads(thread_source->ComputePoolPort, thread_source, 1, error);
             }
             if (permitted_general > 0)
-            {   // wake one or more general workers.
-                // take a task for ourself first.
+            {   // wake one or more general workers, but take a task for ourself first.
                 task_id = TaskQueueTake(&thread_source->GeneralWorkQueue, more_work);
-                if (more_work)
+                if (more_work && permitted_general > 1)
                 {   // wake another worker thread to steal from this thread while we execute task_id.
-                    // TODO(rlk): do it
+                    DWORD error = ERROR_SUCCESS; UNUSED_LOCAL(error);
+                    WakeWorkerThreads(thread_source->GeneralPoolPort, thread_source, 1, error);
                 }
             }
         }
     }
 
 terminate_worker:
+    ConsoleOutput("STATUS (%S): General worker %zu terminating.\n", __FUNCTION__, pool_index);
     return 0;
 }
 
