@@ -555,6 +555,25 @@ GetTaskWorkSize
     return ((id & TASK_ID_MASK_SIZE_P) >> TASK_ID_SHIFT_SIZE);
 }
 
+/// @summary Retrieve the number of work 'points' representing the workload of a given task.
+/// @param id The task identifier to parse.
+/// @return The number of work points assigned to the task.
+internal_function inline size_t
+GetTaskWorkPoints
+(
+    task_id_t id
+)
+{
+    switch (GetTaskWorkSize(id))
+    {
+        case TASK_SIZE_SMALL : return 1;
+        case TASK_SIZE_MEDIUM: return 2;
+        case TASK_SIZE_LARGE : return 4;
+        default: break;
+    }
+    return 0;
+}
+
 /// @summary Retrieve the work item data for a given task ID.
 /// @param task The task identifier. This function does not validate the task ID.
 /// @param source_list The list of state data associated with each task source; either WIN32_TASK_SCHEDULER::TaskSources or TASK_SOURCE::TaskSources.
@@ -623,11 +642,13 @@ TaskQueuePush
 
 /// @summary Take an item from the private end of a task queue. This function can only be called by the thread that owns the queue, and may execute concurrently with one or more steal operations.
 /// @param queue The queue from which the item will be removed.
+/// @param more_items On return, this value is set to true if there was at least one additional item in the queue after the returned item was claimed.
 /// @return The task identifier, or INVALID_TASK_ID if the queue is empty.
 internal_function task_id_t
 TaskQueueTake
 (
-    TASK_QUEUE *queue
+    TASK_QUEUE      *queue,
+    bool       *more_items
 )
 {
     int64_t b = queue->Private.load(std::memory_order_relaxed) - 1; // safe since no concurrent Push operation is allowed.
@@ -640,6 +661,7 @@ TaskQueueTake
         task_id_t task = queue->Tasks[b & queue->Mask];
         if (t != b)
         {   // there's at least one more item in the queue; no need to race.
+            more_items = true;
             return task;
         }
         // this was the last item in the queue. race to claim it.
@@ -648,10 +670,12 @@ TaskQueueTake
             task = INVALID_TASK_ID;
         }
         queue->Private.store(t + 1, std::memory_order_relaxed);
+        more_items = false;
         return task;
     }
     else
     {   // the queue is currently empty.
+        more_items = false;
         queue->Private.store(t, std::memory_order_relaxed);
         return INVALID_TASK_ID;
     }
@@ -659,11 +683,13 @@ TaskQueueTake
 
 /// @summary Attempt to steal an item from the public end of the queue. This function can be called by any thread EXCEPT the thread that owns the queue, and may execute concurrently with a push or take operation, and one or more steal operations.
 /// @param queue The queue from which the item will be removed.
+/// @param more_items On return, this value is set to true if there was at least one additional item in the queue after the returned item was claimed.
 /// @return The task identifier, or INVALID_TASK_ID if the queue is empty or the calling thread lost the race for the last item.
 internal_function task_id_t
 TaskQueueSteal
 (
-    TASK_QUEUE *queue
+    TASK_QUEUE     *queue, 
+    bool       more_items
 )
 {
     int64_t t = queue->Public.load(std::memory_order_acquire);
@@ -676,14 +702,20 @@ TaskQueueSteal
         // race with other threads to claim the item.
         if (queue->Public.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst, std::memory_order_relaxed))
         {   // the calling thread won the race and claimed the item.
+            more_items = (t != b);
             return task;
         }
         else
         {   // the calling thread lost the race and should try again.
+            more_items = false;
             return INVALID_TASK_ID;
         }
     }
-    else return INVALID_TASK_ID; // the queue is currently empty.
+    else
+    {   // the queue is currently empty.
+        more_items = false;
+        return INVALID_TASK_ID;
+    }
 }
 
 /// @summary Reset a task queue to empty.
@@ -864,17 +896,23 @@ FinishTask
 /// @param argp A pointer to the WIN32_WORKER_THREAD instance specifying thread state.
 /// @return The thread exit code (unused).
 internal_function unsigned int __cdecl
-CompueWorkerMain
+ComputeWorkerMain
 (
     void *argp
 )
 {
     WIN32_WORKER_THREAD *thread_data = (WIN32_WORKER_THREAD*) argp;
+    WIN32_THREAD_ARGS     *main_args =  thread_data->ThreadPool->MainThreadArgs;
     WIN32_THREAD_POOL   *thread_pool =  thread_data->ThreadPool;
     MEMORY_ARENA       *thread_arena =  thread_data->ThreadArena;
     TASK_SOURCE       *thread_source =  thread_data->ThreadSource;
     std::atomic<int32_t>  *terminate =  thread_data->TerminateFlag;
     size_t                pool_index =  thread_data->PoolIndex;
+    size_t                task_count =  0;  // number of task IDs in task_ids
+    size_t                 work_load =  0;  // number of workload points claimed in task_ids
+    size_t            steal_attempts =  0;  // number of unsuccessful attempts to steal work, since the most recent success
+    task_id_t            task_ids[4] =  {}; // IDs of ready-to-run tasks, task_count are valid
+    bool                   more_work =  false;
 
     // indicate to the coordinator thread that this worker is ready-to-run.
     SetEvent(thread_data->ReadySignal);
@@ -904,7 +942,85 @@ CompueWorkerMain
             {   // termination was signaled; shut down normally.
                 goto terminate_worker;
             }
+            // TODO(rlk): process any other general notifications here.
+            continue;
         }
+
+        // attempt to steal some work from the victim. try to steal several 
+        // tasks at once to reduce queue contention, but don't take too much 
+        // work, since that would unnecessarily delay execution.
+        steal_attempts = 0;
+        task_count     = 0;
+        work_load      = 0;
+        more_work      = false;
+        do
+        {   task_id_t id = TaskQueueSteal(&victim->ComputeWorkQueue, more_work);
+            if (IsValidTask(id))
+            {   // the task is valid, so update the current workload based on its size.
+                // reset the counter tracking unsuccessful steal attempts.
+                work_load += GetTaskWorkPoints(id);
+                task_ids[task_count++] = id;
+                steal_attempts = 0;
+            }
+            else
+            {   // the task ID is not valid, which means that the queue was empty.
+                // if we've already stolen some work, that's good enough. otherwise, 
+                // spin for very short while to see of additional work shows up - 
+                // it's possible that this thread just lost the race for an item.
+                if (work_load > 0) break;
+                else steal_attempts++;
+            }
+        } while (work_load < 4 && steal_attempts < 32)
+
+        // this thread is done accessing the victim's compute work queue 
+        // for the time being. is there still work remaining?
+        if (more_work)
+        {   // there was still work remaining in the victim's work queue.
+            // wake up a single thread only to minimize queue contention.
+            DWORD error = ERROR_SUCCESS; UNUSED_LOCAL(error);
+            WakeWorkerThreads(victim->ComputePoolPort, victim, 1, error);
+        }
+
+        // execute the work that was just stolen.
+        while (task_count > 0)
+        {   // execute the tasks in the local work list.
+            WIN32_TASK_SCHEDULER  *s = thread_pool->TaskScheduler;
+            WIN32_THREAD_ARGS     *a = thread_pool->MainThreadArgs;
+            size_t permitted_compute = 0; // the # of compute tasks made ready-to-run by executing these tasks.
+            size_t permitted_general = 0; // the # of general tasks made ready-to-run by executing these tasks.
+            for (size_t i = 0; i < task_count; ++i)
+            {
+                ArenaReset(thread_arena);
+                TASK_DATA *td = GetTaskWorkItem(task_ids[i], thread_source->TaskSources);
+                td->TaskMain(task_ids[i], thread_source, td, thread_arena, a, s);
+                FinishTask(thread_source, task_ids[i], permitted_compute, permitted_general);
+            }
+            
+            // the work just executed may have resulted in additional tasks being created.
+            if (permitted_compute > 0)
+            {   // attempt to take tasks from the private end of this thread's work queue.
+                // this is similar to the work stealing performed above.
+                task_count = 0;
+                work_load  = 0;
+                more_work  = false;
+                do
+                {   task_id_t id = TaskQueueTake(&thread_source->ComputeWorkQueue, more_work);
+                    if (IsValidTask(id))
+                    {   // the task is valid, so update the current workload based on its size.
+                        work_load += GetTaskWorkPoints(id);
+                        task_ids[task_count++] = id;
+                    }
+                    else break; // no work remaining in our thread-local queue.
+                } while (work_load < 4);
+
+                if (more_work && work_load >= 4)
+                {   // TODO(rlk): wake another compute worker?
+                }
+            }
+            if (permitted_general > 0)
+            {   // TODO(rlk): should we wake one or more general workers?
+            }
+        };
     }
 
 terminate_worker:
@@ -926,6 +1042,9 @@ GeneralWorkerMain
     TASK_SOURCE       *thread_source =  thread_data->ThreadSource;
     std::atomic<int32_t>  *terminate =  thread_data->TerminateFlag;
     size_t                pool_index =  thread_data->PoolIndex;
+    size_t            steal_attempts =  0;
+    task_id_t                task_id =  INVALID_TASK_ID;
+    bool                   more_work =  false;
 
     // indicate to the coordinator thread that this worker is ready-to-run.
     SetEvent(thread_data->ReadySignal);
@@ -948,12 +1067,66 @@ GeneralWorkerMain
     // other threads may wake this worker if they have work items that can be stolen.
     for ( ; ; )
     {   // wait until someone has work available for this thread to attempt to steal.
+        WIN32_TASK_SCHEDULER *s = thread_pool->TaskScheduler;
+        WIN32_THREAD_ARGS    *a = thread_pool->MainThreadArgs;
         TASK_SOURCE *victim = WorkerThreadWaitForWakeup(thread_pool, pool_index);
         if (victim == NULL)
         {   // this is just a general notification. check for a termination signal.
             if (terminate->load(std::memory_order_seq_cst) != 0)
             {   // termination was signaled; shut down normally.
                 goto terminate_worker;
+            }
+            // TODO(rlk): process any other general notifications here.
+            continue;
+        }
+
+        // general workers are less aggressive than compute workers.
+        // they should not attempt to steal more than one task at a time.
+        steal_attempts = 0;
+        more_work  = false;
+        do
+        {   // attempt to steal a single task from the victim queue.
+            task_id = TaskQueueSteal(&victim->GeneralWorkQueue, more_work);
+            if (IsValidTask(task_id))
+            {   // the steal attempt was successful.
+                break;
+            }
+            else
+            {   // the steal attempt was unsuccessful.
+                steal_attempts++;
+            }
+        } while (steal_attempts < 1024);
+
+        // if there's another item waiting in the victim's queue, launch another worker.
+        if (more_work)
+        {
+            DWORD error = ERROR_SUCCESS; UNUSED_LOCAL(error);
+            WakeWorkerThreads(victim->GeneralPoolPort, victim, 1, error);
+        }
+
+        // if a task was successfully stolen from the victim, execute it.
+        while (IsValidTask(task_id))
+        {   // execute the task retrieved from the queue.
+            size_t permitted_compute = 0; // the # of compute tasks made ready-to-run by executing this task.
+            size_t permitted_general = 0; // the # of general tasks made ready-to-run by executing this task.
+            TASK_DATA            *td = GetTaskWorkItem(task_id, thread_source->TaskSources);
+
+            ArenaReset(thread_arena);
+            td->TaskMain(task_id, thread_source, td, thread_arena, a, s);
+            FinishTask(thread_source, task_id, permitted_compute, permitted_general);
+
+            if (permitted_compute > 0)
+            {   // wake a compute worker.
+                // TODO(rlk): do it
+            }
+            if (permitted_general > 0)
+            {   // wake one or more general workers.
+                // take a task for ourself first.
+                task_id = TaskQueueTake(&thread_source->GeneralWorkQueue, more_work);
+                if (more_work)
+                {   // wake another worker thread to steal from this thread while we execute task_id.
+                    // TODO(rlk): do it
+                }
             }
         }
     }
@@ -1677,7 +1850,7 @@ CreateScheduler
 
     // initialize, but do not launch, the compute task thread pool.
     compute_config.TaskScheduler     = scheduler;
-    compute_config.ThreadMain        = ComputeWorkerMain;
+    compute_config.ThreadMain        = CompueWorkerMain;
     compute_config.MainThreadArgs    = valid_config.MainThreadArgs;
     compute_config.MinThreads        = valid_config.PoolSize[TASK_POOL_COMPUTE].MinThreads;
     compute_config.MaxThreads        = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxThreads;
