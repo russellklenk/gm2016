@@ -974,43 +974,52 @@ ComputeWorkerMain
             size_t permitted_compute = 0; // the # of compute tasks made ready-to-run by executing these tasks.
             size_t permitted_general = 0; // the # of general tasks made ready-to-run by executing these tasks.
             for (size_t i = 0; i < task_count; ++i)
-            {
+            {   // execute the task in a fresh execution environment.
+                size_t nc = 0; // # of compute tasks made ready-to-run by this task.
+                size_t ng = 0; // # of general tasks made ready-to-run by this task.
                 ArenaReset(thread_arena);
                 TASK_DATA *td = GetTaskWorkItem(task_ids[i], thread_source->TaskSources);
                 td->TaskMain(task_ids[i], thread_source, td, thread_arena, a, s);
-                FinishTask(thread_source, task_ids[i], permitted_compute, permitted_general);
-            }
-
-            // all of the current work has completed.
-            task_count = 0;
-            work_load  = 0;
-            more_work  = false;
-            
-            // the work just executed may have resulted in additional tasks being created.
-            if (permitted_compute > 0)
-            {   // attempt to take tasks from the private end of this thread's work queue.
-                // this is similar to the work stealing performed above.
-                do
-                {   task_id_t id = TaskQueueTake(&thread_source->ComputeWorkQueue, more_work);
-                    if (IsValidTask(id))
-                    {   // the task is valid, so update the current workload based on its size.
-                        work_load += GetTaskWorkPoints(id);
-                        task_ids[task_count++] = id;
-                    }
-                    else break; // no work remaining in our thread-local queue.
-                } while (work_load < 4);
-
-                if (more_work && work_load >= 4)
-                {   // there's more work remaining in our thread-local queue.
-                    // wake up another compute pool worker to start on it.
+                FinishTask(thread_source, task_ids[i], nc, ng);
+                permitted_compute += nc; 
+                permitted_general += ng;
+                // the task just executed may have resulted in additional tasks being created, 
+                // or allowed one or more tasks to become ready-to-run. wake workers to run them, 
+                // unless this is the last stolen task, in which case this thread will try first.
+                if (nc > 0 && i != (task_count - 1))
+                {   // wake a compute worker to steal some tasks.
                     DWORD error = ERROR_SUCCESS; UNUSED_LOCAL(error);
                     WakeWorkerThreads(thread_source->ComputePoolPort, thread_source, 1, error);
                 }
+                // always wake a general worker, since this thread can never execute general tasks.
+                if (ng > 0)
+                {   // wake a general worker to steal some tasks.
+                    DWORD error = ERROR_SUCCESS; UNUSED_LOCAL(error);
+                    WakeWorkerThreads(thread_source->GeneralPoolPort, thread_source, 1, error);
+                }
             }
-            if (permitted_general > 0)
-            {   // wake up a general pool worker to process queued tasks.
+
+            // all of the current work has completed. can this thread take any more 
+            // from its local queue before possibly going back to sleep?
+            task_count = 0;
+            work_load  = 0;
+            more_work  = false;
+            do
+            {   task_id_t id = TaskQueueTake(&thread_source->ComputeWorkQueue, more_work);
+                if (IsValidTask(id))
+                {   // the task is valid, so update the current workload based on its size.
+                    work_load += GetTaskWorkPoints(id);
+                    task_ids[task_count++] = id;
+                }
+                else break; // no work remaining in our thread-local queue.
+            } while (work_load < 4);
+
+            // if there's more work remaining in the local compute queue, wake a worker.
+            if (more_work)
+            {   // there's more work remaining in our thread-local queue.
+                // wake up another compute pool worker to start on it.
                 DWORD error = ERROR_SUCCESS; UNUSED_LOCAL(error);
-                WakeWorkerThreads(thread_source->GeneralPoolPort, thread_source, 1, error);
+                WakeWorkerThreads(thread_source->ComputePoolPort, thread_source, 1, error);
             }
         };
     }

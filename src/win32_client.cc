@@ -213,6 +213,7 @@ AsyncLaunchesComputeTaskMain
     ASYNC_TASK_DATA *args = (ASYNC_TASK_DATA*) task_data->Data;
     size_t    count     = Megabytes(5);
     uint8_t  *array     = PushArray<uint8_t>(thread_arena, count);
+    HANDLE       ev     = CreateEvent(NULL, FALSE, FALSE, NULL);
     
     // set up a local batch used to create new tasks.
     // the batch is automatically flushed as-needed and when it goes out of scope.
@@ -221,10 +222,14 @@ AsyncLaunchesComputeTaskMain
         NewTaskBatch(&b, thread_source);
         LAUNCH_TASK_DATA ld = { array, count, 1024 };
         task_id_t launch_id = NewComputeTask(&b, LaunchTaskMain, &ld, TASK_SIZE_SMALL);
-        FENCE_TASK_DATA  fd = { array, count, args->Signal };
+        FENCE_TASK_DATA  fd = { array, count, ev };
         task_id_t finish_id = NewComputeTask(&b, FenceTaskMain , &fd, &launch_id, 1, TASK_SIZE_LARGE);
         UNUSED_LOCAL(finish_id);
     }
+
+    WaitForSingleObject(ev, INFINITE);
+    CloseHandle(ev);
+    SetEvent(args->Signal);
 }
 
 /// @summary Initializes a command line arguments definition with the default program configuration.
@@ -707,6 +712,7 @@ WinMain
         TASK_BATCH    b  = {};
         NewTaskBatch(&b, RootTaskSource(&task_scheduler));
 
+        /*
         LAUNCH_TASK_DATA launch_data = { workspace, workspace_size, 2048 };
         FENCE_TASK_DATA   fence_data = { workspace, workspace_size, ev_fence };
         task_id_t        launch_task = NewComputeTask(&b, LaunchTaskMain, &launch_data, TASK_SIZE_SMALL);
@@ -714,13 +720,14 @@ WinMain
         FlushTaskBatch(&b);
         WaitForSingleObject(ev_fence, INFINITE);
         UNUSED_LOCAL(finish_task);
+        */
 
-        /*ASYNC_TASK_DATA ad = { ev_fence };
+        ASYNC_TASK_DATA ad = { ev_fence };
         task_id_t async_id = NewGeneralTask(&b, AsyncLaunchesComputeTaskMain, &ad);
         UNUSED_LOCAL(async_id);
         FlushTaskBatch(&b);
         WaitForSingleObject(ev_fence, INFINITE);
-        UNUSED_LOCAL(workspace);*/
+        UNUSED_LOCAL(workspace);
 
         // all of the work for this thread for the current tick has completed.
         if ((actual_tick_finish = TimestampInNanoseconds()) < predicted_tick_launch)
