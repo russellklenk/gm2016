@@ -88,82 +88,82 @@ struct ASYNC_TASK_DATA
 internal_function void
 TestTaskMain
 (
-    task_id_t                    id,
-    WIN32_TASK_SOURCE       *source, 
-    COMPUTE_TASK_DATA         *task, 
-    MEMORY_ARENA             *arena, 
-    WIN32_THREAD_ARGS    *main_args,
-    WIN32_TASK_SCHEDULER *scheduler
+    task_id_t                  task_id,
+    TASK_SOURCE         *thread_source, 
+    TASK_DATA               *task_data, 
+    MEMORY_ARENA         *thread_arena, 
+    WIN32_THREAD_ARGS       *main_args,
+    WIN32_TASK_SCHEDULER    *scheduler
 )
 {
-    UNUSED_ARG(id);
-    UNUSED_ARG(source);
-    UNUSED_ARG(arena);
+    UNUSED_ARG(task_id);
+    UNUSED_ARG(thread_source);
+    UNUSED_ARG(thread_arena);
     UNUSED_ARG(main_args);
     UNUSED_ARG(scheduler);
 
-    /*TEST_TASK_DATA *args = (TEST_TASK_DATA*) task->Data;
+    TEST_TASK_DATA *args = (TEST_TASK_DATA*) task_data->Data;
     for (size_t i = args->Index, e = args->Index + args->Count; i < e; ++i)
     {
         args->Array[i] = 1;
-    }*/
-    UNUSED_ARG(task);
+    }
+    UNUSED_ARG(task_data);
 }
 
 internal_function void
 LaunchTaskMain
 (
-    task_id_t                    id,
-    WIN32_TASK_SOURCE       *source, 
-    COMPUTE_TASK_DATA         *task, 
-    MEMORY_ARENA             *arena, 
-    WIN32_THREAD_ARGS    *main_args,
-    WIN32_TASK_SCHEDULER *scheduler
+    task_id_t                  task_id,
+    TASK_SOURCE         *thread_source, 
+    TASK_DATA               *task_data, 
+    MEMORY_ARENA         *thread_arena, 
+    WIN32_THREAD_ARGS       *main_args,
+    WIN32_TASK_SCHEDULER    *scheduler
 )
 {
-    UNUSED_ARG(arena);
+    UNUSED_ARG(thread_arena);
     UNUSED_ARG(main_args);
     UNUSED_ARG(scheduler);
     
-    LAUNCH_TASK_DATA *args = (LAUNCH_TASK_DATA*) task->Data;
-    ZeroMemory(args->Array,args->Count * sizeof(uint8_t));
-    int job_count = 0;
-    for (size_t i = 0; i < args->Count; ++job_count)
+    TASK_BATCH           b = {};
+    LAUNCH_TASK_DATA *args = (LAUNCH_TASK_DATA*) task_data->Data;
+    ZeroMemory(args->Array , args->Count * sizeof(uint8_t));
+    NewTaskBatch(&b, thread_source);
+    for (size_t i = 0; i < args->Count; /* empty */)
     {   // each child task will set up to 64 consecutive values to 1.
         // this should prevent cache contention between tasks.
         size_t         n = (args->Count- i) >= args->Divisor ? args->Divisor : (args->Count - i);
         TEST_TASK_DATA a = {args->Array, i, n};
-        task_id_t  child =  NewChildTask(source, TestTaskMain, &a, sizeof(TEST_TASK_DATA), id);
-        FinishComputeTask(source, child);
+        task_id_t  child =  NewComputeTask(&b, TestTaskMain, &a, task_id, TASK_SIZE_SMALL);
+        UNUSED_LOCAL(child);
         i += n;
     }
-    SignalWaitingWorkers(source, job_count);
 }
 
 internal_function void
 FenceTaskMain
 (
-    task_id_t                    id,
-    WIN32_TASK_SOURCE       *source, 
-    COMPUTE_TASK_DATA         *task, 
-    MEMORY_ARENA             *arena, 
-    WIN32_THREAD_ARGS    *main_args,
-    WIN32_TASK_SCHEDULER *scheduler
+    task_id_t                  task_id,
+    TASK_SOURCE         *thread_source, 
+    TASK_DATA               *task_data, 
+    MEMORY_ARENA         *thread_arena, 
+    WIN32_THREAD_ARGS       *main_args,
+    WIN32_TASK_SCHEDULER    *scheduler
 )
 {
-    UNUSED_ARG(id);
-    UNUSED_ARG(source);
-    UNUSED_ARG(arena);
+    UNUSED_ARG(task_id);
+    UNUSED_ARG(thread_source);
+    UNUSED_ARG(thread_arena);
     UNUSED_ARG(main_args);
     UNUSED_ARG(scheduler);
     
-    FENCE_TASK_DATA *args = (FENCE_TASK_DATA*) task->Data;
-    /*bool               ok =  true;
+    FENCE_TASK_DATA *args = (FENCE_TASK_DATA*) task_data->Data;
+    bool               ok =  true;
     for (size_t i = 0,  n =  args->Count; i < n; ++i)
     {
         if (args->Array[i] != 1)
             ok = false;
-    }*/
+    }
     //if (ok) ConsoleOutput("All tasks completed successfully!\n");
     //else ConsoleOutput("One or more tasks failed.\n");
     SetEvent(args->Signal);
@@ -172,71 +172,59 @@ FenceTaskMain
 internal_function void
 GeneralTaskMain
 (
-    task_id_t                    id,
-    WIN32_TASK_SOURCE       *source, 
-    GENERAL_TASK_DATA         *task, 
-    MEMORY_ARENA             *arena, 
-    WIN32_THREAD_ARGS    *main_args,
-    WIN32_TASK_SCHEDULER *scheduler
+    task_id_t                  task_id,
+    TASK_SOURCE         *thread_source, 
+    TASK_DATA               *task_data, 
+    MEMORY_ARENA         *thread_arena, 
+    WIN32_THREAD_ARGS       *main_args,
+    WIN32_TASK_SCHEDULER    *scheduler
 )
 {
-    UNUSED_ARG(id);
-    UNUSED_ARG(source);
-    UNUSED_ARG(arena);
+    UNUSED_ARG(task_id);
+    UNUSED_ARG(thread_source);
+    UNUSED_ARG(thread_arena);
     UNUSED_ARG(main_args);
     UNUSED_ARG(scheduler);
-    ASYNC_TASK_DATA *args = (ASYNC_TASK_DATA*) task->Data;
-    SetEvent(args->Signal);
+    ASYNC_TASK_DATA *args = (ASYNC_TASK_DATA*) task_data->Data;
+    uint64_t tss = TimestampInTicks();
+    WaitForSingleObject(args->Signal, INFINITE);
+    uint64_t tse = TimestampInTicks();
+    uint64_t  dt = ElapsedNanoseconds(tss, tse);
+    ConsoleOutput("STATUS (%S): Waited %0.03fms.\n", __FUNCTION__, dt / 1000000.0);
 }
 
 internal_function void
 AsyncLaunchesComputeTaskMain
 (
-    task_id_t                    id,
-    WIN32_TASK_SOURCE       *source, 
-    GENERAL_TASK_DATA         *task, 
-    MEMORY_ARENA             *arena, 
-    WIN32_THREAD_ARGS    *main_args,
-    WIN32_TASK_SCHEDULER *scheduler
+    task_id_t                  task_id,
+    TASK_SOURCE         *thread_source, 
+    TASK_DATA               *task_data, 
+    MEMORY_ARENA         *thread_arena, 
+    WIN32_THREAD_ARGS       *main_args,
+    WIN32_TASK_SCHEDULER    *scheduler
 )
-{   UNUSED_ARG(id);
+{   UNUSED_ARG(task_id);
     UNUSED_ARG(scheduler);
     UNUSED_ARG(main_args);
+
     // allocate some thread-local memory. up to 8MB are available.
     // this memory is automatically freed when the task entrypoint exits.
     // TODO(rlk): provide a function to get the maximum memory that can be allocated.
-    ASYNC_TASK_DATA *args = (ASYNC_TASK_DATA*) task->Data;
-    uint64_t  def_tss   = TimestampInTicks();
+    ASYNC_TASK_DATA *args = (ASYNC_TASK_DATA*) task_data->Data;
     size_t    count     = Megabytes(5);
-    uint8_t  *array     = PushArray<uint8_t>(arena, count);
-    LAUNCH_TASK_DATA ld = { array, count, 1024 };
-    task_id_t launch_id = NewComputeTask(source, LaunchTaskMain, &ld, sizeof(ld));
-    HANDLE    finish_ev = CreateEvent(NULL, TRUE, FALSE, NULL);
-    FENCE_TASK_DATA  fd = { array, count, finish_ev };
-    task_id_t  fence_id = NewComputeTask(source, FenceTaskMain , &fd, sizeof(fd), launch_id);
-    FinishComputeTask(source, launch_id);
-    FinishComputeTask(source,  fence_id);
-    SignalWaitingWorkers(source, 2);
-    uint64_t  def_tse   = TimestampInTicks();
-
-    WaitForSingleObject(finish_ev, INFINITE);
-    uint64_t  work_tse  = TimestampInTicks();
-
-    ResetEvent(finish_ev);
-    ASYNC_TASK_DATA   ad = { finish_ev };
-    task_id_t general_id = NewGeneralTask(source, GeneralTaskMain, &ad, sizeof(ad));
-    UNUSED_LOCAL(general_id);
-
-    WaitForSingleObject(finish_ev, INFINITE);
-    uint64_t async_tse  = TimestampInTicks();
-
-    uint64_t def_ns = ElapsedNanoseconds(def_tss, def_tse);
-    uint64_t work_ns = ElapsedNanoseconds(def_tse, work_tse); // ish
-    uint64_t async_ns = ElapsedNanoseconds(work_tse, async_tse); // ish
-    ConsoleOutput("STATUS (%S): Define - %0.03fms Work - %0.03fms Async - %0.03f\n", __FUNCTION__, def_ns / 1000000.0, work_ns / 1000000.0, async_ns / 1000000.0);
-    CloseHandle(finish_ev);
-
-    SetEvent(args->Signal);
+    uint8_t  *array     = PushArray<uint8_t>(thread_arena, count);
+    
+    // set up a local batch used to create new tasks.
+    // the batch is automatically flushed as-needed and when it goes out of scope.
+    {   
+        TASK_BATCH    b = {};
+        NewTaskBatch(&b, thread_source);
+        LAUNCH_TASK_DATA ld = { array, count, 1024 };
+        task_id_t launch_id = NewComputeTask(&b, LaunchTaskMain, &ld, TASK_SIZE_SMALL);
+        FENCE_TASK_DATA  fd = { array, count, args->Signal };
+        task_id_t finish_id = NewComputeTask(&b, FenceTaskMain , &fd, &launch_id, 1, TASK_SIZE_LARGE);
+        UNUSED_LOCAL(finish_id);
+    }
 }
 
 /// @summary Initializes a command line arguments definition with the default program configuration.
@@ -562,8 +550,8 @@ WinMain
     size_t   const                main_arena_size = Megabytes(256);
     size_t   const              default_alignment = std::alignment_of<void*>::value;
 
-    size_t const                   workspace_size = 65535;
-    uint8_t             workspace[workspace_size] = {};
+    size_t const                   workspace_size = Megabytes(16);
+    uint8_t                            *workspace = NULL;
 
     UNUSED_ARG(prev_instance);
     UNUSED_ARG(command_line);
@@ -591,6 +579,8 @@ WinMain
         DebugPrintf(_T("ERROR: Unable to initialize the global memory arena.\n"));
         goto cleanup_and_shutdown;
     }
+
+    workspace = PushArray<uint8_t>(&main_arena, workspace_size);
 
     // initialize low-level services for timing, user input, etc.
     // initialize the data that is available to all worker threads.
@@ -714,29 +704,30 @@ WinMain
 
         // work work work
         ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %I64dns (%0.06fms).\n", NanosecondsToWholeMilliseconds(actual_tick_launch) / 1000.0, NanosecondsToWholeMilliseconds(predicted_tick_launch) / 1000.0, tick_miss_time, tick_miss_time / 1000000.0);
-        WIN32_TASK_SOURCE      *root = RootTaskSource(&task_scheduler);
-        LAUNCH_TASK_DATA launch_data = { workspace, workspace_size, 64 };
-        FENCE_TASK_DATA   fence_data = { workspace, workspace_size, ev_fence };
-        task_id_t        launch_task = NewComputeTask(root, LaunchTaskMain, &launch_data, sizeof(LAUNCH_TASK_DATA));
-        task_id_t         fence_task = NewComputeTask(root, FenceTaskMain ,  &fence_data, sizeof(FENCE_TASK_DATA), launch_task);
-        FinishComputeTask(root, fence_task);
-        FinishComputeTask(root, launch_task);
-        SignalWaitingWorkers(root, 2);
-        WaitForSingleObject(ev_fence, INFINITE);
+        TASK_BATCH    b  = {};
+        NewTaskBatch(&b, RootTaskSource(&task_scheduler));
 
-        //
-        ASYNC_TASK_DATA ad = { ev_fence };
-        task_id_t async_id = NewGeneralTask(root, AsyncLaunchesComputeTaskMain, &ad, sizeof(ad));
-        UNUSED_LOCAL(async_id);
+        LAUNCH_TASK_DATA launch_data = { workspace, workspace_size, 2048 };
+        FENCE_TASK_DATA   fence_data = { workspace, workspace_size, ev_fence };
+        task_id_t        launch_task = NewComputeTask(&b, LaunchTaskMain, &launch_data, TASK_SIZE_SMALL);
+        task_id_t        finish_task = NewComputeTask(&b,  FenceTaskMain,  &fence_data, &launch_task, 1, TASK_SIZE_LARGE);
+        FlushTaskBatch(&b);
         WaitForSingleObject(ev_fence, INFINITE);
-        UNUSED_LOCAL(workspace);
+        UNUSED_LOCAL(finish_task);
+
+        /*ASYNC_TASK_DATA ad = { ev_fence };
+        task_id_t async_id = NewGeneralTask(&b, AsyncLaunchesComputeTaskMain, &ad);
+        UNUSED_LOCAL(async_id);
+        FlushTaskBatch(&b);
+        WaitForSingleObject(ev_fence, INFINITE);
+        UNUSED_LOCAL(workspace);*/
 
         // all of the work for this thread for the current tick has completed.
         if ((actual_tick_finish = TimestampInNanoseconds()) < predicted_tick_launch)
         {   // this tick has finished early. how long should we sleep for?
             if ((wait_time = NanosecondsToWholeMilliseconds(predicted_tick_launch - actual_tick_finish)) > 1)
             {   // put the thread to sleep for at least 1ms.
-                //ConsoleOutput("Sleep for at least %ums.\n", wait_time);
+                ConsoleOutput("Sleep for at least %ums.\n", wait_time);
                 Sleep(wait_time);
             }
         }
