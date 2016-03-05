@@ -278,6 +278,7 @@ struct WIN32_THREAD_POOL_CONFIG
     size_t                   MaxThreads;         /// The maximum number of active worker threads in the pool.
     size_t                   WorkerArenaSize;    /// The number of bytes of thread-local memory to allocate for each active thread.
     size_t                   WorkerSourceIndex;  /// The zero-based index of the first WIN32_TASK_SOURCE in the scheduler allocated to the pool.
+    HANDLE                   CompletionPort;     /// The completion port used to send notifications to worker threads.
     HANDLE                   LaunchSignal;       /// Signal set by the coordinator to allow all active worker threads to start running.
     uint32_t                 WorkerFlags;        /// The WORKER_FLAGS to apply to worker threads in the pool.
 };
@@ -289,8 +290,10 @@ struct WIN32_TASK_SCHEDULER
     size_t                   SourceCount;        /// The number of allocated compute task sources.
     TASK_SOURCE             *TaskSources;        /// The data associated with each compute task source. SourceCount are currently valid.
     HANDLE                   LaunchSignal;       /// Manual-reset event signaled when worker threads should start running tasks.
-    WIN32_THREAD_POOL        GeneralPool;        /// The thread pool used for running light-work asynchronous tasks.
+    HANDLE                   ComputePoolPort;    /// The I/O completion port used to send notifications to worker threads in the compute pool.
     WIN32_THREAD_POOL        ComputePool;        /// The thread pool used for running work-heavy, non-blocking tasks.
+    HANDLE                   GeneralPoolPort;    /// The I/O completion port used to send notifications to worker threads in the general pool.
+    WIN32_THREAD_POOL        GeneralPool;        /// The thread pool used for running light-work asynchronous tasks.
 };
 
 /// @summary Define the user-facing thread pool configuration data.
@@ -343,16 +346,17 @@ SpawnWorkerThread
     }
 
     // initialize the state passed to the worker thread.
-    WIN32_WORKER_THREAD   *thread = &thread_pool->WorkerState[pool_index];
-    thread->ThreadPool   = thread_pool;
-    thread->ThreadArena  =&thread_pool->WorkerArena [pool_index];
-    thread->ThreadSource = thread_pool->WorkerSource[pool_index];
-    thread->ReadySignal  = worker_ready;
-    thread->PoolIndex    = pool_index;
-    thread->WorkerFlags  = worker_flags;
+    WIN32_WORKER_THREAD    *thread = &thread_pool->WorkerState[pool_index];
+    thread->ThreadPool    = thread_pool;
+    thread->ThreadArena   =&thread_pool->WorkerArena [pool_index];
+    thread->ThreadSource  = thread_pool->WorkerSource[pool_index];
+    thread->ReadySignal   = worker_ready;
+    thread->TerminateFlag =&thread_pool->TerminateFlag;
+    thread->PoolIndex     = pool_index;
+    thread->WorkerFlags   = worker_flags;
 
     // spawn the worker thread. _beginthreadex ensures the CRT is properly initialized.
-    if ((thread_handle = (HANDLE)_beginthreadex(NULL, 0, thread_pool->WorkerMain, thread_state, 0, &thread_id)) == NULL)
+    if ((thread_handle = (HANDLE)_beginthreadex(NULL, 0, thread_pool->WorkerMain, thread, 0, &thread_id)) == NULL)
     {   // unable to spawn the worker thread. let the caller decide if they want to terminate everybody.
         ConsoleError("ERROR (%S): Thread creation failed (errno = %d).\n", __FUNCTION__, errno);
         CloseHandle(worker_ready);
@@ -586,7 +590,7 @@ GetTaskWorkCount
 {
     uint32_t const source_index = (task & TASK_ID_MASK_SOURCE_P) >> TASK_ID_SHIFT_SOURCE;
     uint32_t const   task_index = (task & TASK_ID_MASK_INDEX_P ) >> TASK_ID_SHIFT_INDEX;
-    return &source_list[source_index].WorkCounts[task_index];
+    return &source_list[source_index].WorkCount[task_index];
 }
 
 /// @summary Retrieve the list of permits for a given task ID.
@@ -631,7 +635,7 @@ internal_function task_id_t
 TaskQueueTake
 (
     TASK_QUEUE      *queue,
-    bool       *more_items
+    bool       &more_items
 )
 {
     int64_t b = queue->Private.load(std::memory_order_relaxed) - 1; // safe since no concurrent Push operation is allowed.
@@ -760,7 +764,7 @@ CreatePermits
     TASK_SOURCE     *thread_source, 
     task_id_t                 task, 
     TASK_DATA           *work_item, 
-    task_id_t const           deps,
+    task_id_t const          *deps,
     size_t    const     deps_count
 )
 {   // require an extra permit token, which is removed at the end of the function.
@@ -788,7 +792,7 @@ CreatePermits
                 ConsoleError("ERROR (%S): Exceeded max permits on task %08X when defining task %08X (parent %08X).\n", __FUNCTION__, deps[i], task, work_item->ParentTask);
                 assert(n < PERMITS_LIST::MAX_TASKS);
             }
-        } while (plist->Count.compare_exchange_weak(n, n+1, std::memory_order_acq_rel, std::memory_order_relaxed));
+        } while (!plist->Count.compare_exchange_weak(n, n+1, std::memory_order_acq_rel, std::memory_order_relaxed));
     }
     // remove the extra permit token that was added on function entry.
     // if this returns -1, all dependencies have completed, and the function 
@@ -862,7 +866,6 @@ FinishTask
 {
     if ((task & TASK_ID_MASK_VALID_P) != 0)
     {   // decrement the outstanding work counter on the task.
-        std::atomic<int32_t> *work_count = GetTaskWorkCount(task, thread_source->TaskSources);
         if (GetTaskWorkCount(task, thread_source->TaskSources)->fetch_add(-1, std::memory_order_acq_rel) == 1)
         {   // the task (and all of its children) have finished executing. 
             // this also completes a single outstanding work item on the parent task.
@@ -885,7 +888,6 @@ ComputeWorkerMain
 )
 {
     WIN32_WORKER_THREAD *thread_data = (WIN32_WORKER_THREAD*) argp;
-    WIN32_THREAD_ARGS     *main_args =  thread_data->ThreadPool->MainThreadArgs;
     WIN32_THREAD_POOL   *thread_pool =  thread_data->ThreadPool;
     MEMORY_ARENA       *thread_arena =  thread_data->ThreadArena;
     TASK_SOURCE       *thread_source =  thread_data->ThreadSource;
@@ -953,7 +955,7 @@ ComputeWorkerMain
                 if (work_load > 0) break;
                 else steal_attempts++;
             }
-        } while (work_load < 4 && steal_attempts < 32)
+        } while (work_load < 4 && steal_attempts < 32);
 
         // this thread is done accessing the victim's compute work queue 
         // for the time being. is there still work remaining?
@@ -978,14 +980,16 @@ ComputeWorkerMain
                 td->TaskMain(task_ids[i], thread_source, td, thread_arena, a, s);
                 FinishTask(thread_source, task_ids[i], permitted_compute, permitted_general);
             }
+
+            // all of the current work has completed.
+            task_count = 0;
+            work_load  = 0;
+            more_work  = false;
             
             // the work just executed may have resulted in additional tasks being created.
             if (permitted_compute > 0)
             {   // attempt to take tasks from the private end of this thread's work queue.
                 // this is similar to the work stealing performed above.
-                task_count = 0;
-                work_load  = 0;
-                more_work  = false;
                 do
                 {   task_id_t id = TaskQueueTake(&thread_source->ComputeWorkQueue, more_work);
                     if (IsValidTask(id))
@@ -1173,14 +1177,14 @@ CreateThreadPool
     thread_pool->MaxThreads               = pool_config->MaxThreads;
     thread_pool->ActiveThreads            = 0;
     thread_pool->WorkerArenaSize          = pool_config->WorkerArenaSize;
-    thread_pool->CompletionPort           = NULL;
+    thread_pool->CompletionPort           = pool_config->CompletionPort;
     thread_pool->LaunchSignal             = pool_config->LaunchSignal;
     thread_pool->MainThreadArgs           = pool_config->MainThreadArgs;
     thread_pool->OSThreadIds              = PushArray<unsigned int       >(arena, pool_config->MaxThreads);
     thread_pool->OSThreadHandle           = PushArray<HANDLE             >(arena, pool_config->MaxThreads);
     thread_pool->OSThreadArena            = PushArray<WIN32_MEMORY_ARENA >(arena, pool_config->MaxThreads);
     thread_pool->WorkerState              = PushArray<WIN32_WORKER_THREAD>(arena, pool_config->MaxThreads);
-    thread_pool->WorkerSource             = PushArray<WIN32_TASK_SOURCE *>(arena, pool_config->MaxThreads);
+    thread_pool->WorkerSource             = PushArray<TASK_SOURCE       *>(arena, pool_config->MaxThreads);
     thread_pool->WorkerArena              = PushArray<MEMORY_ARENA       >(arena, pool_config->MaxThreads);
     thread_pool->WorkerMain               = pool_config->ThreadMain;
     thread_pool->TaskScheduler            = pool_config->TaskScheduler;
@@ -1189,16 +1193,9 @@ CreateThreadPool
     ZeroMemory(thread_pool->OSThreadHandle, pool_config->MaxThreads * sizeof(HANDLE));
     ZeroMemory(thread_pool->OSThreadArena , pool_config->MaxThreads * sizeof(WIN32_MEMORY_ARENA));
     ZeroMemory(thread_pool->WorkerState   , pool_config->MaxThreads * sizeof(WIN32_WORKER_THREAD));
-    ZeroMemory(thread_pool->WorkerSource  , pool_config->MaxThreads * sizeof(WIN32_TASK_SOURCE *));
+    ZeroMemory(thread_pool->WorkerSource  , pool_config->MaxThreads * sizeof(TASK_SOURCE*));
     ZeroMemory(thread_pool->WorkerArena   , pool_config->MaxThreads * sizeof(MEMORY_ARENA));
     thread_pool->TerminateFlag.store(0, std::memory_order_relaxed);
-
-    // create a new completion port used to wake the threads in the pool.
-    if ((thread_pool->CompletionPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, (DWORD) pool_config->MaxThreads)) == NULL)
-    {
-        ConsoleError("ERROR (%S): Unable to create I/O completion port for thread pool (%08X).\n", __FUNCTION__, GetLastError());
-        goto cleanup_and_fail;
-    }
 
     // initialize the thread-local memory arenas.
     if (pool_config->WorkerArenaSize > 0)
@@ -1243,16 +1240,12 @@ CreateThreadPool
 cleanup_and_fail:
     if (thread_pool->ActiveThreads > 0)
     {   // signal all threads in the pool to die.
+        DWORD err =  ERROR_SUCCESS;
         DWORD   n = (DWORD) thread_pool->ActiveThreads;
         HANDLE *h =  thread_pool->OSThreadHandle;
         thread_pool->TerminateFlag.store(0, std::memory_order_seq_cst);
-        WakeAllWorkerThreads(thread_pool);
+        WakeAllWorkerThreads(thread_pool, err);
         WaitForMultipleObjects(n, h, TRUE, INFINITE);
-    }
-    if (thread_pool->CompletionPort != NULL)
-    {
-        CloseHandle(thread_pool->CompletionPort);
-        thread_pool->CompletionPort = NULL;
     }
     if (pool_config->WorkerArenaSize > 0 && thread_pool->OSThreadArena != NULL)
     {   // free the reserved and committed address space for thread-local arenas.
@@ -1278,9 +1271,10 @@ TerminateThreadPool
     // signal all threads in the pool to terminate.
     if (thread_pool->ActiveThreads > 0)
     {   // signal the threads, which could be in the middle of executing jobs.
+        DWORD err =  ERROR_SUCCESS;
         HANDLE *h =  thread_pool->OSThreadHandle;
         thread_pool->TerminateFlag.store(1, std::memory_order_seq_cst);
-        WakeAllWorkerThreads(thread_pool);
+        WakeAllWorkerThreads(thread_pool, err);
         // block the calling thread until all threads in the pool have terminated.
         WaitForMultipleObjects(n, h, TRUE, INFINITE);
         thread_pool->ActiveThreads = 0;
@@ -1293,25 +1287,8 @@ TerminateThreadPool
         {   // no cleanup needs to be performed for the 'user-facing' arena.
             DeleteMemoryArena(&thread_pool->OSThreadArena[i]);
         }
-        ZeroMemory(thread_pool->OSThreadArena, pool_config->MaxThreads * sizeof(WIN32_MEMORY_ARENA));
-        ZeroMemory(thread_pool->WorkerArena  , pool_config->MaxThreads * sizeof(MEMORY_ARENA));
-    }
-    // NOTE: intentionally not closing the completion port here.
-    // it's possible that another pool is still live, and that pool might post to this pool.
-}
-
-/// @summary Close the completion port associated with a thread pool. ALl worker threads must be stopped (with TerminateThreadPool) prior to calling this function.
-/// @param thread_pool The thread pool to delete.
-public_function void
-DeleteThreadPool
-(
-    WIN32_THREAD_POOL *thread_pool
-)
-{   assert(thread_pool->ActiveThreads == 0);
-    if (thread_pool->CompletionPort != NULL)
-    {   // also close the completion port at this point.
-        CloseHandle(thread_pool->CompletionPort);
-        thread_pool->CompletionPort = NULL;
+        ZeroMemory(thread_pool->OSThreadArena, thread_pool->MaxThreads * sizeof(WIN32_MEMORY_ARENA));
+        ZeroMemory(thread_pool->WorkerArena  , thread_pool->MaxThreads * sizeof(MEMORY_ARENA));
     }
 }
 
@@ -1346,10 +1323,6 @@ NewTaskSource
     MEMORY_ARENA              *arena
 )
 {
-    if (max_tasks < 1)
-    {   // inherit the default value from the scheduler.
-        max_tasks = scheduler->MaxTasks;
-    }
     if ((max_tasks & (max_tasks - 1)) != 0)
     {   // this value must be a power-of-two. round up to the next multiple.
         size_t n = 1;
@@ -1394,8 +1367,8 @@ NewTaskSource
         ArenaResetToMarker(arena, mem_marker);
         return NULL;
     }
-    source->ComputePoolPort = scheduler->ComputePool.CompletionPort;
-    source->GeneralPoolPort = scheduler->GeneralPool.CompletionPort;
+    source->ComputePoolPort = scheduler->ComputePoolPort;
+    source->GeneralPoolPort = scheduler->GeneralPoolPort;
     source->SourceIndex     = uint32_t(scheduler->SourceCount);
     source->SourceCount     = uint32_t(scheduler->MaxSources);
     source->TaskSources     = scheduler->TaskSources;
@@ -1598,7 +1571,7 @@ CheckSchedulerConfiguration
         // calculate the amount of per-thread memory used in the general pool.
         dst.ArenaSize   = src.ArenaSize;
         general_memory  = dst.MaxThreads * dst.ArenaSize;
-        general_memory += dst.MaxThreads * CalculateMemoryForTaskSource(2, dst.MaxTasks);
+        general_memory += dst.MaxThreads * CalculateMemoryForTaskSource(dst.MaxTasks);
     }
     {   // validation for the compute thread pool.
         // the compute thread pool jobs are expected to be created very frequently, in large 
@@ -1657,26 +1630,26 @@ CheckSchedulerConfiguration
         // calculate the amount of per-thread memory used in the general pool.
         dst.ArenaSize   = src.ArenaSize;
         compute_memory  = dst.MaxThreads * dst.ArenaSize;
-        compute_memory += dst.MaxThreads * CalculateMemoryForTaskSource(2, dst.MaxTasks);
+        compute_memory += dst.MaxThreads * CalculateMemoryForTaskSource(dst.MaxTasks);
     }
 
     {   // validate configuration against system limits.
         if ((dst_config->PoolSize[TASK_POOL_GENERAL].MaxThreads  + 
-             dst_config->PoolSize[TASK_POOL_COMPUTE].MaxThreads) > MAX_WORKER_THREADS)
+             dst_config->PoolSize[TASK_POOL_COMPUTE].MaxThreads) >= MAX_TASK_SOURCES)
         {   // there are too many worker threads for the software to support.
-            ConsoleError("ERROR (%S): Too many worker threads for this scheduler implementation. Max is %u.\n", __FUNCTION__, MAX_WORKER_THREADS);
+            ConsoleError("ERROR (%S): Too many worker threads for this scheduler implementation. Max is %u.\n", __FUNCTION__, MAX_TASK_SOURCES);
             performance_warnings = false;
             return -1;
         }
-        if (dst_config->PoolSize[TASK_POOL_GENERAL].MaxTasks > MAX_TASKS_PER_BUFFER)
+        if (dst_config->PoolSize[TASK_POOL_GENERAL].MaxTasks > MAX_TASKS_PER_SOURCE)
         {   // there are too many tasks for the scheduler to suport.
-            ConsoleError("ERROR (%S): Too many tasks per-worker in the general pool. Max is %u.\n", __FUNCTION__, MAX_TASKS_PER_BUFFER);
+            ConsoleError("ERROR (%S): Too many tasks per-worker in the general pool. Max is %u.\n", __FUNCTION__, MAX_TASKS_PER_SOURCE);
             performance_warnings = false;
             return -1;
         }
-        if (dst_config->PoolSize[TASK_POOL_COMPUTE].MaxTasks > MAX_TASKS_PER_BUFFER)
+        if (dst_config->PoolSize[TASK_POOL_COMPUTE].MaxTasks > MAX_TASKS_PER_SOURCE)
         {   // there are too many tasks for the scheduler to suport.
-            ConsoleError("ERROR (%S): Too many tasks per-worker in the compute pool. Max is %u.\n", __FUNCTION__, MAX_TASKS_PER_BUFFER);
+            ConsoleError("ERROR (%S): Too many tasks per-worker in the compute pool. Max is %u.\n", __FUNCTION__, MAX_TASKS_PER_SOURCE);
             performance_warnings = false;
             return -1;
         }
@@ -1722,9 +1695,9 @@ CheckSchedulerConfiguration
     {   // copy the value from the source configuration.
         dst_config->MaxTaskSources =  src_config->MaxTaskSources;
     }
-    if (dst_config->MaxTaskSources > MAX_SCHEDULER_THREADS)
+    if (dst_config->MaxTaskSources > MAX_TASK_SOURCES)
     {   // the global scheduler limit has been exceeded.
-        ConsoleError("ERROR (%S): Too many task sources. Max is %u.\n", __FUNCTION__, MAX_SCHEDULER_THREADS);
+        ConsoleError("ERROR (%S): Too many task sources. Max is %u.\n", __FUNCTION__, MAX_TASK_SOURCES);
         return -1;
     }
     return 0;
@@ -1765,6 +1738,8 @@ CreateScheduler
         return -1;
     }
 
+    HANDLE cp_port         = NULL;
+    HANDLE gp_port         = NULL;
     HANDLE ev_launch       = NULL;
     size_t general_threads = valid_config.PoolSize[TASK_POOL_GENERAL].MaxThreads;
     size_t general_tasks   = valid_config.PoolSize[TASK_POOL_GENERAL].MaxTasks;
@@ -1782,11 +1757,25 @@ CreateScheduler
         goto cleanup_and_fail;
     }
 
+    // create the I/O completion port for each worker thread pool.
+    if ((cp_port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, (DWORD) compute_threads)) == NULL)
+    {   // compute pool worker threads will have no way to receive notifications.
+        ConsoleError("ERROR (%S): Failed to create completion port for compute pool (%08X).\n", __FUNCTION__, GetLastError());
+        goto cleanup_and_fail;
+    }
+    if ((gp_port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, (DWORD) general_threads)) == NULL)
+    {   // general pool worker threads will have no way to receive notifications.
+        ConsoleError("ERROR (%S): Failed to create completion port for general pool (%08X).\n", __FUNCTION__, GetLastError());
+        goto cleanup_and_fail;
+    }
+
     // initialize the various coordination events and task source list.
-    scheduler->MaxSources   = valid_config.MaxTaskSources;
-    scheduler->SourceCount  = 0;
-    scheduler->TaskSources  = PushArray<TASK_SOURCE>(arena, valid_config.MaxTaskSources);
-    scheduler->LaunchSignal = ev_launch;
+    scheduler->MaxSources      = valid_config.MaxTaskSources;
+    scheduler->SourceCount     = 0;
+    scheduler->TaskSources     = PushArray<TASK_SOURCE>(arena, valid_config.MaxTaskSources);
+    scheduler->LaunchSignal    = ev_launch;
+    scheduler->ComputePoolPort = cp_port;
+    scheduler->GeneralPoolPort = gp_port;
     ZeroMemory(scheduler->TaskSources, valid_config.MaxTaskSources * sizeof(TASK_SOURCE));
 
     // task sources must be allocated for worker threads before the threads are spawned
@@ -1831,6 +1820,7 @@ CreateScheduler
     general_config.MaxThreads        = valid_config.PoolSize[TASK_POOL_GENERAL].MaxThreads;
     general_config.WorkerArenaSize   = valid_config.PoolSize[TASK_POOL_GENERAL].ArenaSize;
     general_config.WorkerSourceIndex = compute_threads + 1; // see above
+    general_config.CompletionPort    = gp_port;
     general_config.LaunchSignal      = ev_launch;
     general_config.WorkerFlags       = WORKER_FLAGS_NONE;
     if (CreateThreadPool(&scheduler->GeneralPool, &general_config, arena) < 0)
@@ -1841,12 +1831,13 @@ CreateScheduler
 
     // initialize, but do not launch, the compute task thread pool.
     compute_config.TaskScheduler     = scheduler;
-    compute_config.ThreadMain        = CompueWorkerMain;
+    compute_config.ThreadMain        = ComputeWorkerMain;
     compute_config.MainThreadArgs    = valid_config.MainThreadArgs;
     compute_config.MinThreads        = valid_config.PoolSize[TASK_POOL_COMPUTE].MinThreads;
     compute_config.MaxThreads        = valid_config.PoolSize[TASK_POOL_COMPUTE].MaxThreads;
     compute_config.WorkerArenaSize   = valid_config.PoolSize[TASK_POOL_COMPUTE].ArenaSize;
     compute_config.WorkerSourceIndex = 1; // see above
+    compute_config.CompletionPort    = cp_port;
     compute_config.LaunchSignal      = ev_launch;
     compute_config.WorkerFlags       = WORKER_FLAGS_NONE;
     if (CreateThreadPool(&scheduler->ComputePool, &compute_config, arena) < 0)
@@ -1860,9 +1851,9 @@ CreateScheduler
 cleanup_and_fail:
     TerminateThreadPool(&scheduler->ComputePool);
     TerminateThreadPool(&scheduler->GeneralPool);
-    if(ev_launch != NULL) CloseHandle(ev_launch);
-    DeleteThreadPool(&scheduler->ComputePool);
-    DeleteThreadPool(&scheduler->GeneralPool);
+    if (ev_launch != NULL) CloseHandle(ev_launch);
+    if (gp_port != NULL) CloseHandle(gp_port);
+    if (cp_port != NULL) CloseHandle(cp_port);
     ArenaResetToMarker(arena, mem_marker);
     ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
     return -1;
@@ -1876,9 +1867,9 @@ LaunchScheduler
     WIN32_TASK_SCHEDULER *scheduler
 )
 {
-    if (scheduler->StartSignal != NULL)
+    if (scheduler->LaunchSignal != NULL)
     {   // start all of the worker threads looking for work.
-        SetEvent(scheduler->StartSignal);
+        SetEvent(scheduler->LaunchSignal);
     }
 }
 
@@ -1894,9 +1885,9 @@ HaltScheduler
     {   // signal all worker threads to exit, and wait for them.
         TerminateThreadPool(&scheduler->ComputePool);
         TerminateThreadPool(&scheduler->GeneralPool);
-        DeleteThreadPool(&scheduler->ComputePool);
-        DeleteThreadPool(&scheduler->GeneralPool);
         CloseHandle(scheduler->LaunchSignal);
+        CloseHandle(scheduler->ComputePoolPort);
+        CloseHandle(scheduler->GeneralPoolPort);
         ZeroMemory(scheduler, sizeof(WIN32_TASK_SCHEDULER));
     }
 }
@@ -1910,7 +1901,7 @@ RootTaskSource
     WIN32_TASK_SCHEDULER *scheduler
 )
 {
-    return &scheduler->SourceList[0];
+    return &scheduler->TaskSources[0];
 }
 
 /// @summary Create a new task. If all dependencies have been satisfied, add the task to the ready-to-run queue.
@@ -1947,7 +1938,7 @@ NewTask
     do
     {   // take the first slot with an outstanding work count of 0.
         // note that the calling thread is the only thread that can define tasks on this TASK_SOURCE.
-        if (thread_source->WorkCounts[task_index & mask].load(std::memory_order_acquire) == 0)
+        if (thread_source->WorkCount[task_index & mask].load(std::memory_order_acquire) == 0)
         {   // this slot is currently unused; claim it.
             thread_source->TaskIndex = (task_index + 1) & mask;
             found_slot = true;
@@ -1975,7 +1966,7 @@ NewTask
     // create the task in the claimed slot.
     task_id_t                task_id = MakeTaskId(task_size, task_pool, task_index, thread_source->SourceIndex);
     TASK_DATA                  &task = thread_source->WorkItems [task_index];
-    std::atomic<int32_t> &work_count = thread_source->WorkCounts[task_index];
+    std::atomic<int32_t> &work_count = thread_source->WorkCount [task_index];
     PERMITS_LIST              &plist = thread_source->PermitList[task_index];
 
     task.ParentTask = parent_id;
@@ -1983,7 +1974,7 @@ NewTask
     CopyMemory(task.Data, task_args, args_size);
     work_count.store(2, std::memory_order_relaxed);
     plist.Count.store(0, std::memory_order_relaxed);
-    if (CreatePermits(thread_source, task_id, task, dependencies, dependency_count))
+    if (CreatePermits(thread_source, task_id, &task, dependencies, dependency_count))
     {   // the task is ready-to-run, push it onto the local RTR queue.
         if (task_pool == TASK_POOL_COMPUTE)
         {   // this task executes on the compute thread pool.
@@ -2043,7 +2034,7 @@ WakeGeneralPoolWorkers
 )
 {
     DWORD error = ERROR_SUCCESS;
-    WakeWorkerThreads(thread_source->GeneralPoolPort, thread_source, wake_count);
+    WakeWorkerThreads(thread_source->GeneralPoolPort, thread_source, wake_count, error);
     if (error != ERROR_SUCCESS) ConsoleError("ERROR (%S): Wake failed with result %08X.\n", __FUNCTION__, error);
 }
 
@@ -2091,14 +2082,14 @@ FlushTaskBatch
     {
         size_t  permitted_compute = 0;
         size_t  permitted_general = 0;
-        FinishTaskDefinition (s, s->Buffer[i], permitted_compute, permitted_general);
-        s->RTRComputeCount += uint32_t(permitted_compute); 
-        s->RTRGeneralCount += uint32_t(permitted_general);
+        FinishTaskDefinition(s, batch->Buffer[i], permitted_compute, permitted_general);
+        batch->RTRComputeCount += uint32_t(permitted_compute); 
+        batch->RTRGeneralCount += uint32_t(permitted_general);
     }
     // start threads working.
     DWORD err= ERROR_SUCCESS;
-    if (batch->RTRComputeCount > 0) WakeWorkerThreads(s->ComputePoolPort, s, 1, err);
-    if (batch->RTRGeneralCount > 0) WakeWorkerThreads(s->GeneralPoolPort, s, 1, err);
+    if (batch->RTRComputeCount > 0) WakeWorkerThreads(s->ComputePoolPort, s, batch->RTRComputeCount, err);
+    if (batch->RTRGeneralCount > 0) WakeWorkerThreads(s->GeneralPoolPort, s, batch->RTRGeneralCount, err);
     // reset the internal counters in case more tasks will be defined.
     // intentionally do *not* clear BatchFlags here; the status is sticky.
     batch->BufferedCount   = 0;
@@ -2108,6 +2099,34 @@ FlushTaskBatch
     {   // only report the first failed wake attempt.
         ConsoleError("ERROR (%S): One or more failed wake notifications with result %08X.\n", __FUNCTION__, err);
     }
+}
+
+public_function inline void
+TaskBatchPreAdd
+(
+    TASK_BATCH *batch
+)
+{
+    if (batch->BufferedCount == TASK_BATCH::MAX_TASKS)
+    {   // auto-flush the buffered tasks when the batch reaches capacity.
+        // this allows tasks to complete earlier (they may have started when they 
+        // were first defined) which in turn may allow additional tasks to run.
+        FlushTaskBatch(batch);
+    }
+}
+
+public_function inline task_id_t
+TaskBatchPostAdd
+(
+    TASK_BATCH  *batch, 
+    task_id_t  task_id
+)
+{
+    if (task_id != INVALID_TASK_ID)
+    {   // increment the number of non-finished task IDs.
+        batch->Buffer[batch->BufferedCount++] = task_id;
+    }
+    return task_id;
 }
 
 /// @summary Creates a new task to execute on the compute thread pool.
@@ -2123,8 +2142,10 @@ NewComputeTask
     uint32_t const  task_size
 )
 {
+    TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    return NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, INVALID_TASK_ID, NULL, 0, task_size, batch->RTRComputeCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, INVALID_TASK_ID, NULL, 0, task_size, batch->RTRComputeCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Creates a new task to execute on the compute thread pool. The task is created as a child of another task. The parent task does not complete until all children have completed.
@@ -2142,9 +2163,12 @@ NewComputeTask
     uint32_t  const task_size
 )
 {   // consistency check: cannot define root and child tasks in the same batch.
-    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
     assert((batch->BatchFlags & TASK_BATCH_STATUS_ROOT) == 0);
-    return NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, parent_id, NULL, 0, task_size, batch->RTRComputeCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, parent_id, NULL, 0, task_size, batch->RTRComputeCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the compute thread pool. The task will not execute until all of its dependencies have completed.
@@ -2164,8 +2188,10 @@ NewComputeTask
     uint32_t  const        task_size 
 )
 {
+    TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    return NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the compute thread pool. The task will not execute until all of its dependencies have completed. The task is created as the child of another task. The parent task does not complete until all children have completed.
@@ -2187,9 +2213,12 @@ NewComputeTask
     uint32_t  const        task_size 
 )
 {   // consistency check: cannot define root and child tasks in the same batch.
-    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
     assert((batch->BatchFlags & TASK_BATCH_STATUS_ROOT) == 0);
-    return NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, parent_id, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, parent_id, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the compute thread pool.
@@ -2209,9 +2238,12 @@ NewComputeTask
     uint32_t const  task_size
 )
 {   
-    batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
     assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
-    return NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, NULL, 0, task_size, batch->RTRComputeCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, NULL, 0, task_size, batch->RTRComputeCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Creates a new task to execute on the compute thread pool. The task is created as a child of another task. The parent task does not complete until all children have completed.
@@ -2233,10 +2265,13 @@ NewComputeTask
     uint32_t  const  task_size
 )
 {   // consistency check: cannot define root and child tasks in the same batch.
-    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
     assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
     assert((batch->BatchFlags & TASK_BATCH_STATUS_ROOT) == 0);
-    return NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), parent_id, NULL, 0, task_size, batch->RTRComputeCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), parent_id, NULL, 0, task_size, batch->RTRComputeCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the compute thread pool. The task will not execute until all of its dependencies have completed.
@@ -2260,9 +2295,12 @@ NewComputeTask
     uint32_t  const        task_size
 )
 {   
-    batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
     assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
-    return NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the compute thread pool. The task will not execute until all of its dependencies have completed. The task is created as the child of another task. The parent task does not complete until all children have completed.
@@ -2288,10 +2326,13 @@ NewComputeTask
     uint32_t  const        task_size
 )
 {   // consistency check: cannot define root and child tasks in the same batch.
-    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
     assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
     assert((batch->BatchFlags & TASK_BATCH_STATUS_ROOT) == 0);
-    return NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), parent_id, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), parent_id, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Creates a new task to execute on the general thread pool.
@@ -2307,8 +2348,10 @@ NewGeneralTask
     uint32_t const  task_size=TASK_SIZE_SMALL
 )
 {
+    TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    return NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, INVALID_TASK_ID, NULL, 0, task_size, batch->RTRGeneralCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, INVALID_TASK_ID, NULL, 0, task_size, batch->RTRGeneralCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Creates a new task to execute on the general thread pool. The task is created as a child of another task. The parent task does not complete until all children have completed.
@@ -2326,9 +2369,12 @@ NewGeneralTask
     uint32_t  const task_size=TASK_SIZE_SMALL
 )
 {   // consistency check: cannot define root and child tasks in the same batch.
-    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
     assert((batch->BatchFlags & TASK_BATCH_STATUS_ROOT) == 0);
-    return NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, parent_id, NULL, 0, task_size, batch->RTRGeneralCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, parent_id, NULL, 0, task_size, batch->RTRGeneralCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the general thread pool. The task will not execute until all of its dependencies have completed.
@@ -2348,8 +2394,10 @@ NewGeneralTask
     uint32_t  const        task_size=TASK_SIZE_SMALL
 )
 {
+    TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    return NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the general thread pool. The task will not execute until all of its dependencies have completed. The task is created as the child of another task. The parent task does not complete until all children have completed.
@@ -2371,9 +2419,12 @@ NewGeneralTask
     uint32_t  const        task_size=TASK_SIZE_SMALL
 )
 {   // consistency check: cannot define root and child tasks in the same batch.
-    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
     assert((batch->BatchFlags & TASK_BATCH_STATUS_ROOT) == 0);
-    return NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, parent_id, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, parent_id, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the general thread pool.
@@ -2393,9 +2444,12 @@ NewGeneralTask
     uint32_t const  task_size=TASK_SIZE_SMALL
 )
 {   
-    batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
     assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
-    return NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, NULL, 0, task_size, batch->RTRGeneralCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, NULL, 0, task_size, batch->RTRGeneralCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Creates a new task to execute on the general thread pool. The task is created as a child of another task. The parent task does not complete until all children have completed.
@@ -2417,10 +2471,13 @@ NewGeneralTask
     uint32_t  const  task_size=TASK_SIZE_SMALL
 )
 {   // consistency check: cannot define root and child tasks in the same batch.
-    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
     assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
     assert((batch->BatchFlags & TASK_BATCH_STATUS_ROOT) == 0);
-    return NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), parent_id, NULL, 0, task_size, batch->RTRGeneralCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), parent_id, NULL, 0, task_size, batch->RTRGeneralCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the general thread pool. The task will not execute until all of its dependencies have completed.
@@ -2444,9 +2501,12 @@ NewGeneralTask
     uint32_t  const        task_size=TASK_SIZE_SMALL
 )
 {   
-    batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
     assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
-    return NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the general thread pool. The task will not execute until all of its dependencies have completed. The task is created as the child of another task. The parent task does not complete until all children have completed.
@@ -2472,10 +2532,13 @@ NewGeneralTask
     uint32_t  const        task_size=TASK_SIZE_SMALL
 )
 {   // consistency check: cannot define root and child tasks in the same batch.
-    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
-    assert(sizeof(ArgsType) <= TASK_DATA::MAX_DATA);
+    assert(sizeof(ArgsType)  <= TASK_DATA::MAX_DATA);
     assert((batch->BatchFlags & TASK_BATCH_STATUS_ROOT) == 0);
-    return NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), parent_id, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+
+    TaskBatchPreAdd(batch);
+    batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), parent_id, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+    return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary The destructor for TASK_BATCH, used to auto-flush when the batch goes out-of-scope.
