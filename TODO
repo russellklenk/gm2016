@@ -2,6 +2,7 @@ Continue to test scheduler and fix functional issues.
 - Strange things happening with timing, I think.
 - Very bad things happening if you have too many tasks.
 - Really need to be able to debug more easily.
+- Biggest bug is that workers aren't waking enough. Have to post extra completion notifications.
 Profile scheduler and ensure expected behavior is observed.
 - Behavior looks good in WPA.
 - Need to see how tasks are being scheduled.
