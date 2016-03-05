@@ -1,12 +1,12 @@
-Fast counting semaphore implementation
-Use counting semaphore for SignalWaitingWorkers -> SignalWaitingWorkers(s, N)
-Use counting semaphore for GENERAL_TASK_QUEUE
-Finish refactoring scheduler startup and shutdown
-Add the ability to try stealing from a random task. Waiting on the events is expensive.
-Figure out how to avoid having to constantly call SignalWaitingWorkers, which signals a kernel-mode event.
 Continue to test scheduler and fix functional issues.
+- Strange things happening with timing, I think.
+- Very bad things happening if you have too many tasks.
+- Really need to be able to debug more easily.
 Profile scheduler and ensure expected behavior is observed.
-Basic renderer (software for now?)
+- Behavior looks good in WPA.
+- Need to see how tasks are being scheduled.
+  - Which means that ETW stuff has to be implemented.
+Basic renderer - Vulkan
 Be able to move a simple colored box on the screen.
 Figure out networking.
 
