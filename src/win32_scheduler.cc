@@ -2759,7 +2759,7 @@ CreateTaskProfiler
     }
 
     // allocate memory for the EVENT_TRACE_PROPERTIES, which must be followed by the logger name.
-    size_t             props_size = sizeof(EVENT_TRACE_PROPERTIES) + sizeof(KERNEL_LOGGER_NAME) + 1;
+    size_t             props_size = sizeof(EVENT_TRACE_PROPERTIES) + sizeof(KERNEL_LOGGER_NAME);
     uint8_t              *raw_ptr = PushArray<uint8_t>(arena, props_size);
     EVENT_TRACE_PROPERTIES *props =(EVENT_TRACE_PROPERTIES*) raw_ptr;
     WCHAR                   *name =(WCHAR*)(raw_ptr + sizeof(EVENT_TRACE_PROPERTIES));
