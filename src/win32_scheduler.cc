@@ -340,19 +340,20 @@ struct WIN32_CONTEXT_SWITCH
 
 /// @summary Define the data managed by the built-in profiler.
 struct WIN32_TASK_PROFILER
-{   static size_t const      MAX_BUFFERS           = 4;
-    static size_t const      MAX_EVENTS            = 65536;
+{   static size_t const      MAX_EVENTS            = 256 * 1024;
 
-    size_t                   BufferIndex;        /// The zero-based index of the current capture buffer.
+    uint64_t                 Mask;               /// The mask value used to convert event counts into array indices.
+
     TRACEHANDLE              ConsumerHandle;     /// The ETW trace handle returned by OpenTrace.
     HANDLE                   ConsumerLaunch;     /// A manual-reset event used by the consumer thread to signal the start of trace capture.
     HANDLE                   ConsumerThread;     /// The HANDLE of the thread that receives context switch events.
     unsigned int             ConsumerThreadId;   /// The system identifier of the thread that receives context switch events.
     uint32_t                 ProfilerState;      /// One or more of PROFILER_FLAGS indicating the current profiler state.
 
-    size_t                   CSwitchCount;       /// The number of captured context switch events.
-    uint64_t                *CSwitchTime[4];     /// An array of timestamp values (in ticks) for the context switch events.
-    WIN32_CONTEXT_SWITCH    *CSwitchData[4];     /// An array of context switch event data.
+    uint8_t                 *ETWBuffer;          /// A 64KB buffer used for parsing event data returned by ETW.
+    uint64_t                 CSwitchCount;       /// The number of captured context switch events.
+    uint64_t                *CSwitchTime;        /// An array of timestamp values (in ticks) for the context switch events.
+    WIN32_CONTEXT_SWITCH    *CSwitchData;        /// An array of context switch event data.
 
     uint64_t                 ClockFrequency;     /// The frequency of the high-resolution timer on the system, in ticks-per-second.
     TRACEHANDLE              SessionHandle;      /// The ETW trace handle for the session.
@@ -657,6 +658,50 @@ GetTaskPermitsList
     return &source_list[source_index].PermitList[task_index];
 }
 
+/// @summary Retrieve a 32-bit unsigned integer property value from an event record.
+/// @param ev The EVENT_RECORD passed to TaskProfilerRecordEvent.
+/// @param info_buf The TRACE_EVENT_INFO containing event metadata.
+/// @param index The zero-based index of the property to retrieve.
+/// @return The integer value.
+internal_function inline uint32_t
+TaskProfilerGetUInt32
+(
+    EVENT_RECORD           *ev, 
+    TRACE_EVENT_INFO *info_buf, 
+    size_t               index
+)
+{
+    PROPERTY_DATA_DESCRIPTOR dd;
+    uint32_t  value =  0;
+    dd.PropertyName = (ULONGLONG)((uint8_t*) info_buf + info_buf->EventPropertyInfoArray[index].NameOffset);
+    dd.ArrayIndex   =  ULONG_MAX;
+    dd.Reserved     =  0;
+    TdhGetProperty(ev, 0, NULL, 1, &dd, (ULONG) sizeof(uint32_t), (PBYTE) &value);
+    return value;
+}
+
+/// @summary Retrieve an 8-bit signed integer property value from an event record.
+/// @param ev The EVENT_RECORD passed to TaskProfilerRecordEvent.
+/// @param info_buf The TRACE_EVENT_INFO containing event metadata.
+/// @param index The zero-based index of the property to retrieve.
+/// @return The integer value.
+internal_function inline int8_t
+TaskProfilerGetSInt8
+(
+    EVENT_RECORD           *ev, 
+    TRACE_EVENT_INFO *info_buf, 
+    size_t               index
+)
+{
+    PROPERTY_DATA_DESCRIPTOR dd;
+    int8_t    value =  0;
+    dd.PropertyName = (ULONGLONG)((uint8_t*) info_buf + info_buf->EventPropertyInfoArray[index].NameOffset);
+    dd.ArrayIndex   =  ULONG_MAX;
+    dd.Reserved     =  0;
+    TdhGetProperty(ev, 0, NULL, 1, &dd, (ULONG) sizeof(int8_t), (PBYTE) &value);
+    return value;
+}
+
 /// @summary Callback invoked for each context switch event reported by Event Tracing for Windows.
 /// @param ev Data associated with the event being reported.
 internal_function void WINAPI
@@ -666,8 +711,28 @@ TaskProfilerRecordEvent
 )
 {
     WIN32_TASK_PROFILER *profiler = (WIN32_TASK_PROFILER*) ev->UserContext;
-    UNUSED_LOCAL(profiler);
-    // TODO(rlk): Record the context switch event into the profiler's current buffer.
+    TRACE_EVENT_INFO    *info_buf = (TRACE_EVENT_INFO*) profiler->ETWBuffer;
+    ULONG                size_buf =  64 * 1024;
+
+    // attempt to parse out the context switch information from the EVENT_RECORD.
+    if (TdhGetEventInformation(ev, 0, NULL, info_buf, &size_buf) == ERROR_SUCCESS)
+    {   // this involves some ridiculous parsing of data in an opaque buffer.
+        if (info_buf->EventDescriptor.Opcode == 36)
+        {   // opcode 36 corresponds to a CSwitch event.
+            // see https://msdn.microsoft.com/en-us/library/windows/desktop/aa964744%28v=vs.85%29.aspx
+            uint64_t             ev_index   = profiler->CSwitchCount & profiler->Mask;
+            WIN32_CONTEXT_SWITCH &cswitch   = profiler->CSwitchData[ev_index];
+            cswitch.CurrThreadId            = TaskProfilerGetUInt32(ev, info_buf,  0); // NewThreadId
+            cswitch.PrevThreadId            = TaskProfilerGetUInt32(ev, info_buf,  1); // OldThreadId
+            cswitch.WaitTimeMs              = TaskProfilerGetUInt32(ev, info_buf, 10); // NewThreadWaitTime
+            cswitch.WaitReason              = TaskProfilerGetSInt8 (ev, info_buf,  6); // OldThreadWaitReason
+            cswitch.WaitMode                = TaskProfilerGetSInt8 (ev, info_buf,  7); // OldThreadWaitMode
+            cswitch.PrevThreadPriority      = TaskProfilerGetSInt8 (ev, info_buf,  3); // OldThreadPriority
+            cswitch.CurrThreadPriority      = TaskProfilerGetSInt8 (ev, info_buf,  2); // NewThreadPriority
+            profiler->CSwitchTime[ev_index] =(uint64_t) ev->EventHeader.TimeStamp.QuadPart;
+            profiler->CSwitchCount++;
+        }
+    }
 }
 
 /// @summary Implements the entry point of the thread that dispatches ETW context switch events.
@@ -2658,14 +2723,15 @@ CalculateMemoryForTaskProfiler
     size_t size_in_bytes = 0;
     size_in_bytes += sizeof(EVENT_TRACE_PROPERTIES);
     size_in_bytes += sizeof(KERNEL_LOGGER_NAME) + 1;
-    size_in_bytes += AllocationSizeForArray<uint64_t            >(WIN32_TASK_PROFILER::MAX_EVENTS) * WIN32_TASK_PROFILER::MAX_BUFFERS;
-    size_in_bytes += AllocationSizeForArray<WIN32_CONTEXT_SWITCH>(WIN32_TASK_PROFILER::MAX_EVENTS) * WIN32_TASK_PROFILER::MAX_BUFFERS;
+    size_in_bytes += AllocationSizeForArray<uint64_t            >(WIN32_TASK_PROFILER::MAX_EVENTS);
+    size_in_bytes += AllocationSizeForArray<WIN32_CONTEXT_SWITCH>(WIN32_TASK_PROFILER::MAX_EVENTS);
+    size_in_bytes += 64 * 1024; // for the event parsing buffer
     return size_in_bytes;
 }
 
 /// @summary Create a new task system profiler. Call StartTaskProfileCapture to begin capturing profile events.
 /// @param profiler The WIN32_TASK_PROFILER instance to initialize.
-/// @return Zero if the profiler instance is successfully initialized, or -1 if an error occurred.
+/// @return Zero if the profiler instance is successfullyer initialized, or -1 if an error occurred.
 public_function int
 CreateTaskProfiler
 (
@@ -2711,11 +2777,10 @@ CreateTaskProfiler
     StringCbCopy(name, sizeof(KERNEL_LOGGER_NAME), KERNEL_LOGGER_NAME);
 
     // initialize the various internal event buffers.
-    for (size_t i = 0, n = WIN32_TASK_PROFILER::MAX_BUFFERS; i < n; ++i)
-    {
-        profiler->CSwitchTime[i] = PushArray<uint64_t            >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
-        profiler->CSwitchData[i] = PushArray<WIN32_CONTEXT_SWITCH>(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
-    }
+    profiler->Mask             = WIN32_TASK_PROFILER::MAX_EVENTS - 1;
+    profiler->ETWBuffer        = PushArray<uint8_t             >(arena, 64 * 1024);
+    profiler->CSwitchTime      = PushArray<uint64_t            >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->CSwitchData      = PushArray<WIN32_CONTEXT_SWITCH>(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
 
     // retrieve the frequency of the high-resolution system timer.
     // this is used to convert timestamp values from ticks into seconds.
@@ -2794,7 +2859,7 @@ StartTaskProfileCapture
 
     // reset the internal profiler state.
     profiler->ConsumerLaunch    = launch_handle;
-    profiler->BufferIndex       = 0;
+    profiler->Mask              = WIN32_TASK_PROFILER::MAX_EVENTS - 1;
     profiler->CSwitchCount      = 0;
 
     // configure real-time event capture and set the per-event callback.
