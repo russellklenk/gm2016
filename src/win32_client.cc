@@ -39,6 +39,7 @@
 #include <wmistr.h>
 #include <evntrace.h>
 #include <evntcons.h>
+#include <tdh.h>
 
 #include "platform_config.h"
 #include "compiler_config.h"
@@ -543,6 +544,7 @@ WinMain
     MEMORY_ARENA                       main_arena = {};
     WIN32_TASK_SCHEDULER_CONFIG  scheduler_config = {};
     WIN32_TASK_SCHEDULER           task_scheduler = {};
+    WIN32_TASK_PROFILER                  profiler = {};
     HANDLE                               ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_fence = CreateEvent(NULL, FALSE,FALSE, NULL); // auto-reset
@@ -622,6 +624,12 @@ WinMain
     {   // no user input services are available.
         goto cleanup_and_shutdown;
     }
+
+    if (CreateTaskProfiler(&profiler) < 0)
+    {   // no profiler is available.
+        goto cleanup_and_shutdown;
+    }
+    StartTaskProfileCapture(&profiler);
 
     // create the compute task scheduler first, and then the async scheduler.
     // the async scheduler may depend on the compute task scheduler.
@@ -749,6 +757,8 @@ WinMain
     ConsoleOutput("The main thread has exited.\n");
 
 cleanup_and_shutdown:
+    StopTaskProfileCapture(&profiler);
+    DeleteTaskProfiler(&profiler);
     HaltScheduler(&task_scheduler);
     if (ev_break        != NULL) SetEvent(ev_break);
     if (thread_draw     != NULL) WaitForSingleObject(thread_draw, INFINITE);
