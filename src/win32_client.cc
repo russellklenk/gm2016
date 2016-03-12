@@ -7,6 +7,7 @@
 /*////////////////////
 //   Preprocessor   //
 ////////////////////*/
+#define INITGUID
 #define _STDC_FORMAT_MACROS
 
 #define Kilobytes(x)     (size_t((x)) * size_t(1024))
@@ -34,6 +35,10 @@
 #include <Windows.h>
 #include <Shellapi.h>
 #include <XInput.h>
+#include <strsafe.h>
+#include <wmistr.h>
+#include <evntrace.h>
+#include <evntcons.h>
 
 #include "platform_config.h"
 #include "compiler_config.h"
