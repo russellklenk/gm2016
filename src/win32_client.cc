@@ -1,4 +1,4 @@
-
+/*/////////////////////////////////////////////////////////////////////////////
 /// @summary Implement the entry point of the client application. Initializes 
 /// the runtime and sets up the execution environment for the explicit 
 /// background threads. User input is handled on the main thread.
@@ -35,11 +35,16 @@
 #include <Windows.h>
 #include <Shellapi.h>
 #include <XInput.h>
+
+// TODO(rlk): the following are required for the task profiler. only include them if the task profiler is enabled.
+// TODO(rlk): factor the task profiler out into a separate file, win32_taskprofiler.cc.
 #include <strsafe.h>
 #include <wmistr.h>
 #include <evntrace.h>
 #include <evntcons.h>
 #include <tdh.h>
+
+#include <vulkan/vulkan.h>
 
 #include "platform_config.h"
 #include "compiler_config.h"
