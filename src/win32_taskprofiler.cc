@@ -1,15 +1,9 @@
 /*/////////////////////////////////////////////////////////////////////////////
-/// @summary Implement a low-overhead task scheduler to distribute tasks on a
-/// thread pool. The system supports two main categories of tasks:
-/// * compute tasks are non-blocking and CPU heavy,
-/// * general tasks may block and are generally not CPU heavy.
-/// Tasks may spawn one or more other tasks, and support dependencies such that
-/// a task may wait for one or more tasks to complete before it will launch.
-/// Each type of task executes in a separate thread pool.
-/// Windows I/O completion ports are used to wake threads in the pool.
-/// The task scheduler system supports built-in profiling using Event Tracing
-/// for Windows, in conjunction with custom information, at the cost of some 
-/// fixed space and time overhead (you lose a thread in the compute pool.)
+/// @summary Implement a low-overhead profiler for the task scheduler. The 
+/// profiler uses Event Tracing for Windows to capture context switch events 
+/// from the kernel, and correlates those with user-level events from the task
+/// scheduler. This allows the visual presentation of which tasks run on which
+/// worker threads, how long they took, how long they spent waiting, etc.
 ///////////////////////////////////////////////////////////////////////////80*/
 
 /*/////////////////
@@ -89,7 +83,7 @@ TaskProfilerGetUInt32
     dd.PropertyName = (ULONGLONG)((uint8_t*) info_buf + info_buf->EventPropertyInfoArray[index].NameOffset);
     dd.ArrayIndex   =  ULONG_MAX;
     dd.Reserved     =  0;
-    TdhGetProperty(ev, 0, NULL, 1, &dd, (ULONG) sizeof(uint32_t), (PBYTE) &value);
+    TdhGetProperty_Func(ev, 0, NULL, 1, &dd, (ULONG) sizeof(uint32_t), (PBYTE) &value);
     return value;
 }
 
@@ -111,7 +105,7 @@ TaskProfilerGetSInt8
     dd.PropertyName = (ULONGLONG)((uint8_t*) info_buf + info_buf->EventPropertyInfoArray[index].NameOffset);
     dd.ArrayIndex   =  ULONG_MAX;
     dd.Reserved     =  0;
-    TdhGetProperty(ev, 0, NULL, 1, &dd, (ULONG) sizeof(int8_t), (PBYTE) &value);
+    TdhGetProperty_Func(ev, 0, NULL, 1, &dd, (ULONG) sizeof(int8_t), (PBYTE) &value);
     return value;
 }
 
@@ -128,7 +122,7 @@ TaskProfilerRecordEvent
     ULONG                size_buf =  64 * 1024;
 
     // attempt to parse out the context switch information from the EVENT_RECORD.
-    if (TdhGetEventInformation(ev, 0, NULL, info_buf, &size_buf) == ERROR_SUCCESS)
+    if (TdhGetEventInformation_Func(ev, 0, NULL, info_buf, &size_buf) == ERROR_SUCCESS)
     {   // this involves some ridiculous parsing of data in an opaque buffer.
         if (info_buf->EventDescriptor.Opcode == 36)
         {   // opcode 36 corresponds to a CSwitch event.
