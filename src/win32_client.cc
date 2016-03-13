@@ -7,12 +7,22 @@
 /*////////////////////
 //   Preprocessor   //
 ////////////////////*/
-#define INITGUID
-#define _STDC_FORMAT_MACROS
+/// @summary Define ENABLE_TASK_PROFILER as 1 to include the task scheduler profiler.
+/// Enabling the task scheduler profiler pulls in several additional dependencies.
+#ifndef ENABLE_TASK_PROFILER
+#define ENABLE_TASK_PROFILER 0
+#endif
 
-#define Kilobytes(x)     (size_t((x)) * size_t(1024))
-#define Megabytes(x)     (size_t((x)) * size_t(1024) * size_t(1024))
-#define Gigabytes(x)     (size_t((x)) * size_t(1024) * size_t(1024) * size_t(1024))
+/// @summary If the task profiler is enabled, INITGUID needs to be #defined so that SystemTraceControlGuid is usable.
+#if ENABLE_TASK_PROFILER
+#define INITGUID
+#endif
+
+/// @summary Define some useful macros for specifying common resource sizes.
+/// Define these before including anything so that they are available everywhere.
+#define Kilobytes(x)        (size_t((x)) * size_t(1024))
+#define Megabytes(x)        (size_t((x)) * size_t(1024) * size_t(1024))
+#define Gigabytes(x)        (size_t((x)) * size_t(1024) * size_t(1024) * size_t(1024))
 
 /*////////////////
 //   Includes   //
@@ -36,13 +46,13 @@
 #include <Shellapi.h>
 #include <XInput.h>
 
-// TODO(rlk): the following are required for the task profiler. only include them if the task profiler is enabled.
-// TODO(rlk): factor the task profiler out into a separate file, win32_taskprofiler.cc.
+#if ENABLE_TASK_PROFILER
 #include <strsafe.h>
 #include <wmistr.h>
 #include <evntrace.h>
 #include <evntcons.h>
 #include <tdh.h>
+#endif
 
 #include <vulkan/vulkan.h>
 
@@ -54,11 +64,16 @@
 #include "win32_runtime.cc"
 #include "win32_memarena.cc"
 #include "win32_timestamp.cc"
-#include "win32_random.cc"
 #include "win32_scheduler.cc"
-#include "win32_parse.cc"
+
+#if ENABLE_TASK_PROFILER
+#include "win32_taskprofiler.cc"
+#endif
+
 #include "win32_display.cc"
 #include "win32_input.cc"
+#include "win32_random.cc"
+#include "win32_parse.cc"
 
 /*//////////////////
 //   Data Types   //
@@ -549,7 +564,6 @@ WinMain
     MEMORY_ARENA                       main_arena = {};
     WIN32_TASK_SCHEDULER_CONFIG  scheduler_config = {};
     WIN32_TASK_SCHEDULER           task_scheduler = {};
-    WIN32_TASK_PROFILER                  profiler = {};
     HANDLE                               ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_fence = CreateEvent(NULL, FALSE,FALSE, NULL); // auto-reset
@@ -629,12 +643,6 @@ WinMain
     {   // no user input services are available.
         goto cleanup_and_shutdown;
     }
-
-    if (CreateTaskProfiler(&profiler) < 0)
-    {   // no profiler is available.
-        goto cleanup_and_shutdown;
-    }
-    StartTaskProfileCapture(&profiler);
 
     // create the compute task scheduler first, and then the async scheduler.
     // the async scheduler may depend on the compute task scheduler.
@@ -762,8 +770,6 @@ WinMain
     ConsoleOutput("The main thread has exited.\n");
 
 cleanup_and_shutdown:
-    StopTaskProfileCapture(&profiler);
-    DeleteTaskProfiler(&profiler);
     HaltScheduler(&task_scheduler);
     if (ev_break        != NULL) SetEvent(ev_break);
     if (thread_draw     != NULL) WaitForSingleObject(thread_draw, INFINITE);
