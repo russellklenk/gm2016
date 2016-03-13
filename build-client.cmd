@@ -17,8 +17,8 @@ SET LNKFLAGS=%LIBRARIES%
 
 IF NOT EXIST %OUTPUTDIR% mkdir %OUTPUTDIR%
 
-xcopy %VULKAN_SDK%\Source\lib\vulkan-1.dll %OUTPUTDIR% /Y
-xcopy %VULKAN_SDK%\Source\lib\vulkan-1.pdb %OUTPUTDIR% /Y
+xcopy %VULKAN_SDK%\Source\lib\vulkan-1.dll %OUTPUTDIR% /Y /Q
+xcopy %VULKAN_SDK%\Source\lib\vulkan-1.pdb %OUTPUTDIR% /Y /Q
 
 PUSHD %OUTPUTDIR%
 cl %CPPFLAGS% ..\src\win32_client.cc %DEFINES% %LNKFLAGS% /Fegclient.exe
