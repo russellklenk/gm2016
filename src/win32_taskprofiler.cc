@@ -27,6 +27,7 @@ enum PROFILER_FLAGS : uint32_t
 /// @summary Defines the data associated with a context switch event. This data is extracted from the EVENT_RECORD::UserData field.
 /// See https://msdn.microsoft.com/en-us/library/windows/desktop/aa364115%28v=vs.85%29.aspx
 /// See https://msdn.microsoft.com/en-us/library/aa964744%28VS.85%29.aspx
+#pragma pack(push, 1)
 struct WIN32_CONTEXT_SWITCH
 {
     uint32_t                 PrevThreadId;       /// The system identifier of the thread being switched out.
@@ -37,12 +38,79 @@ struct WIN32_CONTEXT_SWITCH
     int8_t                   PrevThreadPriority; /// The priority value of the thread being switched out.
     int8_t                   CurrThreadPriority; /// The priority value of the thread being switched in.
 };
+#pragma pack(pop)
+
+/// @summary Defines the data used to look up a task definition. Since task IDs can be reused, the search is performed backwards
+/// in time from the timestamp of a given event (such as a task launch event.)
+#pragma pack(push, 1)
+struct WIN32_TASK_AND_TIME
+{
+    uint64_t                 Timestamp;          /// The timestamp value (in ticks) at which the task was defined.
+    uint32_t                 TaskId;             /// The task identifier.
+    uint32_t                 Reserved;           /// Reserved for future use.
+};
+#pragma pack(pop)
+
+/// @summary Defines the data associated with a task definition. The Name field must point to a string literal or a string that 
+/// will remain valid until the end of the trace; the string is not copied into the task definition.
+struct WIN32_TASK_DEFINITION
+{   static size_t const      MAX_DEPENDENCIES      = 3;
+    char                    *Name;               /// A pointer to a string literal specifying the task name.
+    uint32_t                 SourceIndex;        /// The zero-based index of the TASK_SOURCE that defined the task.
+    uint32_t                 ParentTaskId;       /// The identifier of the parent task, or INVALID_TASK_ID.
+    uint32_t                 DependencyCount;    /// The number of dependencies that must be satisfied before the task can launch.
+    uint32_t                 DependencyIds[3];   /// The task_id_t of the first three dependencies. Additional dependencies are not stored.
+};
+
+/// @summary Define the serialized format of the task definiton data.
+#pragma pack(push, 1)
+struct WIN32_TASK_DEFINITION_ON_DISK
+{   static size_t const      MAX_DEPENDENCIES      = 3;
+    uint64_t                 NameOffset;         /// The byte offset of the task name within the string table.
+    uint32_t                 SourceIndex;        /// The zero-based index of the TASK_SOURCE that defined the task.
+    uint32_t                 ParentTaskId;       /// The identifier of the parent task, or INVALID_TASK_ID.
+    uint32_t                 DependencyCount;    /// The number of dependencies that must be satisfied before the task can launch.
+    uint32_t                 DependencyIds[3];   /// The task_id_t of the first three dependencies. Additional dependencies are not stored.
+};
+#pragma pack(pop)
+
+/// @summary Define the data associated with a task's transition to the ready-to-run state.
+#pragma pack(push, 1)
+struct WIN32_TASK_READY_DATA
+{
+    uint32_t                 TaskId;             /// The task identifier.
+};
+#pragma pack(pop)
+
+/// @summary Define the data associated with a task launch event. This indicates the beginning of the execution of a task on a worker thread.
+#pragma pack(push, 1)
+struct WIN32_TASK_LAUNCH_DATA
+{
+    uint32_t                 TaskId;             /// The task identifier.
+    uint32_t                 WorkerThreadId;     /// The operating system identifier of the thread that executed the task.
+};
+#pragma pack(pop)
+
+/// @summary Define the data associated with a task's completion.
+#pragma pack(push, 1)
+struct WIN32_TASK_FINISH_DATA
+{
+    uint32_t                 TaskId;             /// The task identifier.
+};
+#pragma pack(pop)
 
 /// @summary Define the data managed by the built-in profiler.
 struct WIN32_TASK_PROFILER
 {   static size_t const      MAX_EVENTS            = 256 * 1024;
+    static size_t const      MAX_TASK_SOURCES      = 4096;
+    static size_t const      MAX_WORKER_THREADS    = 4096;
+    static size_t const      MAX_TICKS             = 1024;
+    static size_t const      ETW_BUFFER_SIZE       = 64  * 1024;
 
-    uint64_t                 Mask;               /// The mask value used to convert event counts into array indices.
+    uint32_t                 TickMask;           /// The mask value used to convert tick counts into array indices.
+    uint32_t                 EventMask;          /// The mask value used to convert event counts into array indices.
+    uint32_t                 SourceMask;         /// The mask value used to convert source counts into array indices.
+    uint32_t                 ThreadMask;         /// The mask value used to convert thread counts into array indices.
 
     TRACEHANDLE              ConsumerHandle;     /// The ETW trace handle returned by OpenTrace.
     HANDLE                   ConsumerLaunch;     /// A manual-reset event used by the consumer thread to signal the start of trace capture.
@@ -50,10 +118,38 @@ struct WIN32_TASK_PROFILER
     unsigned int             ConsumerThreadId;   /// The system identifier of the thread that receives context switch events.
     uint32_t                 ProfilerState;      /// One or more of PROFILER_FLAGS indicating the current profiler state.
 
+    uint32_t                 CPWorkerCount;      /// The number of worker threads defined in the compute pool.
+    uint32_t                *CPWorkerThreadId;   /// The OS thread identifier of each worker thread in the compute pool.
+
+    uint32_t                 GPWorkerCount;      /// The number of worker threads defined in the general pool.
+    uint32_t                *GPWorkerThreadId;   /// The OS thread identifier of each worker thread in the general pool.
+
+    uint32_t                 TaskSourceCount;    /// The number of TASK_SOURCE objects allocated for use.
+    uint32_t                *TaskSourceThreadId; /// The OS thread identifier of each allocated TASK_SOURCE.
+
     uint8_t                 *ETWBuffer;          /// A 64KB buffer used for parsing event data returned by ETW.
-    uint64_t                 CSwitchCount;       /// The number of captured context switch events.
+    uint32_t                 CSwitchCount;       /// The number of captured context switch events.
     uint64_t                *CSwitchTime;        /// An array of timestamp values (in ticks) for the context switch events.
     WIN32_CONTEXT_SWITCH    *CSwitchData;        /// An array of context switch event data.
+
+    uint32_t                 TickCount;          /// The number of tick launch events passed to the profiler.
+    uint64_t                *TickLaunchTime;     /// An array of timestamps (in ticks) at which each logical tick was launched.
+
+    uint32_t                 TaskDefCount;       /// The number of task definitions passed to the profiler.
+    WIN32_TASK_AND_TIME     *TaskDefTime;        /// An array of task IDs and timestamps for task definitions.
+    WIN32_TASK_DEFINITION   *TaskDefData;        /// An array of task definition data.
+
+    uint32_t                 TaskRTRCount;       /// The number of ready-to-run transitions passed to the profiler.
+    uint64_t                *TaskRTRTime;        /// An array of timestamps (in ticks) at which each task was made ready-to-run.
+    WIN32_TASK_READY_DATA   *TaskRTRData;        /// An array of task IDs corresponding to the ready-to-run event timestamps.
+
+    uint32_t                 TaskLaunchCount;    /// The number of task launch events passed to the profiler.
+    uint64_t                *TaskLaunchTime;     /// An array of timestamps (in ticks) at which each task launch occurred.
+    WIN32_TASK_LAUNCH_DATA  *TaskLaunchData;     /// An array of task ID and worker thread ID for each task launch event.
+
+    uint32_t                 TaskFinishCount;    /// The number of task finish events passed to the profiler.
+    uint64_t                *TaskFinishTime;     /// An array of timestamps (in ticks) at which each task completion occurred.
+    WIN32_TASK_FINISH_DATA  *TaskFinishData;     /// An array of data associated with each task finish event.
 
     uint64_t                 ClockFrequency;     /// The frequency of the high-resolution timer on the system, in ticks-per-second.
     TRACEHANDLE              SessionHandle;      /// The ETW trace handle for the session.
@@ -119,7 +215,7 @@ TaskProfilerRecordEvent
 {
     WIN32_TASK_PROFILER *profiler = (WIN32_TASK_PROFILER*) ev->UserContext;
     TRACE_EVENT_INFO    *info_buf = (TRACE_EVENT_INFO*) profiler->ETWBuffer;
-    ULONG                size_buf =  64 * 1024;
+    ULONG                size_buf = (ULONG) WIN32_TASK_PROFILER::ETW_BUFFER_SIZE;
 
     // attempt to parse out the context switch information from the EVENT_RECORD.
     if (TdhGetEventInformation_Func(ev, 0, NULL, info_buf, &size_buf) == ERROR_SUCCESS)
@@ -184,11 +280,23 @@ CalculateMemoryForTaskProfiler
 )
 {
     size_t size_in_bytes = 0;
-    size_in_bytes += sizeof(EVENT_TRACE_PROPERTIES);
-    size_in_bytes += sizeof(KERNEL_LOGGER_NAME) + 1;
-    size_in_bytes += AllocationSizeForArray<uint64_t            >(WIN32_TASK_PROFILER::MAX_EVENTS);
-    size_in_bytes += AllocationSizeForArray<WIN32_CONTEXT_SWITCH>(WIN32_TASK_PROFILER::MAX_EVENTS);
-    size_in_bytes += 64 * 1024; // for the event parsing buffer
+    size_in_bytes += sizeof(EVENT_TRACE_PROPERTIES);       // SessionProperties
+    size_in_bytes += sizeof(KERNEL_LOGGER_NAME);           // LogFileName
+    size_in_bytes += WIN32_TASK_PROFILER::ETW_BUFFER_SIZE; // ETWBuffer
+    size_in_bytes += AllocationSizeForArray<uint32_t              >(WIN32_TASK_PROFILER::MAX_WORKER_THREADS); // CPWorkerThreadId
+    size_in_bytes += AllocationSizeForArray<uint32_t              >(WIN32_TASK_PROFILER::MAX_WORKER_THREADS); // GPWorkerThreadId
+    size_in_bytes += AllocationSizeForArray<uint32_t              >(WIN32_TASK_PROFILER::MAX_TASK_SOURCES);   // TaskSourceThreadId
+    size_in_bytes += AllocationSizeForArray<uint64_t              >(WIN32_TASK_PROFILER::MAX_EVENTS);         // CSwitchTime
+    size_in_bytes += AllocationSizeForArray<WIN32_CONTEXT_SWITCH  >(WIN32_TASK_PROFILER::MAX_EVENTS);         // CSwitchData
+    size_in_bytes += AllocationSizeForArray<uint64_t              >(WIN32_TASK_PROFILER::MAX_TICKS);          // TickLaunchTime
+    size_in_bytes += AllocationSizeForArray<WIN32_TASK_AND_TIME   >(WIN32_TASK_PROFILER::MAX_EVENTS);         // TaskDefTime
+    size_in_bytes += AllocationSizeForArray<WIN32_TASK_DEFINITION >(WIN32_TASK_PROFILER::MAX_EVENTS);         // TaskDefData
+    size_in_bytes += AllocationSizeForArray<uint64_t              >(WIN32_TASK_PROFILER::MAX_EVENTS);         // TaskRTRTime
+    size_in_bytes += AllocationSizeForArray<WIN32_TASK_READY_DATA >(WIN32_TASK_PROFILER::MAX_EVENTS);         // TaskRTRData
+    size_in_bytes += AllocationSizeForArray<uint64_t              >(WIN32_TASK_PROFILER::MAX_EVENTS);         // TaskLaunchTime
+    size_in_bytes += AllocationSizeForArray<WIN32_TASK_LAUNCH_DATA>(WIN32_TASK_PROFILER::MAX_EVENTS);         // TaskLaunchData
+    size_in_bytes += AllocationSizeForArray<uint64_t              >(WIN32_TASK_PROFILER::MAX_EVENTS);         // TaskFinishTime
+    size_in_bytes += AllocationSizeForArray<WIN32_TASK_FINISH_DATA>(WIN32_TASK_PROFILER::MAX_EVENTS);         // TaskFinishData
     return size_in_bytes;
 }
 
@@ -239,11 +347,28 @@ CreateTaskProfiler
     props->LoggerNameOffset    = sizeof(EVENT_TRACE_PROPERTIES);
     StringCbCopy(name, sizeof(KERNEL_LOGGER_NAME), KERNEL_LOGGER_NAME);
 
+    // initialize the bitmask values used to convert a count into an array index.
+    profiler->TickMask         = WIN32_TASK_PROFILER::MAX_TICKS          - 1;
+    profiler->EventMask        = WIN32_TASK_PROFILER::MAX_EVENTS         - 1;
+    profiler->SourceMask       = WIN32_TASK_PROFILER::MAX_TASK_SOURCES   - 1;
+    profiler->ThreadMask       = WIN32_TASK_PROFILER::MAX_WORKER_THREADS - 1;
+
     // initialize the various internal event buffers.
-    profiler->Mask             = WIN32_TASK_PROFILER::MAX_EVENTS - 1;
-    profiler->ETWBuffer        = PushArray<uint8_t             >(arena, 64 * 1024);
-    profiler->CSwitchTime      = PushArray<uint64_t            >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
-    profiler->CSwitchData      = PushArray<WIN32_CONTEXT_SWITCH>(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->ETWBuffer          = PushArray<uint8_t               >(arena, WIN32_TASK_PROFILER::ETW_BUFFER_SIZE);
+    profiler->CPWorkerThreadId   = PushArray<uint32_t              >(arena, WIN32_TASK_PROFILER::MAX_WORKER_THREADS);
+    profiler->GPWorkerThreadId   = PushArray<uint32_t              >(arena, WIN32_TASK_PROFILER::MAX_WORKER_THREADS);
+    profiler->TaskSourceThreadId = PushArray<uint32_t              >(arena, WIN32_TASK_PROFILER::MAX_TASK_SOURCES);
+    profiler->CSwitchTime        = PushArray<uint64_t              >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->CSwitchData        = PushArray<WIN32_CONTEXT_SWITCH  >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->TickLaunchTime     = PushArray<uint64_t              >(arena, WIN32_TASK_PROFILER::MAX_TICKS);
+    profiler->TaskDefTime        = PushArray<WIN32_TASK_AND_TIME   >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->TaskDefData        = PushArray<WIN32_TASK_DEFINITION >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->TaskRTRTime        = PushArray<uint64_t              >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->TaskRTRData        = PushArray<WIN32_TASK_READY_DATA >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->TaskLaunchTime     = PushArray<uint64_t              >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->TaskLaunchData     = PushArray<WIN32_TASK_LAUNCH_DATA>(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->TaskFinishTime     = PushArray<uint64_t              >(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
+    profiler->TaskFinishData     = PushArray<WIN32_TASK_FINISH_DATA>(arena, WIN32_TASK_PROFILER::MAX_EVENTS);
 
     // retrieve the frequency of the high-resolution system timer.
     // this is used to convert timestamp values from ticks into seconds.
