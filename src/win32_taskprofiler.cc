@@ -549,7 +549,7 @@ ResetGlobalProfilerState
 }
 
 /// @summary Registers the OS thread identifier of a thread in the compute pool. This function is not thread-safe and should be called during scheduler set up.
-/// @param profiler The profiler associated with the scheduler.
+/// @param profiler The profiler associated with the scheduler that created the worker thread.
 /// @param thread_id The OS thread identifier of the worker thread.
 public_function void
 RegisterComputeWorkerThread
@@ -564,7 +564,7 @@ RegisterComputeWorkerThread
 }
 
 /// @summary Registers the OS thread identifier of a thread in the general pool. This function is not thread-safe and should be called during scheduler set up.
-/// @param profiler The profiler associated with the scheduler.
+/// @param profiler The profiler associated with the scheduler that created the worker thread.
 /// @param thread_id The OS thread identifier of the worker thread.
 public_function void
 RegisterGeneralWorkerThread
@@ -578,6 +578,11 @@ RegisterGeneralWorkerThread
     profiler->GPWorkerCount++;
 }
 
+/// @summary Registers information about a TASK_SOURCE with the profiler. This function is safe for concurrent access by multiple threads.
+/// @param profiler The profiler associated with the scheduler attached to the TASK_SOURCE.
+/// @param source_name A NULL-terminated string specifying a friendly name for the TASK_SOURCE. This string must be a literal or otherwise live for the lifetime of the profiler; it is not copied locally.
+/// @param thread_id The OS thread identifier of the thread that owns the TASK_SOURCE. This may be obtained using the SelfThreadId() function if calling from the thread that owns the TASK_SOURCE.
+/// @param source_index The zero-based index of the TASK_SOURCE within the scheduler. This value can be obtained from TASK_SOURCE::SourceIndex.
 public_function void
 RegisterTaskSource
 (
@@ -593,6 +598,8 @@ RegisterTaskSource
     profiler->TaskSourceData[slot].SourceIndex = source_index;
 }
 
+/// @summary Log a marker indicating the start of a tick. This function should be called from the tick launch thread only.
+/// @param profiler The profiler to receive the event.
 public_function void
 MarkTickLaunch
 (
@@ -604,6 +611,14 @@ MarkTickLaunch
     profiler->TickCount++;
 }
 
+/// @summary Log a marker indicating when a given task was defined. This function is safe for concurrent access from multiple threads.
+/// @param profiler The profiler to receive the event.
+/// @param task_name A NULL-terminated string specifying a friendly name for the task. This string must be a literal or otherwise live for the lifetime of the profiler; it is not copied locally.
+/// @param task_id The task identifier generated for the task by the scheduler.
+/// @param source_index The zero-based index of the TASK_SOURCE that is defining the task. This value may be obtained from TASK_SOURCE::SourceIndex.
+/// @param parent_id The task identifier for the parent task (if this new task is a child task) or INVALID_TASK_ID.
+/// @param dependencies The list of task identifiers for any tasks that must complete before this new task becomes ready-to-run, or NULL.
+/// @param dependency_count The number of task identifiers in the dependency list.
 public_function void
 MarkTaskDefinition
 (
@@ -633,6 +648,9 @@ MarkTaskDefinition
     }
 }
 
+/// @param Log a marker indicating when a task becomes ready-to-run. This function is safe for concurrent access from multiple threads.
+/// @param profiler The profiler to receive the event.
+/// @param task_id The identifier of the task that has become ready-to-run.
 public_function void
 MarkTaskReadyToRun
 (
@@ -645,6 +663,10 @@ MarkTaskReadyToRun
     profiler->TaskRTRData[slot].TaskId = task_id;
 }
 
+/// @summary Log a marker indicating when a ready-to-run task starts execution on a worker thread. This function is safe for concurrent access from multiple threads.
+/// @param profiler The profiler to receive the event.
+/// @param task_id The identifier of the ready-to-run task being executed.
+/// @param thread_id The OS thread identifier of the worker thread executing the task.
 public_function void
 MarkTaskLaunch
 (
@@ -659,6 +681,9 @@ MarkTaskLaunch
     profiler->TaskLaunchData[slot].WorkerThreadId = thread_id;
 }
 
+/// @summary Log a marker indicating that a task has finished executing on a worker thread. This function is safe for concurrent access from multiple threads.
+/// @param profiler The profiler to receive the event.
+/// @param task_id The identifier of the task that finished executing.
 public_function void
 MarkTaskFinish
 (
