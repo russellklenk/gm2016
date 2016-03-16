@@ -1146,6 +1146,17 @@ terminate_worker:
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
+/// @summary Retrieves the operating system identifier of the calling thread.
+/// @return The unique identifier of the calling thread.
+public_function inline uint32_t
+SelfThreadId
+(
+    void
+)
+{
+    return GetCurrentThreadId();
+}
+
 /// @summary Calculate the amount of memory required for a thread pool, not including the per-thread memory arena.
 /// @param max_threads The maximum number of threads in the pool.
 /// @return The number of bytes required for thread pool initialization, not including the size of the WIN32_THREAD_POOL instance.
