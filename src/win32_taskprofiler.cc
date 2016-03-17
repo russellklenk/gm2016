@@ -76,7 +76,7 @@ struct WIN32_TASK_AND_TIME
 /// will remain valid until the end of the trace; the string is not copied into the task definition.
 struct WIN32_TASK_DEFINITION
 {   static size_t const      MAX_DEPENDENCIES      = 3;
-    char                    *Name;               /// A pointer to a string literal specifying the task name.
+    char const              *Name;               /// A pointer to a string literal specifying the task name.
     uint32_t                 SourceIndex;        /// The zero-based index of the TASK_SOURCE that defined the task.
     uint32_t                 ParentTaskId;       /// The identifier of the parent task, or INVALID_TASK_ID.
     uint32_t                 DependencyCount;    /// The number of dependencies that must be satisfied before the task can launch.
@@ -187,6 +187,7 @@ struct WIN32_TASK_PROFILER
 /// @param info_buf The TRACE_EVENT_INFO containing event metadata.
 /// @param index The zero-based index of the property to retrieve.
 /// @return The integer value.
+#if ENABLE_TASK_PROFILER
 internal_function inline uint32_t
 TaskProfilerGetUInt32
 (
@@ -203,12 +204,14 @@ TaskProfilerGetUInt32
     TdhGetProperty_Func(ev, 0, NULL, 1, &dd, (ULONG) sizeof(uint32_t), (PBYTE) &value);
     return value;
 }
+#endif
 
 /// @summary Retrieve an 8-bit signed integer property value from an event record.
 /// @param ev The EVENT_RECORD passed to TaskProfilerRecordEvent.
 /// @param info_buf The TRACE_EVENT_INFO containing event metadata.
 /// @param index The zero-based index of the property to retrieve.
 /// @return The integer value.
+#if ENABLE_TASK_PROFILER
 internal_function inline int8_t
 TaskProfilerGetSInt8
 (
@@ -225,9 +228,11 @@ TaskProfilerGetSInt8
     TdhGetProperty_Func(ev, 0, NULL, 1, &dd, (ULONG) sizeof(int8_t), (PBYTE) &value);
     return value;
 }
+#endif
 
 /// @summary Callback invoked for each context switch event reported by Event Tracing for Windows.
 /// @param ev Data associated with the event being reported.
+#if ENABLE_TASK_PROFILER
 internal_function void WINAPI
 TaskProfilerRecordEvent
 (
@@ -245,7 +250,7 @@ TaskProfilerRecordEvent
         {   // opcode 36 corresponds to a CSwitch event.
             // see https://msdn.microsoft.com/en-us/library/windows/desktop/aa964744%28v=vs.85%29.aspx
             // all context switch event handling occurs on the same thread.
-            uint64_t             ev_index   = profiler->CSwitchCount & profiler->Mask;
+            uint64_t             ev_index   = profiler->CSwitchCount & profiler->EventMask;
             WIN32_CONTEXT_SWITCH &cswitch   = profiler->CSwitchData[ev_index];
             cswitch.CurrThreadId            = TaskProfilerGetUInt32(ev, info_buf,  0); // NewThreadId
             cswitch.PrevThreadId            = TaskProfilerGetUInt32(ev, info_buf,  1); // OldThreadId
@@ -259,10 +264,12 @@ TaskProfilerRecordEvent
         }
     }
 }
+#endif
 
 /// @summary Implements the entry point of the thread that dispatches ETW context switch events.
 /// @param argp A pointer to the WIN32_TASK_PROFILER to which events will be logged.
 /// @return Zero (unused).
+#if ENABLE_TASK_PROFILER
 internal_function unsigned int __cdecl
 TaskProfilerThreadMain
 (
@@ -289,6 +296,7 @@ TaskProfilerThreadMain
     }
     return 0;
 }
+#endif
 
 /*////////////////////////
 //   Public Functions   //
@@ -324,7 +332,8 @@ CalculateMemoryForTaskProfiler
 
 /// @summary Create a new task system profiler. Call StartTaskProfileCapture to begin capturing profile events.
 /// @param profiler The WIN32_TASK_PROFILER instance to initialize.
-/// @return Zero if the profiler instance is successfullyer initialized, or -1 if an error occurred.
+/// @return Zero if the profiler instance is successfully initialized, or -1 if an error occurred.
+#if ENABLE_TASK_PROFILER
 public_function int
 CreateTaskProfiler
 (
@@ -417,9 +426,21 @@ CreateTaskProfiler
     profiler->SessionProperties = props;
     return 0;
 }
+#else
+public_function int
+CreateTaskProfiler
+(
+    WIN32_TASK_PROFILER *profiler
+)
+{   // profiling is disabled. just zero out the data.
+    ZeroMemory(profiler, sizeof(WIN32_TASK_PROFILER));
+    return 0;
+}
+#endif /* ENABLE_TASK_PROFILER */
 
 /// @summary Stops any open capture sessions and releases all resources associated with a task system profiler.
 /// @param profiler The profile instance to delete.
+#if ENABLE_TASK_PROFILER
 public_function void
 DeleteTaskProfiler
 (
@@ -440,10 +461,21 @@ DeleteTaskProfiler
     }
     ZeroMemory(profiler, sizeof(WIN32_TASK_PROFILER));
 }
+#else
+public_function void
+DeleteTaskProfiler
+(
+    WIN32_TASK_PROFILER *profiler
+)
+{   // profiling is disabled. there are no resources to clean up.
+    ZeroMemory(profiler, sizeof(WIN32_TASK_PROFILER));
+}
+#endif
 
 /// @summary Begin capturing task system profile events.
 /// @param profiler The profiler instance for which capturing will be enabled.
 /// @return Zero if event capture is enabled, or -1 if an error occurred.
+#if ENABLE_TASK_PROFILER
 public_function int
 StartTaskProfileCapture
 (
@@ -509,9 +541,21 @@ StartTaskProfileCapture
     SetEvent(launch_handle);
     return 0;
 }
+#else
+public_function int
+StartTaskProfileCapture
+(
+    WIN32_TASK_PROFILER *profiler
+)
+{   // profiling is disabled. return success.
+    UNUSED_ARG(profiler);
+    return 0;
+}
+#endif
 
 /// @summary Stop capturing task system profiling events. This may block the calling thread for several seconds until buffered events are captured.
 /// @param profiler The profiler instance to update.
+#if ENABLE_TASK_PROFILER
 public_function void
 StopTaskProfileCapture
 (
@@ -531,11 +575,22 @@ StopTaskProfileCapture
         profiler->ProfilerState.store(PROFILER_STATE_IDLE, std::memory_order_seq_cst);
     }
 }
+#else
+public_function void
+StopTaskProfileCapture
+(
+    WIN32_TASK_PROFILER *profiler
+)
+{   // profiling is disabled. nothing to do.
+    UNUSED_ARG(profiler);
+}
+#endif
 
 /// @summary Unregisters all currently known global state associated with a profiler instance.
 /// Worker threads and task sources will need to be re-registered, and the tick counter is reset to zero.
 /// This function should be called only when no other threads are accessing the profiler, before calling StartTaskProfileCapture.
 /// @param profiler The profiler to reset.
+#if ENABLE_TASK_PROFILER
 public_function void
 ResetGlobalProfilerState
 (
@@ -547,10 +602,14 @@ ResetGlobalProfilerState
     profiler->TaskSourceCount = 0;
     profiler->TickCount       = 0;
 }
+#else
+#define ResetGlobalProfilerState(profiler) /* profiling disabled */
+#endif
 
 /// @summary Registers the OS thread identifier of a thread in the compute pool. This function is not thread-safe and should be called during scheduler set up.
 /// @param profiler The profiler associated with the scheduler that created the worker thread.
 /// @param thread_id The OS thread identifier of the worker thread.
+#if ENABLE_TASK_PROFILER
 public_function void
 RegisterComputeWorkerThread
 (
@@ -562,10 +621,14 @@ RegisterComputeWorkerThread
     profiler->CPWorkerThreadId[slot] = thread_id;
     profiler->CPWorkerCount++;
 }
+#else
+#define RegisterComputeWorkerThread(profiler, thread_id) /* profiling disabled */
+#endif
 
 /// @summary Registers the OS thread identifier of a thread in the general pool. This function is not thread-safe and should be called during scheduler set up.
 /// @param profiler The profiler associated with the scheduler that created the worker thread.
 /// @param thread_id The OS thread identifier of the worker thread.
+#if ENABLE_TASK_PROFILER
 public_function void
 RegisterGeneralWorkerThread
 (
@@ -577,12 +640,16 @@ RegisterGeneralWorkerThread
     profiler->GPWorkerThreadId[slot] = thread_id;
     profiler->GPWorkerCount++;
 }
+#else
+#define RegisterGeneralWorkerThread(profiler, thread_id) /* profiling disabled */
+#endif
 
 /// @summary Registers information about a TASK_SOURCE with the profiler. This function is safe for concurrent access by multiple threads.
 /// @param profiler The profiler associated with the scheduler attached to the TASK_SOURCE.
 /// @param source_name A NULL-terminated string specifying a friendly name for the TASK_SOURCE. This string must be a literal or otherwise live for the lifetime of the profiler; it is not copied locally.
 /// @param thread_id The OS thread identifier of the thread that owns the TASK_SOURCE. This may be obtained using the SelfThreadId() function if calling from the thread that owns the TASK_SOURCE.
 /// @param source_index The zero-based index of the TASK_SOURCE within the scheduler. This value can be obtained from TASK_SOURCE::SourceIndex.
+#if ENABLE_TASK_PROFILER
 public_function void
 RegisterTaskSource
 (
@@ -597,9 +664,13 @@ RegisterTaskSource
     profiler->TaskSourceData[slot].ThreadId = thread_id;
     profiler->TaskSourceData[slot].SourceIndex = source_index;
 }
+#else
+#define RegisterTaskSource(profiler, source_name, thread_id, source_index) /* profiling disabled */
+#endif
 
 /// @summary Log a marker indicating the start of a tick. This function should be called from the tick launch thread only.
 /// @param profiler The profiler to receive the event.
+#if ENABLE_TASK_PROFILER
 public_function void
 MarkTickLaunch
 (
@@ -610,6 +681,9 @@ MarkTickLaunch
     profiler->TickLaunchTime[slot] = TimestampInTicks();
     profiler->TickCount++;
 }
+#else
+#define MarkTickLaunch(profiler) /* profiling disabled */
+#endif
 
 /// @summary Log a marker indicating when a given task was defined. This function is safe for concurrent access from multiple threads.
 /// @param profiler The profiler to receive the event.
@@ -619,6 +693,7 @@ MarkTickLaunch
 /// @param parent_id The task identifier for the parent task (if this new task is a child task) or INVALID_TASK_ID.
 /// @param dependencies The list of task identifiers for any tasks that must complete before this new task becomes ready-to-run, or NULL.
 /// @param dependency_count The number of task identifiers in the dependency list.
+#if ENABLE_TASK_PROFILER
 public_function void
 MarkTaskDefinition
 (
@@ -647,10 +722,14 @@ MarkTaskDefinition
         profiler->TaskDefData[slot].DependencyIds[i] = dependencies[i];
     }
 }
+#else
+#define MarkTaskDefinition(profiler, task_name, task_id, source_index, parent_id, dependencies, dependency_count) /* profiling disabled */
+#endif
 
 /// @param Log a marker indicating when a task becomes ready-to-run. This function is safe for concurrent access from multiple threads.
 /// @param profiler The profiler to receive the event.
 /// @param task_id The identifier of the task that has become ready-to-run.
+#if ENABLE_TASK_PROFILER
 public_function void
 MarkTaskReadyToRun
 (
@@ -662,11 +741,15 @@ MarkTaskReadyToRun
     profiler->TaskRTRTime[slot] = TimestampInTicks();
     profiler->TaskRTRData[slot].TaskId = task_id;
 }
+#else
+#define MarkTaskReadyToRun(profiler, task_id) /* profiling disabled */
+#endif
 
 /// @summary Log a marker indicating when a ready-to-run task starts execution on a worker thread. This function is safe for concurrent access from multiple threads.
 /// @param profiler The profiler to receive the event.
 /// @param task_id The identifier of the ready-to-run task being executed.
 /// @param thread_id The OS thread identifier of the worker thread executing the task.
+#if ENABLE_TASK_PROFILER
 public_function void
 MarkTaskLaunch
 (
@@ -680,10 +763,14 @@ MarkTaskLaunch
     profiler->TaskLaunchData[slot].TaskId = task_id;
     profiler->TaskLaunchData[slot].WorkerThreadId = thread_id;
 }
+#else
+#define MarkTaskLaunch(profiler, task_id, thread_id) /* profiling disabled */
+#endif
 
 /// @summary Log a marker indicating that a task has finished executing on a worker thread. This function is safe for concurrent access from multiple threads.
 /// @param profiler The profiler to receive the event.
 /// @param task_id The identifier of the task that finished executing.
+#if ENABLE_TASK_PROFILER
 public_function void
 MarkTaskFinish
 (
@@ -695,4 +782,7 @@ MarkTaskFinish
     profiler->TaskFinishTime[slot] = TimestampInTicks();
     profiler->TaskFinishData[slot].TaskId = task_id;
 }
+#else
+#define MarkTaskFinish(profiler, task_id) /* profiling disabled */
+#endif
 

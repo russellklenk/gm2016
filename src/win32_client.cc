@@ -52,6 +52,8 @@
 #include <evntrace.h>
 #include <evntcons.h>
 #include <tdh.h>
+#else
+#include <evntrace.h>
 #endif
 
 #include <vulkan/vulkan.h>
@@ -59,19 +61,16 @@
 #include "platform_config.h"
 #include "compiler_config.h"
 #include "win32_platform.h"
-
 #include "win32_debug.cc"
 #include "win32_runtime.cc"
 #include "win32_memarena.cc"
 #include "win32_timestamp.cc"
-#include "win32_scheduler.cc"
-
-#if ENABLE_TASK_PROFILER
 #include "win32_taskprofiler.cc"
-#endif
 
+#include "win32_scheduler.cc"
 #include "win32_display.cc"
 #include "win32_input.cc"
+
 #include "win32_random.cc"
 #include "win32_parse.cc"
 
