@@ -159,7 +159,7 @@ LaunchTaskMain
         // this should prevent cache contention between tasks.
         size_t         n = (args->Count- i) >= args->Divisor ? args->Divisor : (args->Count - i);
         TEST_TASK_DATA a = {args->Array, i, n};
-        task_id_t  child =  NewComputeTask(&b, TestTaskMain, &a, task_id, TASK_SIZE_SMALL);
+        task_id_t  child =  NewComputeTask(&b, TASK_MAIN(TestTaskMain), &a, task_id, TASK_SIZE_SMALL);
         UNUSED_LOCAL(child);
         i += n;
     }
@@ -246,9 +246,9 @@ AsyncLaunchesComputeTaskMain
         TASK_BATCH    b = {};
         NewTaskBatch(&b, thread_source);
         LAUNCH_TASK_DATA ld = { array, count, 1024 };
-        task_id_t launch_id = NewComputeTask(&b, LaunchTaskMain, &ld, TASK_SIZE_SMALL);
+        task_id_t launch_id = NewComputeTask(&b, TASK_MAIN(LaunchTaskMain), &ld, TASK_SIZE_SMALL);
         FENCE_TASK_DATA  fd = { array, count, ev };
-        task_id_t finish_id = NewComputeTask(&b, FenceTaskMain , &fd, &launch_id, 1, TASK_SIZE_LARGE);
+        task_id_t finish_id = NewComputeTask(&b, TASK_MAIN(FenceTaskMain) , &fd, &launch_id, 1, TASK_SIZE_LARGE);
         UNUSED_LOCAL(finish_id);
     }
 
@@ -740,15 +740,15 @@ WinMain
         /*
         LAUNCH_TASK_DATA launch_data = { workspace, workspace_size, 2048 };
         FENCE_TASK_DATA   fence_data = { workspace, workspace_size, ev_fence };
-        task_id_t        launch_task = NewComputeTask(&b, LaunchTaskMain, &launch_data, TASK_SIZE_SMALL);
-        task_id_t        finish_task = NewComputeTask(&b,  FenceTaskMain,  &fence_data, &launch_task, 1, TASK_SIZE_LARGE);
+        task_id_t        launch_task = NewComputeTask(&b, TASK_MAIN(LaunchTaskMain), &launch_data, TASK_SIZE_SMALL);
+        task_id_t        finish_task = NewComputeTask(&b, TASK_MAIN(FenceTaskMain) ,  &fence_data, &launch_task, 1, TASK_SIZE_LARGE);
         FlushTaskBatch(&b);
         WaitForSingleObject(ev_fence, INFINITE);
         UNUSED_LOCAL(finish_task);
         */
 
         ASYNC_TASK_DATA ad = { ev_fence };
-        task_id_t async_id = NewGeneralTask(&b, AsyncLaunchesComputeTaskMain, &ad);
+        task_id_t async_id = NewGeneralTask(&b, TASK_MAIN(AsyncLaunchesComputeTaskMain), &ad);
         UNUSED_LOCAL(async_id);
         FlushTaskBatch(&b);
         WaitForSingleObject(ev_fence, INFINITE);
