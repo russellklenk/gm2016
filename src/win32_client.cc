@@ -563,6 +563,7 @@ WinMain
     MEMORY_ARENA                       main_arena = {};
     WIN32_TASK_SCHEDULER_CONFIG  scheduler_config = {};
     WIN32_TASK_SCHEDULER           task_scheduler = {};
+    WIN32_TASK_PROFILER             task_profiler = {};
     HANDLE                               ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_fence = CreateEvent(NULL, FALSE,FALSE, NULL); // auto-reset
@@ -643,9 +644,15 @@ WinMain
         goto cleanup_and_shutdown;
     }
 
-    // create the compute task scheduler first, and then the async scheduler.
-    // the async scheduler may depend on the compute task scheduler.
+    // create the task system profiler for capturing execution flow.
+    if (CreateTaskProfiler(&task_profiler) < 0)
+    {   // no profilinf services are available.
+        goto cleanup_and_shutdown;
+    }
+
+    // create the task scheduler to manage execution of work items on worker threads.
     DefaultSchedulerConfiguration(&scheduler_config, &thread_args, &host_cpu);
+    scheduler_config.Profiler = &task_profiler;
     scheduler_config.PoolSize[TASK_POOL_GENERAL].MaxTasks = 8192;
     scheduler_config.PoolSize[TASK_POOL_COMPUTE].MaxTasks = 65536;
     if (CreateScheduler(&task_scheduler, &scheduler_config, &main_arena) < 0)
@@ -653,6 +660,7 @@ WinMain
         ConsoleError("ERROR: Unable to create the compute task scheduler.\n");
         goto cleanup_and_shutdown;
     }
+    RegisterTaskSource(&task_profiler, "Root", SelfThreadId(), RootTaskSource(&task_scheduler)->SourceIndex);
 
     // set up explicit threads for frame composition, network I/O and file I/O.
     if ((thread_draw = SpawnExplicitThread(DisplayThread, &thread_args)) == NULL)
@@ -733,6 +741,7 @@ WinMain
         predicted_tick_launch = predicted_tick_launch + tick_interval;
 
         // work work work
+        MarkTickLaunch(&task_profiler);
         ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %I64dns (%0.06fms).\n", NanosecondsToWholeMilliseconds(actual_tick_launch) / 1000.0, NanosecondsToWholeMilliseconds(predicted_tick_launch) / 1000.0, tick_miss_time, tick_miss_time / 1000000.0);
         TASK_BATCH    b  = {};
         NewTaskBatch(&b, RootTaskSource(&task_scheduler));
