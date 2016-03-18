@@ -7,10 +7,6 @@
 /// a task may wait for one or more tasks to complete before it will launch.
 /// Each type of task executes in a separate thread pool.
 /// Windows I/O completion ports are used to wake threads in the pool.
-/// The task scheduler system supports built-in profiling using Event Tracing
-/// for Windows, in conjunction with custom information, at the cost of some 
-/// fixed space and time overhead (an extra thread is required to capture 
-/// context switch events, which are generated at a rate of 20k-40k/sec.)
 ///////////////////////////////////////////////////////////////////////////80*/
 
 /*/////////////////
@@ -63,22 +59,12 @@
 #define INVALID_TASK_ID                   ((task_id_t) 0x7FFFFFFFUL)
 #endif
 
-/// @summary Define a helper macro used to specify a task entrypoint function and its name.
-#ifndef TASK_MAIN
-    #if ENABLE_TASK_PROFILER
-        #define TASK_MAIN(_main_func)     _main_func, #_main_func
-    #else
-        #define TASK_MAIN(_main_func)     _main_func, NULL
-    #endif
-#endif
-
 /*////////////////////////////
 //   Forward Declarations   //
 ////////////////////////////*/
 struct WIN32_THREAD_ARGS;
 struct WIN32_TASK_SCHEDULER;
 struct WIN32_TASK_SCHEDULER_CONFIG;
-struct WIN32_TASK_PROFILER;
 struct WIN32_WORKER_THREAD;
 struct WIN32_THREAD_POOL;
 struct WIN32_THREAD_POOL_CONFIG;
@@ -221,8 +207,6 @@ struct cacheline_align       TASK_SOURCE
     HANDLE                   ComputePoolPort;    /// The I/O completion port used to wake threads in the compute pool.
     HANDLE                   GeneralPoolPort;    /// The I/O completion port used to wake threads in the general pool.
 
-    WIN32_TASK_PROFILER     *TaskProfiler;       /// The profiler to which events will be logged, or NULL.
-
     uint32_t                 SourceIndex;        /// The zero-based index of this TASK_SOURCE in the scheduler source list. Constant.
     uint32_t                 SourceCount;        /// The total number of task sources defined in the scheduler. Constant.
     TASK_SOURCE             *TaskSources;        /// The list of per-source state for each task source. Managed by the scheduler.
@@ -302,7 +286,6 @@ struct WIN32_TASK_SCHEDULER
     size_t                   MaxSources;         /// The maximum number of compute task sources.
     size_t                   SourceCount;        /// The number of allocated compute task sources.
     TASK_SOURCE             *TaskSources;        /// The data associated with each compute task source. SourceCount are currently valid.
-    WIN32_TASK_PROFILER     *TaskProfiler;       /// The profiler instance to which profile events will be emitted, or NULL.
     HANDLE                   LaunchSignal;       /// Manual-reset event signaled when worker threads should start running tasks.
     HANDLE                   ComputePoolPort;    /// The I/O completion port used to send notifications to worker threads in the compute pool.
     WIN32_THREAD_POOL        ComputePool;        /// The thread pool used for running work-heavy, non-blocking tasks.
@@ -324,7 +307,6 @@ struct WIN32_TASK_SCHEDULER_CONFIG
 {   static size_t const      NUM_POOLS             = TASK_POOL_COUNT;
     WIN32_THREAD_ARGS       *MainThreadArgs;     /// The global data managed by the main thread and available to all threads.
     size_t                   MaxTaskSources;     /// The maximum number of threads (task sources) that can create tasks.
-    WIN32_TASK_PROFILER     *Profiler;           /// The profiler instance to which profile events will be emitted, or NULL.
     WIN32_THREAD_POOL_SIZE   PoolSize[NUM_POOLS];/// The maximum number of worker threads in each type of thread pool.
 };
 
@@ -852,12 +834,10 @@ AllowPermits
             if (is_compute)
             {   // this task will run on the compute thread pool.
                 TaskQueuePush(cqueue, ref); ++nc;
-                MarkTaskReadyToRun(thread_source->TaskProfiler, ref);
             }
             else
             {   // this task will run on the general thread pool.
                 TaskQueuePush(gqueue, ref); ++ng;
-                MarkTaskReadyToRun(thread_source->TaskProfiler, ref);
             }
         }
     }
@@ -997,9 +977,7 @@ ComputeWorkerMain
                 size_t ng = 0; // # of general tasks made ready-to-run by this task.
                 ArenaReset(thread_arena);
                 TASK_DATA *td = GetTaskWorkItem(task_ids[i], thread_source->TaskSources);
-                MarkTaskLaunch(thread_source->TaskProfiler, task_ids[i], worker_id);
                 td->TaskMain(task_ids[i], thread_source, td, thread_arena, a, s);
-                MarkTaskFinish(thread_source->TaskProfiler, task_ids[i]);
                 FinishTask(thread_source, task_ids[i], nc, ng);
                 permitted_compute += nc; 
                 permitted_general += ng;
@@ -1136,9 +1114,7 @@ GeneralWorkerMain
             TASK_DATA            *td = GetTaskWorkItem(task_id, thread_source->TaskSources);
 
             ArenaReset(thread_arena);
-            MarkTaskLaunch(thread_source->TaskProfiler, task_id, worker_id);
             td->TaskMain(task_id, thread_source, td, thread_arena, a, s);
-            MarkTaskFinish(thread_source->TaskProfiler, task_id);
             FinishTask(thread_source, task_id, permitted_compute, permitted_general);
 
             if (permitted_compute > 0)
@@ -1416,7 +1392,6 @@ NewTaskSource
     source->GeneralPoolPort = scheduler->GeneralPoolPort;
     source->SourceIndex     = uint32_t(scheduler->SourceCount);
     source->SourceCount     = uint32_t(scheduler->MaxSources);
-    source->TaskProfiler    = scheduler->TaskProfiler;
     source->TaskSources     = scheduler->TaskSources;
     source->MaxTasks        = uint32_t(max_tasks);
     source->TaskIndex       = 0;
@@ -1550,18 +1525,6 @@ CheckSchedulerConfiguration
         performance_warnings = false;
         return -1;
     }
-
-#if ENABLE_TASK_PROFILER
-    if (src_config->Profiler == NULL)
-    {   // if profiling is enabled, a profiler instance must be specified.
-        ConsoleError("ERROR (%S): Scheduler profiling enabled, but no profiler instance provided.\n", __FUNCTION__);
-        performance_warnings = false;
-        return -1;
-    }
-#endif
-
-    // copy the profiler reference over directly.
-    dst_config->Profiler  = (WIN32_TASK_PROFILER*) src_config->Profiler;
 
     // retrieve the current system memory usage.
     WIN32_CPU_INFO const *host_cpu_info = src_config->MainThreadArgs->HostCPUInfo;
@@ -1831,14 +1794,10 @@ CreateScheduler
     scheduler->MaxSources      = valid_config.MaxTaskSources;
     scheduler->SourceCount     = 0;
     scheduler->TaskSources     = PushArray<TASK_SOURCE>(arena, valid_config.MaxTaskSources);
-    scheduler->TaskProfiler    = valid_config.Profiler;
     scheduler->LaunchSignal    = ev_launch;
     scheduler->ComputePoolPort = cp_port;
     scheduler->GeneralPoolPort = gp_port;
     ZeroMemory(scheduler->TaskSources, valid_config.MaxTaskSources * sizeof(TASK_SOURCE));
-
-    // reset the profiler state; worker threads and task sources will be re-specified.
-    ResetGlobalProfilerState(scheduler->TaskProfiler);
 
     // task sources must be allocated for worker threads before the threads are spawned
     // (which happens when the thread pools are created, below.)
@@ -1891,16 +1850,6 @@ CreateScheduler
         goto cleanup_and_fail;
     }
 
-    // register the worker threads in the general pool with the profiler.
-    for (size_t i = 0, n = scheduler->GeneralPool.ActiveThreads; i < n; ++i)
-    {
-        uint32_t      id = scheduler->GeneralPool.OSThreadIds[i];
-        TASK_SOURCE *src = scheduler->GeneralPool.WorkerSource[i];
-        RegisterGeneralWorkerThread(scheduler->TaskProfiler, id);
-        RegisterTaskSource(scheduler->TaskProfiler, "GeneralPoolWorker", id, src->SourceIndex);
-        UNUSED_LOCAL(id); UNUSED_LOCAL(src); // prevent warnings if profiler is disabled
-    }
-
     // initialize, but do not launch, the compute task thread pool.
     compute_config.TaskScheduler     = scheduler;
     compute_config.ThreadMain        = ComputeWorkerMain;
@@ -1916,16 +1865,6 @@ CreateScheduler
     {   // the scheduler would have no pool in which to execute compute tasks.
         ConsoleError("ERROR (%S): Failed to create the compute thread pool.\n", __FUNCTION__);
         goto cleanup_and_fail;
-    }
-
-    // register the worker threads in the compute pool with the profiler.
-    for (size_t i = 0, n = scheduler->ComputePool.ActiveThreads; i < n; ++i)
-    {
-        uint32_t      id = scheduler->ComputePool.OSThreadIds[i];
-        TASK_SOURCE *src = scheduler->ComputePool.WorkerSource[i];
-        RegisterComputeWorkerThread(scheduler->TaskProfiler, id);
-        RegisterTaskSource(scheduler->TaskProfiler, "ComputePoolWorker", id, src->SourceIndex);
-        UNUSED_LOCAL(id); UNUSED_LOCAL(src); // prevent warnings if profiler is disabled
     }
 
     return 0;
@@ -1990,7 +1929,6 @@ RootTaskSource
 /// @param thread_source The TASK_SOURCE owned by the thread creating the new task.
 /// @param task_pool One of the values of the TASK_POOL enumeration specifying the thread pool on which the task should run.
 /// @param task_main The entry point of the new task.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
 /// @param args_size The size of the optional task data, in bytes.
 /// @param parent_id The identifier of the parent task, or INVALID_TASK_ID.
@@ -2005,7 +1943,6 @@ NewTask
     TASK_SOURCE       *thread_source,
     uint32_t  const        task_pool, 
     TASK_ENTRYPOINT        task_main, 
-    char      const       *task_name,
     void      const       *task_args, 
     size_t    const        args_size, 
     task_id_t const        parent_id, 
@@ -2049,8 +1986,6 @@ NewTask
 
     // create the task identifier and register it with the profiler.
     task_id_t task_id = MakeTaskId(task_size, task_pool, task_index, thread_source->SourceIndex);
-    MarkTaskDefinition(thread_source->TaskProfiler, task_name, task_id, thread_source->SourceIndex, parent_id, dependencies, dependency_count);
-    UNUSED_ARG(task_name); // prevent warnings if the profiler is disabled.
 
     // initialize the task data in the claimed slot.
     TASK_DATA                  &task = thread_source->WorkItems [task_index];
@@ -2067,13 +2002,11 @@ NewTask
         if (task_pool == TASK_POOL_COMPUTE)
         {   // this task executes on the compute thread pool.
             TaskQueuePush(&thread_source->ComputeWorkQueue, task_id);
-            MarkTaskReadyToRun(thread_source->TaskProfiler, task_id);
             ready_to_run++;
         }
         else
         {   // this task executes on the general thread pool.
             TaskQueuePush(&thread_source->GeneralWorkQueue, task_id);
-            MarkTaskReadyToRun(thread_source->TaskProfiler, task_id);
             ready_to_run++;
         }
     }
@@ -2228,7 +2161,6 @@ TaskBatchPostAdd
 /// @summary Creates a new task to execute on the compute thread pool.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
 /// @return The identifier of the new task, or INVALID_TASK_ID.
 public_function inline task_id_t
@@ -2236,20 +2168,18 @@ NewComputeTask
 (
     TASK_BATCH         *batch, 
     TASK_ENTRYPOINT task_main, 
-    char     const *task_name,
     uint32_t const  task_size
 )
 {
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_name, NULL, 0, INVALID_TASK_ID, NULL, 0, task_size, batch->RTRComputeCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, INVALID_TASK_ID, NULL, 0, task_size, batch->RTRComputeCount);
     return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Creates a new task to execute on the compute thread pool. The task is created as a child of another task. The parent task does not complete until all children have completed.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
 /// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
 /// @return The identifier of the new task, or INVALID_TASK_ID.
@@ -2258,7 +2188,6 @@ NewComputeTask
 (
     TASK_BATCH          *batch, 
     TASK_ENTRYPOINT  task_main, 
-    char      const *task_name, 
     task_id_t const  parent_id,
     uint32_t  const  task_size
 )
@@ -2267,14 +2196,13 @@ NewComputeTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_name, NULL, 0, parent_id, NULL, 0, task_size, batch->RTRComputeCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, parent_id, NULL, 0, task_size, batch->RTRComputeCount);
     return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the compute thread pool. The task will not execute until all of its dependencies have completed.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
 /// @param dependency_count The number of valid task identifiers in the dependencies list.
 /// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
@@ -2284,7 +2212,6 @@ NewComputeTask
 (
     TASK_BATCH                *batch,
     TASK_ENTRYPOINT        task_main, 
-    char      const       *task_name,
     task_id_t const    *dependencies, 
     size_t    const dependency_count,
     uint32_t  const        task_size 
@@ -2292,14 +2219,13 @@ NewComputeTask
 {
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_name, NULL, 0, INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRComputeCount);
     return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the compute thread pool. The task will not execute until all of its dependencies have completed. The task is created as the child of another task. The parent task does not complete until all children have completed.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
 /// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
 /// @param dependency_count The number of valid task identifiers in the dependencies list.
@@ -2310,7 +2236,6 @@ NewComputeTask
 (
     TASK_BATCH                *batch,
     TASK_ENTRYPOINT        task_main,
-    char      const       *task_name,
     task_id_t const        parent_id,
     task_id_t const    *dependencies, 
     size_t    const dependency_count,
@@ -2321,7 +2246,7 @@ NewComputeTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_name, NULL, 0, parent_id, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, NULL, 0, parent_id, dependencies, dependency_count, task_size, batch->RTRComputeCount);
     return TaskBatchPostAdd(batch, id);
 }
 
@@ -2329,7 +2254,6 @@ NewComputeTask
 /// @typeparam ArgsType The type of the data specifying per-task arguments.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
 /// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
 /// @return The identifier of the new task, or INVALID_TASK_ID.
@@ -2339,7 +2263,6 @@ NewComputeTask
 (
     TASK_BATCH         *batch,
     TASK_ENTRYPOINT task_main, 
-    char     const *task_name, 
     ArgsType const *task_args, 
     uint32_t const  task_size
 )
@@ -2348,7 +2271,7 @@ NewComputeTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_name, task_args, sizeof(ArgsType), INVALID_TASK_ID, NULL, 0, task_size, batch->RTRComputeCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, NULL, 0, task_size, batch->RTRComputeCount);
     return TaskBatchPostAdd(batch, id);
 }
 
@@ -2356,7 +2279,6 @@ NewComputeTask
 /// @typeparam ArgsType The type of the data specifying per-task arguments.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
 /// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
 /// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
@@ -2367,7 +2289,6 @@ NewComputeTask
 (
     TASK_BATCH          *batch,
     TASK_ENTRYPOINT  task_main, 
-    char      const *task_name,
     ArgsType  const *task_args, 
     task_id_t const  parent_id, 
     uint32_t  const  task_size
@@ -2378,7 +2299,7 @@ NewComputeTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_name, task_args, sizeof(ArgsType), parent_id, NULL, 0, task_size, batch->RTRComputeCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), parent_id, NULL, 0, task_size, batch->RTRComputeCount);
     return TaskBatchPostAdd(batch, id);
 }
 
@@ -2386,7 +2307,6 @@ NewComputeTask
 /// @typeparam ArgsType The type of the data specifying per-task arguments.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
 /// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
 /// @param dependency_count The number of valid task identifiers in the dependencies list.
@@ -2398,7 +2318,6 @@ NewComputeTask
 (
     TASK_BATCH                *batch,
     TASK_ENTRYPOINT        task_main, 
-    char      const       *task_name,
     ArgsType  const       *task_args, 
     task_id_t const    *dependencies, 
     size_t    const dependency_count,
@@ -2409,7 +2328,7 @@ NewComputeTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_name, task_args, sizeof(ArgsType), INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRComputeCount);
     return TaskBatchPostAdd(batch, id);
 }
 
@@ -2417,7 +2336,6 @@ NewComputeTask
 /// @typeparam ArgsType The type of the data specifying per-task arguments.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
 /// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
 /// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
@@ -2430,7 +2348,6 @@ NewComputeTask
 (
     TASK_BATCH                *batch,
     TASK_ENTRYPOINT        task_main, 
-    char      const       *task_name,
     ArgsType  const       *task_args, 
     task_id_t const        parent_id,
     task_id_t const    *dependencies, 
@@ -2443,14 +2360,13 @@ NewComputeTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_name, task_args, sizeof(ArgsType), parent_id, dependencies, dependency_count, task_size, batch->RTRComputeCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_COMPUTE, task_main, task_args, sizeof(ArgsType), parent_id, dependencies, dependency_count, task_size, batch->RTRComputeCount);
     return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Creates a new task to execute on the general thread pool.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
 /// @return The identifier of the new task, or INVALID_TASK_ID.
 public_function inline task_id_t
@@ -2458,20 +2374,18 @@ NewGeneralTask
 (
     TASK_BATCH         *batch, 
     TASK_ENTRYPOINT task_main, 
-    char     const *task_name,
     uint32_t const  task_size=TASK_SIZE_SMALL
 )
 {
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_name, NULL, 0, INVALID_TASK_ID, NULL, 0, task_size, batch->RTRGeneralCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, INVALID_TASK_ID, NULL, 0, task_size, batch->RTRGeneralCount);
     return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Creates a new task to execute on the general thread pool. The task is created as a child of another task. The parent task does not complete until all children have completed.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
 /// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
 /// @return The identifier of the new task, or INVALID_TASK_ID.
@@ -2480,7 +2394,6 @@ NewGeneralTask
 (
     TASK_BATCH          *batch, 
     TASK_ENTRYPOINT  task_main, 
-    char      const *task_name,
     task_id_t const  parent_id,
     uint32_t  const  task_size=TASK_SIZE_SMALL
 )
@@ -2489,14 +2402,13 @@ NewGeneralTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_name, NULL, 0, parent_id, NULL, 0, task_size, batch->RTRGeneralCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, parent_id, NULL, 0, task_size, batch->RTRGeneralCount);
     return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the general thread pool. The task will not execute until all of its dependencies have completed.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
 /// @param dependency_count The number of valid task identifiers in the dependencies list.
 /// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
@@ -2506,7 +2418,6 @@ NewGeneralTask
 (
     TASK_BATCH                *batch,
     TASK_ENTRYPOINT        task_main, 
-    char      const       *task_name,
     task_id_t const    *dependencies, 
     size_t    const dependency_count,
     uint32_t  const        task_size=TASK_SIZE_SMALL
@@ -2514,14 +2425,13 @@ NewGeneralTask
 {
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_name, NULL, 0, INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
     return TaskBatchPostAdd(batch, id);
 }
 
 /// @summary Create a new task to execute on the general thread pool. The task will not execute until all of its dependencies have completed. The task is created as the child of another task. The parent task does not complete until all children have completed.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
 /// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
 /// @param dependency_count The number of valid task identifiers in the dependencies list.
@@ -2532,7 +2442,6 @@ NewGeneralTask
 (
     TASK_BATCH                *batch,
     TASK_ENTRYPOINT        task_main,
-    char      const       *task_name,
     task_id_t const        parent_id,
     task_id_t const    *dependencies, 
     size_t    const dependency_count,
@@ -2543,7 +2452,7 @@ NewGeneralTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_name, NULL, 0, parent_id, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, NULL, 0, parent_id, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
     return TaskBatchPostAdd(batch, id);
 }
 
@@ -2551,7 +2460,6 @@ NewGeneralTask
 /// @typeparam ArgsType The type of the data specifying per-task arguments.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
 /// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
 /// @return The identifier of the new task, or INVALID_TASK_ID.
@@ -2561,7 +2469,6 @@ NewGeneralTask
 (
     TASK_BATCH         *batch, 
     TASK_ENTRYPOINT task_main, 
-    char     const *task_name,
     ArgsType const *task_args, 
     uint32_t const  task_size=TASK_SIZE_SMALL
 )
@@ -2570,7 +2477,7 @@ NewGeneralTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_name, task_args, sizeof(ArgsType), INVALID_TASK_ID, NULL, 0, task_size, batch->RTRGeneralCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, NULL, 0, task_size, batch->RTRGeneralCount);
     return TaskBatchPostAdd(batch, id);
 }
 
@@ -2578,7 +2485,6 @@ NewGeneralTask
 /// @typeparam ArgsType The type of the data specifying per-task arguments.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
 /// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
 /// @param task_size One of the values of the TASK_SIZE enumeration, specifying the relative CPU load of the task.
@@ -2589,7 +2495,6 @@ NewGeneralTask
 (
     TASK_BATCH          *batch, 
     TASK_ENTRYPOINT  task_main, 
-    char      const *task_name, 
     ArgsType  const *task_args, 
     task_id_t const  parent_id, 
     uint32_t  const  task_size=TASK_SIZE_SMALL
@@ -2600,7 +2505,7 @@ NewGeneralTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_name, task_args, sizeof(ArgsType), parent_id, NULL, 0, task_size, batch->RTRGeneralCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), parent_id, NULL, 0, task_size, batch->RTRGeneralCount);
     return TaskBatchPostAdd(batch, id);
 }
 
@@ -2608,7 +2513,6 @@ NewGeneralTask
 /// @typeparam ArgsType The type of the data specifying per-task arguments.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
 /// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
 /// @param dependency_count The number of valid task identifiers in the dependencies list.
@@ -2620,7 +2524,6 @@ NewGeneralTask
 (
     TASK_BATCH                *batch,
     TASK_ENTRYPOINT        task_main, 
-    char      const       *task_name,
     ArgsType  const       *task_args, 
     task_id_t const    *dependencies, 
     size_t    const dependency_count,
@@ -2631,7 +2534,7 @@ NewGeneralTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_ROOT;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_name, task_args, sizeof(ArgsType), INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), INVALID_TASK_ID, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
     return TaskBatchPostAdd(batch, id);
 }
 
@@ -2639,7 +2542,6 @@ NewGeneralTask
 /// @typeparam ArgsType The type of the data specifying per-task arguments.
 /// @param batch The TASK_BATCH used to submit tasks on the calling thread.
 /// @param task_main The function to execute representing the task entry point.
-/// @param task_name A NULL-terminated string literal specifying a friendly name for the task in the profiler, or NULL.
 /// @param task_args Optional data to be supplied to the task when it executes. This data is memcpy'd into the new task.
 /// @param parent_id The identifier of the parent task, or INVALID_TASK_ID to create a root task.
 /// @param dependencies The optional list of task identifiers for all tasks that must complete before the new task is made ready-to-run.
@@ -2652,7 +2554,6 @@ NewGeneralTask
 (
     TASK_BATCH                *batch,
     TASK_ENTRYPOINT        task_main, 
-    char      const       *task_name,
     ArgsType  const       *task_args, 
     task_id_t const        parent_id,
     task_id_t const    *dependencies, 
@@ -2665,7 +2566,7 @@ NewGeneralTask
 
     TaskBatchPreAdd(batch);
     batch->BatchFlags |= TASK_BATCH_STATUS_CHILD;
-    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_name, task_args, sizeof(ArgsType), parent_id, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
+    task_id_t id = NewTask(batch->TaskSource, TASK_POOL_GENERAL, task_main, task_args, sizeof(ArgsType), parent_id, dependencies, dependency_count, task_size, batch->RTRGeneralCount);
     return TaskBatchPostAdd(batch, id);
 }
 

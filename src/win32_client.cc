@@ -7,17 +7,6 @@
 /*////////////////////
 //   Preprocessor   //
 ////////////////////*/
-/// @summary Define ENABLE_TASK_PROFILER as 1 to include the task scheduler profiler.
-/// Enabling the task scheduler profiler pulls in several additional dependencies.
-#ifndef ENABLE_TASK_PROFILER
-#define ENABLE_TASK_PROFILER 0
-#endif
-
-/// @summary If the task profiler is enabled, INITGUID needs to be #defined so that SystemTraceControlGuid is usable.
-#if ENABLE_TASK_PROFILER
-#define INITGUID
-#endif
-
 /// @summary Define some useful macros for specifying common resource sizes.
 /// Define these before including anything so that they are available everywhere.
 #define Kilobytes(x)        (size_t((x)) * size_t(1024))
@@ -46,16 +35,6 @@
 #include <Shellapi.h>
 #include <XInput.h>
 
-#if ENABLE_TASK_PROFILER
-#include <strsafe.h>
-#include <wmistr.h>
-#include <evntrace.h>
-#include <evntcons.h>
-#include <tdh.h>
-#else
-#include <evntrace.h>
-#endif
-
 #include <vulkan/vulkan.h>
 
 #include "platform_config.h"
@@ -65,7 +44,6 @@
 #include "win32_runtime.cc"
 #include "win32_memarena.cc"
 #include "win32_timestamp.cc"
-#include "win32_taskprofiler.cc"
 
 #include "win32_scheduler.cc"
 #include "win32_display.cc"
@@ -159,7 +137,7 @@ LaunchTaskMain
         // this should prevent cache contention between tasks.
         size_t         n = (args->Count- i) >= args->Divisor ? args->Divisor : (args->Count - i);
         TEST_TASK_DATA a = {args->Array, i, n};
-        task_id_t  child =  NewComputeTask(&b, TASK_MAIN(TestTaskMain), &a, task_id, TASK_SIZE_SMALL);
+        task_id_t  child =  NewComputeTask(&b, TestTaskMain, &a, task_id, TASK_SIZE_SMALL);
         UNUSED_LOCAL(child);
         i += n;
     }
@@ -246,9 +224,9 @@ AsyncLaunchesComputeTaskMain
         TASK_BATCH    b = {};
         NewTaskBatch(&b, thread_source);
         LAUNCH_TASK_DATA ld = { array, count, 1024 };
-        task_id_t launch_id = NewComputeTask(&b, TASK_MAIN(LaunchTaskMain), &ld, TASK_SIZE_SMALL);
+        task_id_t launch_id = NewComputeTask(&b, LaunchTaskMain, &ld, TASK_SIZE_SMALL);
         FENCE_TASK_DATA  fd = { array, count, ev };
-        task_id_t finish_id = NewComputeTask(&b, TASK_MAIN(FenceTaskMain) , &fd, &launch_id, 1, TASK_SIZE_LARGE);
+        task_id_t finish_id = NewComputeTask(&b, FenceTaskMain , &fd, &launch_id, 1, TASK_SIZE_LARGE);
         UNUSED_LOCAL(finish_id);
     }
 
@@ -563,7 +541,6 @@ WinMain
     MEMORY_ARENA                       main_arena = {};
     WIN32_TASK_SCHEDULER_CONFIG  scheduler_config = {};
     WIN32_TASK_SCHEDULER           task_scheduler = {};
-    WIN32_TASK_PROFILER             task_profiler = {};
     HANDLE                               ev_start = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_break = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     HANDLE                               ev_fence = CreateEvent(NULL, FALSE,FALSE, NULL); // auto-reset
@@ -644,15 +621,8 @@ WinMain
         goto cleanup_and_shutdown;
     }
 
-    // create the task system profiler for capturing execution flow.
-    if (CreateTaskProfiler(&task_profiler) < 0)
-    {   // no profilinf services are available.
-        goto cleanup_and_shutdown;
-    }
-
     // create the task scheduler to manage execution of work items on worker threads.
     DefaultSchedulerConfiguration(&scheduler_config, &thread_args, &host_cpu);
-    scheduler_config.Profiler = &task_profiler;
     scheduler_config.PoolSize[TASK_POOL_GENERAL].MaxTasks = 8192;
     scheduler_config.PoolSize[TASK_POOL_COMPUTE].MaxTasks = 65536;
     if (CreateScheduler(&task_scheduler, &scheduler_config, &main_arena) < 0)
@@ -660,7 +630,6 @@ WinMain
         ConsoleError("ERROR: Unable to create the compute task scheduler.\n");
         goto cleanup_and_shutdown;
     }
-    RegisterTaskSource(&task_profiler, "Root", SelfThreadId(), RootTaskSource(&task_scheduler)->SourceIndex);
 
     // set up explicit threads for frame composition, network I/O and file I/O.
     if ((thread_draw = SpawnExplicitThread(DisplayThread, &thread_args)) == NULL)
@@ -741,7 +710,6 @@ WinMain
         predicted_tick_launch = predicted_tick_launch + tick_interval;
 
         // work work work
-        MarkTickLaunch(&task_profiler);
         ConsoleOutput("Launch tick at %0.06f, next at %0.06f, miss by %I64dns (%0.06fms).\n", NanosecondsToWholeMilliseconds(actual_tick_launch) / 1000.0, NanosecondsToWholeMilliseconds(predicted_tick_launch) / 1000.0, tick_miss_time, tick_miss_time / 1000000.0);
         TASK_BATCH    b  = {};
         NewTaskBatch(&b, RootTaskSource(&task_scheduler));
@@ -749,15 +717,15 @@ WinMain
         /*
         LAUNCH_TASK_DATA launch_data = { workspace, workspace_size, 2048 };
         FENCE_TASK_DATA   fence_data = { workspace, workspace_size, ev_fence };
-        task_id_t        launch_task = NewComputeTask(&b, TASK_MAIN(LaunchTaskMain), &launch_data, TASK_SIZE_SMALL);
-        task_id_t        finish_task = NewComputeTask(&b, TASK_MAIN(FenceTaskMain) ,  &fence_data, &launch_task, 1, TASK_SIZE_LARGE);
+        task_id_t        launch_task = NewComputeTask(&b, LaunchTaskMain, &launch_data, TASK_SIZE_SMALL);
+        task_id_t        finish_task = NewComputeTask(&b, FenceTaskMain ,  &fence_data, &launch_task, 1, TASK_SIZE_LARGE);
         FlushTaskBatch(&b);
         WaitForSingleObject(ev_fence, INFINITE);
         UNUSED_LOCAL(finish_task);
         */
 
         ASYNC_TASK_DATA ad = { ev_fence };
-        task_id_t async_id = NewGeneralTask(&b, TASK_MAIN(AsyncLaunchesComputeTaskMain), &ad);
+        task_id_t async_id = NewGeneralTask(&b, AsyncLaunchesComputeTaskMain, &ad);
         UNUSED_LOCAL(async_id);
         FlushTaskBatch(&b);
         WaitForSingleObject(ev_fence, INFINITE);

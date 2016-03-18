@@ -136,12 +136,6 @@ DECLARE_WIN32_RUNTIME_FUNCTION(BOOL    , WINAPI, SetFileCompletionNotificationMo
 DECLARE_WIN32_RUNTIME_FUNCTION(DWORD   , WINAPI, GetFinalPathNameByHandleA         , HANDLE , LPSTR , DWORD, DWORD);                          // Kernel32.dll
 DECLARE_WIN32_RUNTIME_FUNCTION(DWORD   , WINAPI, GetFinalPathNameByHandleW         , HANDLE , LPWSTR, DWORD, DWORD);                          // Kernel32.dll
 
-/// @summary The following are required only to support the task scheduler profiler.
-#if ENABLE_TASK_PROFILER
-DECLARE_WIN32_RUNTIME_FUNCTION(ULONG   , WINAPI, TdhGetEventInformation            , EVENT_RECORD*, ULONG, TDH_CONTEXT*, TRACE_EVENT_INFO*, ULONG*);                      // Tdh.dll
-DECLARE_WIN32_RUNTIME_FUNCTION(ULONG   , WINAPI, TdhGetProperty                    , EVENT_RECORD*, ULONG, TDH_CONTEXT*, ULONG, PROPERTY_DATA_DESCRIPTOR*, ULONG, BYTE*); // Tdl.dll
-#endif
-
 /*///////////////
 //   Globals   //
 ///////////////*/
@@ -157,14 +151,6 @@ DEFINE_WIN32_RUNTIME_FUNCTION(SetProcessWorkingSetSizeEx);
 DEFINE_WIN32_RUNTIME_FUNCTION(SetFileInformationByHandle);
 DEFINE_WIN32_RUNTIME_FUNCTION(GetQueuedCompletionStatusEx);
 DEFINE_WIN32_RUNTIME_FUNCTION(SetFileCompletionNotificationModes);
-
-#if ENABLE_TASK_PROFILER
-DEFINE_WIN32_RUNTIME_FUNCTION(TdhGetEventInformation);
-DEFINE_WIN32_RUNTIME_FUNCTION(TdhGetProperty);
-
-/// @summary The module load address of the Tdh DLL.
-global_variable HMODULE TdhDll      = NULL;
-#endif
 
 /// @summary The module load address of the XInput DLL.
 global_variable HMODULE XInputDll   = NULL;
@@ -399,50 +385,6 @@ GetFinalPathNameByHandleW_Stub
     return 0;
 }
 
-#if ENABLE_TASK_PROFILER
-internal_function ULONG WINAPI
-TdhGetEventInformation_Stub
-(
-    EVENT_RECORD      *event_record, 
-    ULONG             context_count, 
-    TDH_CONTEXT       *context_list, 
-    TRACE_EVENT_INFO    *event_info, 
-    ULONG              *buffer_size
-)
-{
-    UNUSED_ARG(event_record);
-    UNUSED_ARG(context_count);
-    UNUSED_ARG(context_list);
-    UNUSED_ARG(event_info);
-    UNUSED_ARG(buffer_size);
-    return ERROR_NOT_SUPPORTED;
-}
-#endif
-
-#if ENABLE_TASK_PROFILER
-internal_function ULONG WINAPI
-TdhGetProperty_Stub
-(
-    EVENT_RECORD                *event_record, 
-    ULONG                       context_count, 
-    TDH_CONTEXT                 *context_list, 
-    ULONG                    descriptor_count, 
-    PROPERTY_DATA_DESCRIPTOR *descriptor_list,
-    ULONG                         buffer_size,
-    BYTE                       *property_data
-)
-{
-    UNUSED_ARG(event_record);
-    UNUSED_ARG(context_count);
-    UNUSED_ARG(context_list);
-    UNUSED_ARG(descriptor_count);
-    UNUSED_ARG(descriptor_list);
-    UNUSED_ARG(buffer_size);
-    UNUSED_ARG(property_data);
-    return ERROR_NOT_SUPPORTED;
-}
-#endif
-
 /// @summary Enable or disable a process privilege.
 /// @param token The privilege token of the process to modify.
 /// @param privilege_name The name of the privilege to enable or disable.
@@ -581,42 +523,6 @@ missing_entry_point:
     return true;
 }
 
-#if ENABLE_TASK_PROFILER
-/// @summary Load Tdh.dll into the process address space and resolve the required API functions.
-/// @param missing_entry_points On return, set to true if any entry points are missing.
-/// @return true if Tdh.dll was loaded into the process address space.
-internal_function bool
-LoadTdh
-(
-    bool *missing_entry_points
-)
-{
-    HMODULE tdh_dll = LoadLibrary(_T("Tdh.dll"));
-    if (tdh_dll == NULL)
-    {   // maybe this operating system isn't supported.
-        if (missing_entry_points) *missing_entry_points = true;
-        return false;
-    }
-
-    // perform runtime resolution of all required API functions.
-    RESOLVE_WIN32_RUNTIME_FUNCTION(tdh_dll, TdhGetEventInformation);
-    RESOLVE_WIN32_RUNTIME_FUNCTION(tdh_dll, TdhGetProperty);
-
-    // check for any entry points that got set to their stub functions.
-    if (WIN32_RUNTIME_STUB(TdhGetEventInformation)) goto missing_entry_point;
-    if (WIN32_RUNTIME_STUB(TdhGetProperty))         goto missing_entry_point;
-
-    // save the DLL handle.
-    TdhDll = tdh_dll;
-    return true;
-
-missing_entry_point:
-    if (missing_entry_points) *missing_entry_points = true;
-    TdhDll = tdh_dll;
-    return true;
-}
-#endif
-
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
@@ -636,14 +542,6 @@ InitializeRuntime
     {   // without the kernel routines, there's no point in continuing.
         return false;
     }
-
-#if ENABLE_TASK_PROFILER
-    if (!LoadTdh(&missing_entry_points))
-    {   // without the Tdh functions, the task profiler won't function.
-        // TODO(rlk): should this be made optional?
-        return false;
-    }
-#endif
 
     if (runtime_type == WIN32_RUNTIME_TYPE_CLIENT)
     {   // resolve client-only entry points.
